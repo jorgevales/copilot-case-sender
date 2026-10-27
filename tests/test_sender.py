@@ -124,6 +124,7 @@ class World:
 
     def __init__(self):
         self.behaviors, self.tabs, self.sends, self.attach_calls, self.rules = [], {}, [], [], []
+        self.events = []                                  # ordered ("foreground"|"send", tab id): proves what came first
         self.generation, self.reconnects, self.reconnect_fail = 1, 0, False
         self.opened = 0
 
@@ -155,6 +156,10 @@ class FakeTab:
 
     async def adopt(self):
         pass
+
+    async def foreground(self):
+        self._alive()
+        self.w.events.append(("foreground", self.target_id))
 
     async def discover_models(self):
         return list(MODELS)
@@ -209,6 +214,7 @@ class FakeTab:
     async def click_send(self):
         self._alive()
         mode = self.b.get("send", "normal")
+        self.w.events.append(("send", self.target_id))
         self.w.sends.append((self.target_id, list(self.attached), self.message))
         if mode == "no_effect":
             return
@@ -958,3 +964,44 @@ def test_every_setting_the_code_reads_has_a_default():
     used = set(_re.findall(r"\bcfg\.([a-z_]+)", source)) | set(_re.findall(r"self\.cfg\.([a-z_]+)", source))
     missing = sorted(k for k in used if k not in S.DEFAULTS and k not in S.REQUIRED)
     assert missing == []
+
+
+# ------------------------------------------------------------------ foreground, console detail
+
+def test_every_tab_is_foregrounded_right_before_its_send(env):
+    for n in range(1, 4):
+        env.make_case(n)
+    cases, _, _ = env.cases()
+    results = run(env.runner().run(collections.deque(cases)))
+    assert [v[0] for v in results.values()] == ["submitted"] * 3
+    events = env.world.events
+    for i, (kind, tid) in enumerate(events):
+        if kind == "send":
+            assert events[i - 1] == ("foreground", tid)            # nothing between "bring to front" and "click Send"
+    assert sum(1 for k, _ in events if k == "send") == 3
+
+
+def test_minimal_console_shows_only_the_essentials_and_the_real_id_never_reaches_the_log_file(env, capsys):
+    red = S.Redactor()
+    red.ids["case-aaa111"] = "a" * 32
+    minimal = S.Log(env.rt, red, "minimal", True)
+    minimal("queue", note="5 instruction(s) queued")
+    minimal("uploading", "case-aaa111", expected=4)
+    minimal("upload-progress", "case-aaa111", observed=2)
+    minimal("start", "case-aaa111", queue="1/5", attachments=4)
+    minimal("submitted", "case-aaa111")
+    out = capsys.readouterr().out
+    assert "uploading" not in out and "upload-progress" not in out
+    assert "5 instruction(s) queued" in out and "attachments=4" in out and "submitted" in out
+    assert out.count("a" * 32) == 2                                     # shown on the start and submitted lines
+    log_text = minimal.file.read_text("utf-8")
+    assert "a" * 32 not in log_text and "uploading" in log_text         # the log file keeps every step, without the ID
+    full = S.Log(None, red, "full", False)
+    full("uploading", "case-aaa111", expected=4)
+    shown = capsys.readouterr().out
+    assert "uploading" in shown and "a" * 32 not in shown               # full detail, IDs hidden when not requested
+
+
+def test_console_detail_setting_is_validated(env):
+    bad = types.SimpleNamespace(**{**vars(env.cfg), "approved_root": str(env.base), "console_detail": "loud"})
+    assert any("console_detail" in p for p in S.validate_config(bad)[1])

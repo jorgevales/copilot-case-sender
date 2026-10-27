@@ -1,7 +1,7 @@
 # Copilot Case Sender
 
 Sends instruction-ID case folders to Microsoft 365 Copilot through your installed Microsoft Edge: **one fresh
-conversation per case**, the case's documents plus one shared `instructions.md` attached, your `base_message`
+conversation per case**, the case's documents plus one shared **review guidance** file (`review_guidance.md`) attached, your `base_message`
 typed into the composer, **sent once**, outcome saved before the next case starts.
 
 Everything is in `copilot_case_sender.py` (read top to bottom, sections are numbered). `Run.cmd` launches it.
@@ -13,7 +13,7 @@ ones are typed once during setup and stay in your local, git-ignored `sender_con
 1. Put `Run.cmd` and `copilot_case_sender.py` together in a folder on `S:`.
 2. Double-click `Run.cmd`. It asks once for `PYTHON_EXECUTABLE` (paste the path, quotes are fine; it also looks
    for a `python\python.exe` beside it) and then starts `setup`.
-3. `setup` asks you to paste: `CASES_ROOT`, the `instructions.md`, the `base_message` file, `PYTHON_EXECUTABLE`,
+3. `setup` asks you to paste: `CASES_ROOT`, the **Review guidance** `.md` file, the `base_message` file, `PYTHON_EXECUTABLE`,
    `EDGE_EXECUTABLE`, `RUNTIME_ROOT` (and optionally a Node.js `node.exe`). Pressing Enter keeps a shown default;
    a folder pasted where a file is expected is searched for the expected name. Re-run `Run.cmd setup` any time to edit.
 4. `Run.cmd check` validates everything (nothing is sent). `Run.cmd plan` shows the queue and any blocked cases.
@@ -44,7 +44,18 @@ by a safe alias (`other-xxxxxx`); two folders with the same ID are both blocked 
    a short pause) so Copilot wakes each one. After your answer every tab applies the chosen model in the background.
 
 ### Per case, strictly one at a time
-take a warm tab → check the model label (a cheap read) → attach all documents + instructions in **one bulk
+**Foreground rule.** Every tab is brought to the front (and confirmed visible) when a case starts working in it, again
+before the send checks, and once more immediately before the Send click. A background tab is throttled by the browser,
+which makes the page time out and can make a send silently not happen. This is tested (nothing sits between the
+foreground step and the click).
+
+**Console detail.** `console_detail` (asked in `setup`, or `Run.cmd run --detail minimal|full`): *minimal* prints the
+number of instructions queued, each instruction ID being sent with its attachment count, its status once submitted
+(green), and anything you must act on (warnings, retries, uncertain/blocked cases, pauses); *full* adds every step.
+With `console_show_ids` (default on) the real instruction ID appears **on the console only** – the shareable log files
+keep aliases. Set it to false to print aliases instead.
+
+take a warm tab → check the model label (a cheap read) → attach all documents + the review guidance in **one bulk
 assignment** → type `base_message` while the transfer runs → wait until the **exact** attachment set is present with no
 transfer/error and Send enabled (held steady for `stable_seconds`) → record `send_intent` → click Send once → confirm
 the user message in *that* tab → record `submitted`, then add the ID to the ledger. Inventory of the next case runs
@@ -84,10 +95,10 @@ unreadable/locked file, likely password-protected Office/PDF file, link not foll
 `ignore_names` (default `~$*`, `desktop.ini`, `thumbs.db`) are skipped but listed in the manifest.
 
 ### The 20-attachment limit
-`max_attachments` (default 20, **instructions.md counts**) is the *reference program's* number; live testing showed
+`max_attachments` (default 20, **the review guidance file counts**) is the *reference program's* number; live testing showed
 Copilot accepting exactly 20 files on a personal profile, but check your tenant. A case with exactly the limit is
 sent and the console says `at-limit`. When a case has **more** files, `over_limit_mode` decides:
-* `send_partial` (default): attach instructions.md + the first documents in sorted order up to the limit, print a
+* `send_partial` (default): attach the review guidance + the first documents in sorted order up to the limit, print a
   `WARNING` *before* sending (count of files left out), and finish as **`submitted_partial`** (yellow). The ledger
   records it as `partial`, the run exits with code 1, and the left-out file list stays in the local journal.
   The case is *not* resent automatically – delete its ledger line if you want to handle the rest manually.
@@ -107,7 +118,7 @@ every failure; this design guarantees *at-most-once automatically*, and tells yo
 
 ## Storage, S: and UNC
 
-* `approved_root` (default: the drive/share root of `RUNTIME_ROOT`) defines **approved storage**. Cases, instructions,
+* `approved_root` (default: the drive/share root of `RUNTIME_ROOT`) defines **approved storage**. Cases, review guidance,
   base message, dependency folder, runtime, config and every tool write must be inside it. Executables
   (python/edge/node) are read/execute only and may live anywhere (e.g. `C:`).
 * Identity is a tuple of *path components*: a mapped drive is resolved with `WNetGetUniversalNameW` (buffer resized,

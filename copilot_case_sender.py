@@ -338,6 +338,9 @@ DEFAULTS = {
     "warm_tabs": 8, "warm_dwell_seconds": 0.4,             # tabs prepared (and visibly walked through) before the run
     "model_prompt_seconds": 0,                              # 0 = wait for your answer; Enter always takes the default
     "retry_backoff": [2, 5, 15], "persist_retries": 5,
+    "console_detail": "minimal",      # "minimal" = queue total, ID being sent + attachments, final status, warnings;
+                                      # "full" = every step (uploads, retries, connection details)
+    "console_show_ids": True,         # print the real instruction ID on the console (never in the shareable log files)
     "diagnostics_capture": False,     # screenshots/HTML are SENSITIVE, local-only, off by default
 }
 REQUIRED = ["cases_root", "instructions_path", "base_message_path", "python_executable",
@@ -386,6 +389,8 @@ def resolve_file(text: str, hint: str = "") -> Path | None:
         return p
     if p.is_dir() and hint and (p / hint).is_file():
         return p / hint
+    if p.is_dir() and hint == "review_guidance.md" and (p / "instructions.md").is_file():  # older name still found
+        return p / "instructions.md"
     for ext in (".md", ".exe"):
         if p.with_name(p.name + ext).is_file():
             return p.with_name(p.name + ext)
@@ -425,7 +430,8 @@ def setup_command() -> int:
             print("  That file was not found - try again.")
 
     cur["cases_root"] = ask_dir("cases_root", "Folder that contains the instruction-ID case folders (CASES_ROOT)")
-    cur["instructions_path"] = ask_file("instructions_path", "Path of the additional instructions.md", "instructions.md")
+    cur["instructions_path"] = ask_file("instructions_path", "Path of the Review guidance .md file (review_guidance.md)",
+                                        "review_guidance.md")
     cur["base_message_path"] = ask_file("base_message_path", "Path of the base_message Markdown file", "base_message.md")
     cur["python_executable"] = ask_file("python_executable", "Embedded python.exe", "python.exe", sys.executable)
     edge = next((str(p) for p in exe_candidates("edge") if p.is_file()), "")
@@ -435,6 +441,9 @@ def setup_command() -> int:
     node = next((str(p) for p in exe_candidates("node") if p.is_file()), "")
     value = ask("Node.js node.exe (optional; Enter = use the copy bundled with Playwright)", cur.get("node_executable") or node, True)
     cur["node_executable"] = str(resolve_file(value, "node.exe") or "") if value else ""
+    detail = ask("Console output: 1 = minimal (queue total, ID being sent, attachments, result), 2 = full detail",
+                 "2" if cur.get("console_detail") == "full" else "1")
+    cur["console_detail"] = "full" if detail.strip() == "2" else "minimal"
     if ask("Change optional settings (port, URL, model, recursion, limits)? y/N", "n").lower().startswith("y"):
         for key in ("cdp_port", "copilot_url", "requested_model", "recursive_documents", "max_attachments", "over_limit_mode", "warm_tabs",
                     "dependency_directory", "approved_root", "approved_unc_root"):
@@ -488,6 +497,8 @@ def validate_config(cfg):
             problems.append("CASES_ROOT must be outside runtime_root")
     except PathError as exc:
         problems.append(str(exc))
+    if cfg.console_detail not in ("minimal", "full"):
+        problems.append("console_detail must be 'minimal' or 'full'")
     if cfg.over_limit_mode not in ("send_partial", "block"):
         problems.append("over_limit_mode must be 'send_partial' or 'block'")
     if cfg.completion_mode != "submission_only":
@@ -599,6 +610,7 @@ class Redactor:
 
     def __init__(self):
         self.literals, self._rx = {}, None
+        self.ids = {}   # alias -> real instruction ID (console only, when the user chose to see them)
 
     def add(self, value, label: str) -> None:
         value = str(value or "")
@@ -641,24 +653,35 @@ def use_colour() -> bool:
     return True
 
 
-class Log:
-    """Console progress + structured redacted event log (shareable).  Real values live only in state/."""
+# What the "minimal" console shows: the queue, the case being sent, its result, and anything the user must act on.
+MINIMAL_PHASES = {"queue", "start", "submitted", "submitted_partial", "submission_uncertain", "preflight_blocked",
+                  "failed_exhausted", "WARNING", "at-limit", "attempt-failed", "deferred", "released", "paused",
+                  "stopped", "login", "session", "model", "reconnect", "recovered", "dependencies"}
 
-    def __init__(self, rt: Runtime | None, redact: Redactor):
-        self.redact, self.file = redact, None
+
+class Log:
+    """Console progress + structured redacted event log (shareable).  Real values live only in state/.
+    The console may additionally show the real instruction ID (console_show_ids); the log file never does."""
+
+    def __init__(self, rt: Runtime | None, redact: Redactor, detail: str = "full", show_ids: bool = False):
+        self.redact, self.file, self.detail, self.show_ids = redact, None, detail, show_ids
         if rt:
             self.file = rt.logs / f"events-{datetime.datetime.now():%Y%m%d-%H%M%S}.jsonl"
 
     def __call__(self, phase: str, alias: str = "", **fields) -> None:
         fields = {k: (self.redact(v) if isinstance(v, str) else v) for k, v in fields.items()}
         line = " ".join(f"{k}={v}" for k, v in fields.items())
+        shown = self.redact.ids.get(alias) if self.show_ids else None
+        if shown:
+            line = f"{line} instruction={shown}".strip()
         text = f"[{datetime.datetime.now():%H:%M:%S}] {alias or '-':<12} {phase:<18} {line}".rstrip()
         shade = {"submitted": "42;97",            # white text on green: sent successfully
                  "submitted_partial": "43;30",    # black on yellow: sent, but some files were left out
                  "WARNING": "43;30"}.get(phase)
         if shade and use_colour():
             text = f"\x1b[{shade}m {text} \x1b[0m"
-        print(text, flush=True)
+        if self.detail == "full" or phase in MINIMAL_PHASES:
+            print(text, flush=True)
         if self.file:
             try:
                 with open(self.file, "a", encoding="utf-8") as fh:
@@ -668,7 +691,7 @@ class Log:
 
 
 def register_redactions(red: Redactor, cfg, policy: PathPolicy | None) -> None:
-    labels = {"cases_root": "CASES_ROOT", "runtime_root": "RUNTIME_ROOT", "instructions_path": "INSTRUCTIONS_FILE",
+    labels = {"cases_root": "CASES_ROOT", "runtime_root": "RUNTIME_ROOT", "instructions_path": "REVIEW_GUIDANCE_FILE",
               "base_message_path": "BASE_MESSAGE_FILE", "python_executable": "PYTHON_EXECUTABLE",
               "edge_executable": "EDGE_EXECUTABLE", "node_executable": "NODE_EXECUTABLE",
               "dependency_directory": "DEPENDENCY_DIR", "approved_root": "APPROVED_ROOT",
@@ -851,6 +874,7 @@ def discover(cfg, policy: PathPolicy, salt: str, red: Redactor):
         case = Case(entry.name, Path(entry.path), policy.ident(entry.path), salt)
         red.add(case.name, case.alias)
         red.add(case.id, case.alias)
+        red.ids[case.alias] = case.id
         red.add(case.ref, case.alias + "-ref")
         try:
             policy.check(entry.path, "case folder")
@@ -1456,6 +1480,18 @@ class CopilotTab:
             await self._new_chat()
 
     @guarded
+    async def foreground(self):
+        """Bring this tab to the front and wait until the page reports itself visible.  A background tab is
+        throttled by the browser: talking to it can time out and a send can silently not happen."""
+        await self.page.bring_to_front()
+        deadline = time.monotonic() + self.cfg.op_timeout
+        while time.monotonic() < deadline:
+            if await self._ev("() => document.visibilityState === 'visible'"):
+                return
+            await asyncio.sleep(0.05)
+        raise UiError("the tab could not be brought to the front")
+
+    @guarded
     async def adopt(self):
         """Take over a tab that is already signed in (the login tab): same tab id, fresh chat."""
         self.target_id = await asyncio.wait_for(page_target_id(self.page), self.cfg.op_timeout)
@@ -1810,6 +1846,7 @@ class Runner:
             paths = await asyncio.to_thread(stage_aliases, prep.plan, self.rt, aid)
             tab = usable or self.pool_tab(case.key) or await self.browser.open_tab()
             self.rec(case, "preparing", target_id=tab.target_id, url=await tab.url())
+            await tab.foreground()                        # every tab is foregrounded before we work in it
             pending = getattr(tab, "model_task", None)    # background model selection started right after your choice
             if pending:
                 await asyncio.gather(pending, return_exceptions=True)
@@ -1905,6 +1942,7 @@ class Runner:
         if rec.get("state") in ("send_intent", "submitted", "submission_uncertain"):
             raise AttemptFailed("a send was already recorded for this case")
         self.storage_alive()
+        await tab.foreground()                        # the send must happen in the visible, active tab
         ev = await tab.evidence(self.needle)          # (fresh() would fail here: our own chips are attached)
         if ev["users"] or ev["replies"]:
             raise AttemptFailed("conversation already contains messages")
@@ -1920,6 +1958,10 @@ class Runner:
 
     async def send_and_confirm(self, tab, case, expected) -> str:
         """After send_intent we never raise Stopped and never resend.  Anything unresolved = uncertain."""
+        try:  # again, right before the click (another tab may have taken the focus); never skips the send itself
+            await tab.foreground()
+        except Exception as exc:
+            self.log("foreground", case.alias, note=safe_exc(self.redact, exc))
         try:
             await tab.click_send()
         except Exception as exc:  # a click that raised may still have gone through: reconcile, don't retry
@@ -2064,7 +2106,8 @@ def context(cfg, need_runtime: bool = True):
     if problems:
         raise SenderError("configuration problems:\n  - " + "\n  - ".join(red(p) for p in problems))
     rt = bootstrap_storage(cfg, policy)
-    return types.SimpleNamespace(cfg=cfg, policy=policy, rt=rt, red=red, log=Log(rt, red))
+    return types.SimpleNamespace(cfg=cfg, policy=policy, rt=rt, red=red,
+                                 log=Log(rt, red, cfg.console_detail, cfg.console_show_ids))
 
 
 def classify(cases, ctx, journal, listed):
@@ -2386,6 +2429,8 @@ def summarise(ctx, journal, cases, listed, results):
 
 def run_command(args) -> int:
     cfg = load_config()
+    if getattr(args, "detail", None):
+        cfg.console_detail = args.detail
     ctx = context(cfg)
     ensure_dependencies(cfg, ctx.rt, ctx.log)           # first launch only; never inside the case loop
     message = load_message(Path(cfg.base_message_path))
@@ -2399,7 +2444,7 @@ def run_command(args) -> int:
         for c in cases:
             if c.blocked:
                 journal.record(c.key, "preflight_blocked", alias=c.alias, instruction_id=c.id, reason=c.blocked)
-        ctx.log("queue", note=f"{len(todo)} to send, {len(done)} already sent, {excluded} excluded, "
+        ctx.log("queue", note=f"{len(todo)} instruction(s) queued; {len(done)} already sent, {excluded} excluded, "
                               f"{len(other)} unrecognised, {sum(1 for c in cases if c.blocked)} blocked")
         return asyncio.run(run_async(ctx, journal, ledger, listed, cases, todo, instr, message))
     finally:
@@ -2418,7 +2463,8 @@ def main(argv=None) -> int:
     c = sub.add_parser("check", help="validate everything without sending")
     c.add_argument("--browser", action="store_true", help="also launch/connect Edge and test a page")
     sub.add_parser("plan", help="dry run: show the queue and any blocked cases")
-    sub.add_parser("run", help="send the queue (default)")
+    r = sub.add_parser("run", help="send the queue (default)")
+    r.add_argument("--detail", choices=("minimal", "full"), help="console detail for this run (overrides the setting)")
     args = p.parse_args(argv)
     command = args.command or "run"
     try:
