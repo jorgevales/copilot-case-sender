@@ -1,0 +1,10 @@
+# Machine-specific answers and runtime data: never commit
+sender_config.json
+local_python.cmd
+sender_runtime/
+*.log
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+.env
