@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import collections
+import csv
 import ctypes
 import datetime
 import fnmatch
@@ -318,8 +319,9 @@ def probe_dir(directory: Path) -> str:
 # --------------------------------------------------------------------------------------------
 
 DEFAULTS = {
-    "cdp_port": 9333, "copilot_url": "https://m365.cloud.microsoft/chat", "requested_model": "",
-    "recursive_documents": False, "completion_mode": "submission_only",
+    "cdp_port": 9333, "result_contract_path": "", "copilot_url": "https://m365.cloud.microsoft/chat", "requested_model": "",
+    "recursive_documents": False,
+    "completion_mode": "json_result",   # "json_result" = collect + validate Copilot's JSON answer; "submission_only" = V1 (send only)
     "node_executable": "", "dependency_directory": "", "approved_root": "", "approved_unc_root": "",
     "max_attachments": 20,            # a reference-program setting, NOT proof of your tenant's limit
     "over_limit_mode": "send_partial",  # more files than the limit: "send_partial" (instructions + first files, loud
@@ -341,11 +343,14 @@ DEFAULTS = {
     "console_detail": "minimal",      # "minimal" = queue total, ID being sent + attachments, final status, warnings;
                                       # "full" = every step (uploads, retries, connection details)
     "console_show_ids": True,         # print the real instruction ID on the console (never in the shareable log files)
+    "fixup_requests": 3,              # asks for the exact same answer in the right structure, this many times per try
+    "answer_overdue_minutes": 20,     # flag a slow answer (never resent); "answer_stable_seconds": text unchanged = finished
+    "answer_stable_seconds": 3, "collect_poll_seconds": 2,
     "diagnostics_capture": False,     # screenshots/HTML are SENSITIVE, local-only, off by default
 }
 REQUIRED = ["cases_root", "instructions_path", "base_message_path", "python_executable",
             "edge_executable", "runtime_root"]
-PATH_KEYS = REQUIRED + ["node_executable", "dependency_directory", "approved_root", "approved_unc_root"]
+PATH_KEYS = REQUIRED + ["result_contract_path", "node_executable", "dependency_directory", "approved_root", "approved_unc_root"]
 HERE = Path(__file__).resolve().parent
 
 
@@ -433,6 +438,11 @@ def setup_command() -> int:
     cur["instructions_path"] = ask_file("instructions_path", "Path of the Review guidance .md file (review_guidance.md)",
                                         "review_guidance.md")
     cur["base_message_path"] = ask_file("base_message_path", "Path of the base_message Markdown file", "base_message.md")
+    template = HERE / "result_contract.md"
+    value = ask("Path of the Result contract .md - the strict JSON answer format (Enter = do not collect answers)",
+                cur.get("result_contract_path") or (str(template) if template.is_file() else ""), True)
+    cur["result_contract_path"] = str(resolve_file(value, "result_contract.md") or "") if value else ""
+    cur["completion_mode"] = "json_result" if cur["result_contract_path"] else "submission_only"
     cur["python_executable"] = ask_file("python_executable", "Embedded python.exe", "python.exe", sys.executable)
     edge = next((str(p) for p in exe_candidates("edge") if p.is_file()), "")
     cur["edge_executable"] = ask_file("edge_executable", "Installed msedge.exe", "msedge.exe", edge)
@@ -473,7 +483,7 @@ def validate_config(cfg):
     except PathError as exc:
         return None, [str(exc)]
     for key, kind in (("cases_root", "dir"), ("runtime_root", "dir"), ("instructions_path", "file"),
-                      ("base_message_path", "file"), ("dependency_directory", "dir")):
+                      ("base_message_path", "file"), ("result_contract_path", "file"), ("dependency_directory", "dir")):
         value = getattr(cfg, key)
         if not value:
             continue
@@ -501,8 +511,10 @@ def validate_config(cfg):
         problems.append("console_detail must be 'minimal' or 'full'")
     if cfg.over_limit_mode not in ("send_partial", "block"):
         problems.append("over_limit_mode must be 'send_partial' or 'block'")
-    if cfg.completion_mode != "submission_only":
-        problems.append("completion_mode: only 'submission_only' exists in this version (no response collection)")
+    if cfg.completion_mode not in ("json_result", "submission_only"):
+        problems.append("completion_mode must be 'json_result' or 'submission_only'")
+    elif cfg.completion_mode == "json_result" and not cfg.result_contract_path:
+        problems.append("completion_mode 'json_result' needs result_contract_path (or use 'submission_only')")
     if not problems:
         try:
             load_message(Path(cfg.base_message_path))
@@ -530,7 +542,7 @@ def load_message(path: Path) -> str:
 class Runtime:
     """Every tool-controlled folder, all under RUNTIME_ROOT."""
 
-    DIRS = ("state", "logs", "staging", "temp", "profile", "cache", "downloads", "crashes",
+    DIRS = ("state", "logs", "results", "staging", "temp", "profile", "cache", "downloads", "crashes",
             "diagnostics", "pycache", "pipcache", "work", "locks", "tools")
 
     def __init__(self, cfg):
@@ -656,7 +668,8 @@ def use_colour() -> bool:
 # What the "minimal" console shows: the queue, the case being sent, its result, and anything the user must act on.
 MINIMAL_PHASES = {"queue", "start", "submitted", "submitted_partial", "submission_uncertain", "preflight_blocked",
                   "failed_exhausted", "WARNING", "at-limit", "attempt-failed", "deferred", "released", "paused",
-                  "stopped", "login", "session", "model", "reconnect", "recovered", "dependencies"}
+                  "stopped", "login", "session", "model", "reconnect", "recovered", "dependencies", "fixup", "resubmit",
+                  "result_correct", "result_incorrect", "result_inconclusive", "result_invalid", "response_timeout"}
 
 
 class Log:
@@ -677,7 +690,8 @@ class Log:
         text = f"[{datetime.datetime.now():%H:%M:%S}] {alias or '-':<12} {phase:<18} {line}".rstrip()
         shade = {"submitted": "42;97",            # white text on green: sent successfully
                  "submitted_partial": "43;30",    # black on yellow: sent, but some files were left out
-                 "WARNING": "43;30"}.get(phase)
+                 "WARNING": "43;30", "result_correct": "42;97", "result_incorrect": "41;97",
+                 "result_inconclusive": "43;30", "result_invalid": "41;97", "response_timeout": "43;30"}.get(phase)
         if shade and use_colour():
             text = f"\x1b[{shade}m {text} \x1b[0m"
         if self.detail == "full" or phase in MINIMAL_PHASES:
@@ -691,7 +705,7 @@ class Log:
 
 
 def register_redactions(red: Redactor, cfg, policy: PathPolicy | None) -> None:
-    labels = {"cases_root": "CASES_ROOT", "runtime_root": "RUNTIME_ROOT", "instructions_path": "REVIEW_GUIDANCE_FILE",
+    labels = {"cases_root": "CASES_ROOT", "runtime_root": "RUNTIME_ROOT", "instructions_path": "REVIEW_GUIDANCE_FILE", "result_contract_path": "RESULT_CONTRACT_FILE",
               "base_message_path": "BASE_MESSAGE_FILE", "python_executable": "PYTHON_EXECUTABLE",
               "edge_executable": "EDGE_EXECUTABLE", "node_executable": "NODE_EXECUTABLE",
               "dependency_directory": "DEPENDENCY_DIR", "approved_root": "APPROVED_ROOT",
@@ -708,7 +722,7 @@ def register_redactions(red: Redactor, cfg, policy: PathPolicy | None) -> None:
 # 5. STATE: append-only journal + sent-instructions ledger
 # --------------------------------------------------------------------------------------------
 
-TERMINAL_SENT = ("submitted", "submission_uncertain")
+TERMINAL_SENT = ("submitted", "submission_uncertain", "fixup_sent", "result_valid", "result_invalid", "response_timeout")
 
 
 class Journal:
@@ -819,7 +833,7 @@ def sync_ledger(journal: Journal, ledger: Ledger, log) -> dict:
             journal.record(key, "queued", released=True, attempts=0, ledger_written=False)
             log("released", rec.get("alias", ""), note="ledger line removed by user: eligible again")
         else:
-            ledger.add(iid, ("partial" if rec.get("omitted") else "submitted") if rec["state"] == "submitted" else "uncertain")
+            ledger.add(iid, "uncertain" if rec["state"] == "submission_uncertain" else ("partial" if rec.get("omitted") else "submitted"))
             journal.record(key, rec["state"], ledger_written=True)
             listed[iid] = rec["state"]
     return listed
@@ -970,7 +984,8 @@ def build_plan(case: Case, instr, cfg, policy: PathPolicy):
     the journal, so aliases stay reversible.  Source files are never renamed.
     """
     entries, seen_ident = [], set()
-    for doc in [instr] + list(case.docs):
+    fixed = list(instr) if isinstance(instr, (list, tuple)) else [instr]      # review guidance (+ result contract)
+    for doc in fixed + list(case.docs):
         ident = policy.ident(doc.path)
         if ident in seen_ident:
             continue  # the instructions file physically sits inside this case: still attached once
@@ -1330,6 +1345,14 @@ class EdgeBrowser:
             await t.activate()
         return tabs
 
+    async def open_url_tab(self, url: str):
+        """Read-only tab on a saved conversation (collecting an answer after a restart)."""
+        page = await self.context.new_page()
+        tab = CopilotTab(page, self.cfg, self.stop)
+        tab.target_id = await asyncio.wait_for(page_target_id(page), self.cfg.op_timeout)
+        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        return tab
+
     async def find_ready_tab(self):
         """A Copilot page of this browser that already shows the chat composer + model button."""
         origin = "{0.scheme}://{0.netloc}".format(urlparse(self.cfg.copilot_url))
@@ -1358,6 +1381,7 @@ class EdgeBrowser:
         return None
 
 
+PLUS_BTN = "button[data-testid='PlusMenuButton']"
 ATTACH_BTN = ("#plus-menu-container button[data-testid='PlusMenuButton'], button[data-testid='chat-input-attach-button'], "
               "button[data-test-id='chat-input-attach-button'], button[aria-label='Add'][aria-haspopup='menu']")
 EDITORS = ["#m365-chat-editor-target-element", "[data-testid*='chat-editor' i] [contenteditable='true']",
@@ -1379,7 +1403,8 @@ MENU_JS = r"""idx => {
   const m = menus[idx]; if (!m) return null;
   return [...m.querySelectorAll('[role="menuitem"],[role="menuitemradio"]')].filter(e => e.closest('[role="menu"]') === m).map(e => {
     const span = [...e.querySelectorAll('span')].find(x => norm(x.textContent) && ![...x.querySelectorAll('span')].some(y => norm(y.textContent)));   // first leaf span = the name
-    return {text: norm(e.textContent), title: norm(span ? span.textContent : e.textContent), popup: e.getAttribute('aria-haspopup') || ''}; }); }"""
+    return {text: norm(e.textContent), title: norm(span ? span.textContent : e.textContent), popup: e.getAttribute('aria-haspopup') || '',
+            disabled: e.getAttribute('aria-disabled') === 'true' || e.disabled === true}; }); }"""
 MODEL_SWITCHER = ("#gptModeSwitcher, [data-testid*='gptModeSwitcher' i], button[aria-label*='response mode' i], "
                   "button[aria-label*='model selector' i], button[aria-label*='mode selector' i]")
 
@@ -1429,6 +1454,14 @@ SENT_JS = "([needle, userSel, asstSel]) => {" + OUTER_JS + r"""
 FRESH_JS = "([userSel, asstSel]) => {" + OUTER_JS + r"""
   return {users: outer([...document.querySelectorAll(userSel)]).length, replies: outer([...document.querySelectorAll(asstSel)]).length,
           chips: document.querySelectorAll('button[aria-label^="Remove attachment "]').length};
+}"""
+ANSWER_JS = "([userSel, asstSel]) => {" + OUTER_JS + r"""
+  const users = outer([...document.querySelectorAll(userSel)]);
+  const replies = outer([...document.querySelectorAll(asstSel)]);
+  const last = replies[replies.length - 1];     // ONLY the newest assistant reply of this conversation
+  const blocks = last ? [...last.querySelectorAll('pre')].map(p => (p.querySelector('code') || p).textContent) : [];
+  const stop = [...document.querySelectorAll('button')].some(b => /^stop/i.test((b.getAttribute('aria-label') || '').trim()));
+  return {users: users.length, replies: replies.length, text: last ? last.textContent : '', blocks, generating: stop};
 }"""
 RETRY_JS = r"""() => {   // click "Try again" ONLY inside an upload-error alert (never the response Regenerate/Retry)
   const vis = e => !!(e && (e.offsetWidth || e.offsetHeight || e.getClientRects().length));
@@ -1575,7 +1608,12 @@ class CopilotTab:
         menu items) can open Windows' file dialog because the chooser is intercepted anyway."""
         paths = [os.path.abspath(f) for f in files]
         self._chooser = asyncio.get_running_loop().create_future()
-        await self.page.locator(ATTACH_BTN).first.click(timeout=10000)
+        plus = self.page.locator(PLUS_BTN).first
+        try:   # early in a page load only a look-alike placeholder "Add" button exists; the real one appears a few seconds later
+            await plus.wait_for(state="visible", timeout=15000)
+        except Exception:
+            plus = self.page.locator(ATTACH_BTN).first          # other Copilot variants
+        await plus.click(timeout=10000)
         item = self.page.get_by_role("menuitem", name=UPLOAD_ITEM).first
         deadline = time.monotonic() + self.cfg.op_timeout
         while not self._chooser.done() and time.monotonic() < deadline:
@@ -1635,13 +1673,13 @@ class CopilotTab:
         entry (Claude, GPT ...) is hovered to read its models.  The picker is closed again afterwards."""
         await self.page.locator(MODEL_SWITCHER).first.click(timeout=10000)
         top = await self._menu(0)
-        found = [{"group": "Modes", "label": m["title"], "text": m["text"]} for m in top if not m["popup"]]
+        found = [{"group": "Modes", "label": m["title"], "text": m["text"], "disabled": m["disabled"]} for m in top if not m["popup"]]
         previous = ()
         for provider in [m for m in top if m["popup"]]:
             await self.page.locator("[role=menuitem][aria-haspopup]", has_text=provider["title"]).first.hover()
             models = await self._menu(1, provider["title"], previous)
             previous = {m["text"] for m in models}
-            found += [{"group": provider["title"], "label": m["text"], "text": m["text"]} for m in models]
+            found += [{"group": provider["title"], "label": m["text"], "text": m["text"], "disabled": m["disabled"]} for m in models]
         await self._close_menus()
         return found
 
@@ -1667,7 +1705,11 @@ class CopilotTab:
             await self._menu(1, entry["group"])
             index = 1
         pattern = re.compile("^" + re.escape(entry["text"]) + "$")
-        await self.page.locator("[role=menu]").nth(index).locator("[role=menuitem],[role=menuitemradio]", has_text=pattern).first.click(timeout=10000)
+        item = self.page.locator("[role=menu]").nth(index).locator("[role=menuitem],[role=menuitemradio]", has_text=pattern).first
+        if await item.get_attribute("aria-disabled") == "true":      # greyed out by Copilot (e.g. usage limit reached)
+            await self._close_menus()
+            raise RecoveryRequired(f"the chosen model ({entry['label']}) is not available in Copilot right now - run again and pick another one")
+        await item.click(timeout=10000)
         deadline = time.monotonic() + self.cfg.op_timeout
         while time.monotonic() < deadline:
             if label_matches(await switcher.text_content(), entry):
@@ -1692,6 +1734,22 @@ class CopilotTab:
     @guarded
     async def evidence(self, needle: str) -> dict:
         return await self._ev(SENT_JS, [needle, USER_MSG, ASSISTANT_MSG])
+
+    @guarded
+    async def read_answer(self) -> dict:
+        """Newest assistant reply of this chat: text, its code blocks, whether Copilot is still generating."""
+        return await self._ev(ANSWER_JS, [USER_MSG, ASSISTANT_MSG])
+
+    @guarded
+    async def send_followup(self, text: str):
+        """Second message in the SAME chat (the structure fix-up request)."""
+        await self.foreground()
+        ed = await self._editor()
+        if ed is None:
+            raise UiError("the Copilot message editor was not found")
+        await ed.click(timeout=10000)
+        await ed.fill(text, timeout=20000)
+        await self.page.locator(SEND_BTN).first.click(timeout=15000)
 
     @guarded
     async def close(self):
@@ -1740,6 +1798,120 @@ def judge_upload(snap: dict, expected: list) -> dict:
             "ready": ready, "signature": (sum(observed.values()), len(snap["active"]))}
 
 
+# --- the answer contract: Copilot must reply with ONE JSON object, written as plain text, shaped like this -----
+RESULT_KEYS = ("COPILOT_RESULT", "JUSTIFICATION", "A_B_COMPARISONS")
+ROW_KEYS = ("ITEM", "Customer_expectation", "System_data", "MATCH")
+RESULT_WORDS = ("Correct", "Incorrect", "Inconclusive")
+FIXUP_TEXT = ("Your previous answer did not follow the required result structure. Resend your exact same answer, unchanged "
+              "in content, as one JSON object written as plain text on a single line (no code block, no markdown) with "
+              "exactly the keys COPILOT_RESULT, JUSTIFICATION and A_B_COMPARISONS, as defined in the attached result contract.")
+
+
+def validate_result(obj: dict) -> list:
+    """Problems with an answer object ([] = valid).  Strict keys, exact verdict words, and the verdict must
+    agree with the MATCH flags of the comparison rows."""
+    problems = []
+    missing, extra = [k for k in RESULT_KEYS if k not in obj], [k for k in obj if k not in RESULT_KEYS]
+    if missing:
+        problems.append("missing key(s): " + ", ".join(missing))
+    if extra:
+        problems.append("unexpected key(s): " + ", ".join(extra))
+    verdict = obj.get("COPILOT_RESULT")
+    if verdict not in RESULT_WORDS:
+        problems.append("COPILOT_RESULT must be exactly Correct, Incorrect or Inconclusive")
+    if not (isinstance(obj.get("JUSTIFICATION"), str) and obj["JUSTIFICATION"].strip()):
+        problems.append("JUSTIFICATION must be non-empty text")
+    rows = obj.get("A_B_COMPARISONS")
+    if not isinstance(rows, list):
+        problems.append("A_B_COMPARISONS must be a list of rows")
+        return problems
+    for i, row in enumerate(rows, 1):
+        if not isinstance(row, dict) or set(row) != set(ROW_KEYS):
+            problems.append(f"A_B_COMPARISONS row {i} must have exactly ITEM, Customer_expectation, System_data, MATCH")
+            continue
+        if not isinstance(row["MATCH"], bool):
+            problems.append(f"row {i}: MATCH must be true or false")
+        for k in ("ITEM", "Customer_expectation", "System_data"):
+            if isinstance(row[k], bool) or not isinstance(row[k], (str, int, float)):
+                problems.append(f"row {i}: {k} must be text")
+    if not problems:  # verdict cross-check
+        flags = [r["MATCH"] for r in rows]
+        if verdict in ("Correct", "Incorrect") and not rows:
+            problems.append(f"{verdict} needs at least one A_B_COMPARISONS row")
+        elif verdict == "Correct" and not all(flags):
+            problems.append("Correct requires every MATCH to be true")
+        elif verdict == "Incorrect" and all(flags):
+            problems.append("Incorrect requires at least one MATCH to be false")
+    return problems
+
+
+def json_objects(text: str) -> list:
+    """Every JSON object inside a piece of text (plain text with or without words around it), in order."""
+    decoder, found, i = json.JSONDecoder(), [], 0
+    while True:
+        i = text.find("{", i)
+        if i == -1:
+            return found
+        try:
+            obj, end = decoder.raw_decode(text, i)
+        except ValueError:
+            i += 1
+            continue
+        if isinstance(obj, dict):
+            found.append(obj)
+        i = end
+
+
+def parse_answer(answer: dict):
+    """(object or None, problems) from the NEWEST reply.  The result is expected as plain text (a code box is not
+    relied on - it sometimes does not render), but JSON inside a code block is read too.  The newest object that
+    has COPILOT_RESULT is judged; otherwise the newest object, so a wrong one can be named in the fix-up."""
+    body = answer.get("text") or ""
+    pool = []
+    for block in reversed(answer.get("blocks") or []):
+        pool += json_objects(block)[::-1]
+    pool += json_objects(body)[::-1]
+    for obj in pool:
+        if "COPILOT_RESULT" in obj:
+            return obj, validate_result(obj)
+    if pool:
+        return pool[0], validate_result(pool[0])
+    looks = "text that looks like JSON but is not valid JSON" if "{" in body else "no JSON object"
+    return None, [f"the reply has {looks} (the result must be one JSON object written as plain text)"]
+
+
+def save_result(rt: Runtime, case, status: str, obj, raw: str, tries: int, fixups: int, omitted: int) -> None:
+    """Local result files: <instruction id>.json (full answer) and one row in results.csv."""
+    rows = (obj or {}).get("A_B_COMPARISONS") or []
+    mismatches = sum(1 for r in rows if isinstance(r, dict) and r.get("MATCH") is False)
+    done = now()
+    write_atomic(rt.results / f"{case.id}.json", json.dumps(
+        {"instruction_id": case.id, "status": status, "tries": tries, "fixups": fixups, "left_out_files": omitted,
+         "finished": done, "result": obj, "raw_text": raw}, indent=2))
+    line = [case.id, status, (obj or {}).get("COPILOT_RESULT", ""), len(rows), mismatches, tries, fixups, omitted, done]
+
+    def append():
+        path = rt.results / "results.csv"
+        new = not path.exists()
+        with open(path, "a", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            if new:
+                w.writerow(["instruction_id", "status", "verdict", "rows", "differences", "tries", "fixups", "left_out_files", "finished_utc"])
+            w.writerow(line)
+            fh.flush()
+            os.fsync(fh.fileno())
+    io_retry(append, "results.csv write")
+
+
+class Pending:
+    """A submitted case whose answer has not been collected yet (its tab holds the conversation)."""
+
+    def __init__(self, case, tab, generation, fixups=0):
+        self.case, self.tab, self.generation, self.fixups = case, tab, generation, fixups
+        self.started, self.replies_before = time.monotonic(), 0
+        self.last_text, self.stable_since, self.overdue = None, None, False
+
+
 class Prepared:
     """Result of preparing the next case while the current one uploads (the pipeline)."""
 
@@ -1760,6 +1932,12 @@ class Runner:
         self.pool = collections.deque()   # warm, signed-in, fresh tabs: (tab, connection generation)
         self.retry_tab = {}               # case key -> (tab, generation): an unsent tab reset for the next try
         self.model = None                 # chosen model entry (None = Copilot's own default)
+        self.pending = {}                 # case key -> Pending: submitted, answer not collected yet
+        self.done_tabs = collections.deque()   # tabs whose answer is collected: reset + reused when a new case needs a tab
+        self.results = {}                 # case key -> (state, reason) shown in the summary
+        self.partial = set()              # cases sent with files left out (never reported as plain success)
+        self.fg_lock = asyncio.Lock()     # only ONE party (sender or collector) works in the front tab at a time
+        self.queue, self.queue_closed = None, False
 
     # -- helpers ------------------------------------------------------------------------------
     def rec(self, case, state, **fields):
@@ -1785,10 +1963,26 @@ class Runner:
         tab = None
         if want_tab:
             try:
-                tab = self.pool_tab() or await self.browser.open_tab()
+                tab = self.pool_tab()          # prefetch only takes a warm tab; the attempt opens/recycles one if needed
             except Exception as exc:  # pipeline is an optimisation: failing here only loses the head start
                 self.log("prefetch", case.alias, note=safe_exc(self.redact, exc))
         return Prepared(case, plan, tab=tab, generation=self.browser.generation, left_out=left_out)
+
+    def collecting(self) -> bool:
+        return self.cfg.completion_mode == "json_result"
+
+    async def recycled_tab(self):
+        """A tab whose answer is already collected goes back to a brand-new chat for the next case."""
+        while self.done_tabs:
+            tab, generation = self.done_tabs.popleft()
+            if generation != self.browser.generation:
+                continue
+            try:
+                await tab.reset()
+                return tab
+            except Exception:
+                await self._abandon(tab)
+        return None
 
     def pool_tab(self, key=None):
         """A warm tab (or the case's own reset retry tab) from the current browser connection, else None."""
@@ -1836,7 +2030,8 @@ class Runner:
         t0, aid = time.monotonic(), uuid.uuid4().hex[:10]
         expected = [p["name"] for p in prep.plan]
         self.rec(case, "preparing", attempt=n, attempt_id=aid, route=route, plan=prep.plan, expected=len(expected),
-                 prompt_version=self.prompt_version, omitted=len(prep.left_out), left_out=prep.left_out)
+                 prompt_version=self.prompt_version, omitted=len(prep.left_out), left_out=prep.left_out,
+                 contract=self.collecting())
         tab, usable = prep.tab, prep.tab
         prep.tab = None
         intent = reusable = False
@@ -1844,7 +2039,7 @@ class Runner:
             if not files_unchanged(prep.plan):
                 raise AttemptFailed("documents changed while preparing")
             paths = await asyncio.to_thread(stage_aliases, prep.plan, self.rt, aid)
-            tab = usable or self.pool_tab(case.key) or await self.browser.open_tab()
+            tab = usable or self.pool_tab(case.key) or await self.recycled_tab() or await self.browser.open_tab()
             self.rec(case, "preparing", target_id=tab.target_id, url=await tab.url())
             await tab.foreground()                        # every tab is foregrounded before we work in it
             pending = getattr(tab, "model_task", None)    # background model selection started right after your choice
@@ -1869,6 +2064,8 @@ class Runner:
             partial = outcome == "submitted" and prep.left_out
             self.log("submitted_partial" if partial else outcome, case.alias, attempt=n, route=route,
                      elapsed=round(time.monotonic() - t0, 1))
+            if outcome == "submitted" and self.collecting():
+                self.watch(case, tab)                    # its answer is collected in the background from now on
             return outcome
         except (Stopped, asyncio.CancelledError):
             if not intent:
@@ -1975,8 +2172,13 @@ class Runner:
         names = collections.Counter(stem(n) for n in ev.get("names") or [])
         if names and names != collections.Counter(stem(n) for n in expected):
             return self.finish_uncertain(case, "attachments shown in the sent message differ from the plan")
-        self.rec(case, "submitted", evidence={"user_message": True, "attachments_visible": bool(names),
-                                              "generating_seen": ev["generating"], "reply_seen": bool(ev["replies"])})
+        try:
+            url = await tab.url()
+        except Exception:
+            url = ""
+        self.rec(case, "submitted", conversation_url=url,
+                 evidence={"user_message": True, "attachments_visible": bool(names),
+                           "generating_seen": ev["generating"], "reply_seen": bool(ev["replies"])})
         self.mark_sent(case, "submitted")
         return "submitted"
 
@@ -2011,80 +2213,249 @@ class Runner:
     def mark_sent(self, case, state: str):
         omitted = self.journal.cases.get(case.key, {}).get("omitted")
         state = "partial" if (state == "submitted" and omitted) else state   # shown in the ledger so it is not forgotten
-        self.ledger.add(case.id, state)
+        if self.sent_ids.get(case.id) != state:       # a resubmission must not write a second ledger line
+            self.ledger.add(case.id, state)
         self.sent_ids[case.id] = state
         self.rec(case, "submission_uncertain" if state == "uncertain" else "submitted", ledger_written=True)
 
+    # -- answers ------------------------------------------------------------------------------
+    def watch(self, case, tab):
+        self.pending[case.key] = Pending(case, tab, self.browser.generation)
+        self.results[case.key] = ("answer_pending", "waiting for Copilot's answer")
+
+    async def resume(self, by_key: dict):
+        """Re-run rule: a case that was submitted but never answered gets its answer collected from its saved
+        conversation (same tab by exact target id, else the saved conversation link in a new tab).  Never resent."""
+        for key, rec in list(self.journal.cases.items()):
+            case = by_key.get(key)
+            if not (case and rec.get("contract") and rec.get("state") in ("submitted", "fixup_sent")):
+                continue
+            tab = None
+            try:
+                if rec.get("target_id"):
+                    tab = await self.browser.find_tab(rec["target_id"])
+                if tab is None and rec.get("conversation_url", "").startswith("http"):
+                    tab = await self.browser.open_url_tab(rec["conversation_url"])
+            except SenderError:
+                tab = None
+            if tab is None:
+                self.log("WARNING", case.alias, note="submitted earlier but its conversation could not be found again")
+                self.results[key] = ("answer_unavailable", "conversation not found - check Copilot manually")
+                continue
+            self.pending[key] = Pending(case, tab, self.browser.generation, fixups=rec.get("fixups", 0))
+            self.results[key] = ("answer_pending", "collecting an answer from an earlier run")
+            self.log("recovered", case.alias, note="collecting the answer of an earlier submission")
+
+    async def collect_loop(self):
+        """Background collector: visits each answering tab in turn (bringing it to the front), judges finished
+        answers, asks for fix-ups, and finishes overdue cases when nothing else is left to send."""
+        while True:
+            if not self.pending:
+                if self.queue_closed:
+                    return
+                await asyncio.sleep(0.3)
+                continue
+            for key in list(self.pending):
+                if key in self.pending:
+                    await self.visit(self.pending[key])
+            await asyncio.sleep(self.cfg.collect_poll_seconds)
+
+    async def visit(self, p):
+        case, cfg = p.case, self.cfg
+        try:
+            async with self.fg_lock:                  # never while the sender works in the front tab
+                await p.tab.foreground()
+                answer = await p.tab.read_answer()
+        except ConnectionLost:
+            await self.rebind(p)
+            return
+        except UiError:
+            return                                    # try this tab again on the next round
+        moment, elapsed = time.monotonic(), time.monotonic() - p.started
+        if elapsed > cfg.answer_overdue_minutes * 60 and not p.overdue:
+            p.overdue = True
+            self.log("WARNING", case.alias, note=f"answer overdue ({cfg.answer_overdue_minutes} min): still waiting, not resending")
+        finished = answer["replies"] > p.replies_before and not answer["generating"] and answer["text"].strip()
+        if not finished:
+            p.last_text = p.stable_since = None
+            if p.overdue and not self.queue:          # nothing left to send: stop waiting, report it
+                self.finish_without_answer(p, "response_timeout", "no answer within the overdue limit")
+            return
+        if answer["text"] != p.last_text:
+            p.last_text, p.stable_since = answer["text"], moment
+        if moment - p.stable_since >= cfg.answer_stable_seconds:
+            await self.judge(p, answer)
+
+    async def rebind(self, p):
+        """Connection lost while collecting: reconnect, then find the tab again by its exact target id."""
+        async with self.fg_lock:
+            await self.browser.reconnect()
+        tab = await self.browser.find_tab(p.tab.target_id)
+        rec = self.journal.cases.get(p.case.key, {})
+        if tab is None and rec.get("conversation_url", "").startswith("http"):
+            tab = await self.browser.open_url_tab(rec["conversation_url"])
+        if tab is None:
+            self.finish_without_answer(p, "response_timeout", "conversation lost after a reconnect")
+        else:
+            p.tab, p.generation = tab, self.browser.generation
+
+    async def judge(self, p, answer):
+        obj, problems = parse_answer(answer)
+        if obj is not None and not problems:
+            return self.finish_valid(p, obj, answer["text"])
+        self.log("fixup", p.case.alias, note="answer structure problem: " + "; ".join(problems[:3]))
+        if p.fixups < self.cfg.fixup_requests:
+            await self.request_fixup(p, answer, problems)
+        else:
+            await self.business_retry(p, problems, answer["text"])
+
+    async def request_fixup(self, p, answer, problems):
+        text = FIXUP_TEXT + " Problems found: " + "; ".join(problems[:4]) + "."
+        try:
+            async with self.fg_lock:
+                await p.tab.send_followup(text)
+        except ConnectionLost:
+            return await self.rebind(p)
+        except UiError as exc:
+            self.log("fixup", p.case.alias, note=f"could not send the fix-up request: {safe_exc(self.redact, exc)}")
+            return
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:               # confirm: one more user message in this chat
+            try:
+                if (await p.tab.read_answer())["users"] > answer["users"]:
+                    break
+            except SenderError:
+                pass
+            await asyncio.sleep(0.3)
+        p.fixups += 1                                    # counted even if unconfirmed, so this always ends
+        p.replies_before, p.last_text, p.stable_since = answer["replies"], None, None
+        self.rec(p.case, "fixup_sent", fixups=p.fixups, problems="; ".join(problems[:4]))
+        self.log("fixup", p.case.alias, request=f"{p.fixups}/{self.cfg.fixup_requests}", note="asked Copilot to resend in the right structure")
+
+    async def business_retry(self, p, problems, raw: str):
+        """Fix-ups did not help: resubmit the SAME instruction ID in this tab refreshed to a new chat, within the
+        same total-tries budget.  (The only case where a submitted ID is sent again: no valid answer exists.)"""
+        case, key = p.case, p.case.key
+        if self.attempts[key] >= self.cfg.max_attempts:
+            return self.finish_without_answer(p, "result_invalid", "no valid answer structure after all tries", raw=raw)
+        try:
+            async with self.fg_lock:
+                await p.tab.reset()
+            self.retry_tab[key] = (p.tab, self.browser.generation)
+        except Exception:
+            await self._abandon(p.tab)
+        self.rec(case, "retry_pending", reason="answer structure still invalid after the fix-up requests")
+        self.log("resubmit", case.alias, note=f"resubmitting in a refreshed tab (try {self.attempts[key] + 1}/{self.cfg.max_attempts})")
+        del self.pending[key]
+        self.queue.append(case)
+
+    def finish_valid(self, p, obj, raw):
+        case, verdict = p.case, obj["COPILOT_RESULT"]
+        rows = obj["A_B_COMPARISONS"]
+        diff = sum(1 for r in rows if r["MATCH"] is False)
+        omitted = self.journal.cases.get(case.key, {}).get("omitted", 0)
+        save_result(self.rt, case, "result_valid", obj, raw, self.attempts[case.key], p.fixups, omitted)
+        self.rec(case, "result_valid", verdict=verdict, rows=len(rows), differences=diff, fixups=p.fixups)
+        note = f"{len(rows)} comparison(s), {diff} difference(s)" + (f"; {omitted} file(s) were left out" if omitted else "")
+        self.results[case.key] = ("result_" + verdict.lower(), note)
+        self.log("result_" + verdict.lower(), case.alias, comparisons=len(rows), differences=diff, fixups=p.fixups)
+        del self.pending[case.key]
+        self.done_tabs.append((p.tab, p.generation))     # free to be reset and reused
+
+    def finish_without_answer(self, p, state: str, reason: str, raw: str = ""):
+        case = p.case
+        save_result(self.rt, case, state, None, raw, self.attempts[case.key], p.fixups, 0)
+        self.rec(case, state, reason=reason, fixups=p.fixups)
+        self.results[case.key] = (state, reason)
+        self.log(state, case.alias, note=reason)
+        del self.pending[case.key]
+
     # -- queue --------------------------------------------------------------------------------
     async def run(self, queue: collections.deque) -> dict:
-        results, deferred, total = {}, set(), len(queue)
+        self.queue, self.queue_closed, deferred, total = queue, False, set(), len(queue)
         same_reason = collections.Counter()
-        while queue:
-            self.stop.check()
-            case = queue.popleft()
-            self.storage_alive()
-            nxt = queue[0] if queue else None
-            prep = await self.take_prepared(case)
-            if prep.blocked:
-                self.rec(case, "preflight_blocked", reason=prep.blocked)
-                self.log("preflight_blocked", case.alias, note=prep.blocked)
-                results[case.key] = ("preflight_blocked", prep.blocked)
-                self.start_prefetch(nxt)
-                continue
-            self.log("start", case.alias, queue=f"{total - len(queue)}/{total}", attachments=len(prep.plan))
-            if prep.left_out:
-                self.log("WARNING", case.alias, note=f"{len(prep.left_out)} file(s) will NOT be sent: the case has more files "
-                                                      f"than the {self.cfg.max_attachments}-attachment limit (instructions included)")
-            elif len(prep.plan) >= int(self.cfg.max_attachments):
-                self.log("at-limit", case.alias, note=f"{len(prep.plan)}/{self.cfg.max_attachments} attachments "
-                                                       "(instructions included): this case uses the whole allowance")
-            outcome, reason = "retry_pending", ""
-            for _ in range(self.cfg.immediate_retries):
-                if self.attempts[case.key] >= self.cfg.max_attempts:
-                    break
-                self.attempts[case.key] += 1
-                n = self.attempts[case.key]
-                route = "bulk" if n % 2 else "sequential"     # bulk first, sequential on the next fresh attempt
-                try:
-                    outcome = await self.attempt(case, prep, n, route, nxt)
-                    break
-                except AttemptFailed as exc:
-                    reason = self.redact(str(exc))
-                    self.rec(case, "retry_pending", reason=reason, attempt=n)
-                    self.log("attempt-failed", case.alias, attempt=n, route=route, note=reason)
-                    await self.stop.sleep(self.cfg.retry_backoff[min(n - 1, len(self.cfg.retry_backoff) - 1)])
-                    prep = await self.prepare(case, want_tab=False)   # fresh manifest for the next attempt
-                    if prep.blocked:
-                        outcome, reason = "preflight_blocked", prep.blocked
-                        break
-                except Blocked as exc:
-                    outcome, reason = "preflight_blocked", str(exc)
-                    break
-            if outcome == "preflight_blocked":
-                self.rec(case, "preflight_blocked", reason=reason)
-            elif outcome == "retry_pending":
-                if self.attempts[case.key] < self.cfg.max_attempts and case.key not in deferred:
-                    deferred.add(case.key)
-                    queue.append(case)                       # tail: first-attempt cases go first
-                    total += 1
-                    self.log("deferred", case.alias, note="moved to the end of the queue")
+        collector = asyncio.ensure_future(self.collect_loop()) if self.collecting() else None
+        try:
+            while queue or self.pending:
+                self.stop.check()
+                if collector and collector.done():
+                    collector.result()                    # a collector failure (e.g. reconnect budget) stops the run
+                if not queue:                             # only answers are outstanding
+                    await asyncio.sleep(0.3)
                     continue
-                outcome = "failed_exhausted"
-                self.rec(case, "failed_exhausted", reason=reason)
-            else:
-                same_reason.clear()
-                if outcome == "submitted" and prep.left_out:
-                    outcome = "submitted_partial"
-                    reason = f"{len(prep.left_out)} file(s) left out (attachment limit) - sent files only"
-            if case.key in self.retry_tab and outcome != "retry_pending":   # finished: close its leftover unsent tab
-                await self._abandon(self.retry_tab.pop(case.key)[0])
-            results[case.key] = (outcome, reason)
-            if outcome in ("failed_exhausted", "preflight_blocked") and reason:
-                same_reason[reason] += 1
-                if same_reason[reason] >= 3 and outcome == "failed_exhausted":  # no-progress guard
-                    raise RecoveryRequired("three cases failed the same way - likely an environment problem; run paused")
-            self.journal.snapshot()
-        return results
+                case = queue.popleft()
+                self.storage_alive()
+                nxt = queue[0] if queue else None
+                prep = await self.take_prepared(case)
+                if prep.blocked:
+                    self.rec(case, "preflight_blocked", reason=prep.blocked)
+                    self.log("preflight_blocked", case.alias, note=prep.blocked)
+                    self.results[case.key] = ("preflight_blocked", prep.blocked)
+                    self.start_prefetch(nxt)
+                    continue
+                self.log("start", case.alias, queue=f"{total - len(queue)}/{total}", attachments=len(prep.plan))
+                if prep.left_out:
+                    self.log("WARNING", case.alias, note=f"{len(prep.left_out)} file(s) will NOT be sent: the case has more files "
+                                                          f"than the {self.cfg.max_attachments}-attachment limit (fixed files included)")
+                elif len(prep.plan) >= int(self.cfg.max_attachments):
+                    self.log("at-limit", case.alias, note=f"{len(prep.plan)}/{self.cfg.max_attachments} attachments "
+                                                           "(fixed files included): this case uses the whole allowance")
+                outcome, reason = "retry_pending", ""
+                for _ in range(self.cfg.immediate_retries):
+                    if self.attempts[case.key] >= self.cfg.max_attempts:
+                        break
+                    self.attempts[case.key] += 1
+                    n = self.attempts[case.key]
+                    route = "bulk" if n % 2 else "sequential"     # bulk first, sequential on the next fresh attempt
+                    try:
+                        async with self.fg_lock:                  # the sender owns the front tab for the whole attempt
+                            outcome = await self.attempt(case, prep, n, route, nxt)
+                        break
+                    except AttemptFailed as exc:
+                        reason = self.redact(str(exc))
+                        self.rec(case, "retry_pending", reason=reason, attempt=n)
+                        self.log("attempt-failed", case.alias, attempt=n, route=route, note=reason)
+                        await self.stop.sleep(self.cfg.retry_backoff[min(n - 1, len(self.cfg.retry_backoff) - 1)])
+                        prep = await self.prepare(case, want_tab=False)   # fresh manifest for the next attempt
+                        if prep.blocked:
+                            outcome, reason = "preflight_blocked", prep.blocked
+                            break
+                    except Blocked as exc:
+                        outcome, reason = "preflight_blocked", str(exc)
+                        break
+                if outcome == "preflight_blocked":
+                    self.rec(case, "preflight_blocked", reason=reason)
+                elif outcome == "retry_pending":
+                    if self.attempts[case.key] < self.cfg.max_attempts and case.key not in deferred:
+                        deferred.add(case.key)
+                        queue.append(case)                       # tail: first-attempt cases go first
+                        total += 1
+                        self.log("deferred", case.alias, note="moved to the end of the queue")
+                        continue
+                    outcome = "failed_exhausted"
+                    self.rec(case, "failed_exhausted", reason=reason)
+                else:
+                    same_reason.clear()
+                    if outcome == "submitted" and prep.left_out:
+                        self.partial.add(case.key)
+                        if not self.collecting():
+                            outcome = "submitted_partial"
+                            reason = f"{len(prep.left_out)} file(s) left out (attachment limit) - sent files only"
+                if case.key in self.retry_tab and outcome != "retry_pending":   # finished: close its leftover unsent tab
+                    await self._abandon(self.retry_tab.pop(case.key)[0])
+                if not (outcome == "submitted" and self.collecting()):    # collector owns the result of a submitted case
+                    self.results[case.key] = (outcome, reason)
+                if outcome in ("failed_exhausted", "preflight_blocked") and reason:
+                    same_reason[reason] += 1
+                    if same_reason[reason] >= 3 and outcome == "failed_exhausted":  # no-progress guard
+                        raise RecoveryRequired("three cases failed the same way - likely an environment problem; run paused")
+                self.journal.snapshot()
+        finally:
+            self.queue_closed = True
+            if collector:
+                collector.cancel()
+                await asyncio.gather(collector, return_exceptions=True)
+        return self.results
 
     prompt_version = ""
 
@@ -2094,8 +2465,9 @@ class Runner:
 # --------------------------------------------------------------------------------------------
 
 def prompt_version(cfg, message: str) -> str:
-    st = os.stat(cfg.instructions_path)
-    return hashlib.sha256(f"{st.st_size}|{st.st_mtime_ns}|{message}".encode()).hexdigest()[:12]
+    stats = [os.stat(path) for path in (cfg.instructions_path, cfg.result_contract_path) if path]
+    parts = "|".join(f"{st.st_size}|{st.st_mtime_ns}" for st in stats)
+    return hashlib.sha256(f"{parts}|{message}".encode()).hexdigest()[:12]
 
 
 def context(cfg, need_runtime: bool = True):
@@ -2195,7 +2567,9 @@ def plan_command(args) -> int:
         ledger = Ledger(ctx.rt.ledger, ctx.cfg.persist_retries)
         listed = sync_ledger(journal, ledger, ctx.log)
         cases, other, excluded = discover(ctx.cfg, ctx.policy, local_salt(ctx.rt), ctx.red)
-        instr = doc_of(ctx.policy.check(ctx.cfg.instructions_path, "instructions"))
+        instr = [doc_of(ctx.policy.check(ctx.cfg.instructions_path, "review guidance"))]
+        if ctx.cfg.completion_mode == "json_result":
+            instr.append(doc_of(ctx.policy.check(ctx.cfg.result_contract_path, "result contract")))
         print(f"{len(cases)} case folder(s), {excluded} excluded browser-profile folder(s), "
               f"{len(other)} unrecognised folder(s): {', '.join(other) or '-'}")
         for c in cases:
@@ -2300,8 +2674,9 @@ async def wait_for_login(browser, stdin, log):
 
 def pick_default(entries):
     """Default model: the LAST one listed under GPT (models change fast, so no version-number parsing)."""
-    gpt = [e for e in entries if re.search(r"gpt|openai", e["group"], re.I)]
-    pool = gpt or [e for e in entries if e["group"] != "Modes"] or entries
+    usable = [e for e in entries if not e.get("disabled")]          # a greyed-out model cannot be selected
+    gpt = [e for e in usable if re.search(r"gpt|openai", e["group"], re.I)]
+    pool = gpt or [e for e in usable if e["group"] != "Modes"] or usable
     return pool[-1] if pool else None
 
 
@@ -2311,7 +2686,7 @@ def model_menu(entries, default) -> str:
         if e["group"] != group:
             group = e["group"]
             lines.append(f"  {group}")
-        lines.append(f"   {'*' if e is default else ' '} {i:>2}. {e['label']}")
+        lines.append(f"   {'*' if e is default else ' '} {i:>2}. {e['label']}{'  (unavailable now)' if e.get('disabled') else ''}")
     return "\n".join(lines)
 
 
@@ -2324,9 +2699,11 @@ async def choose_model(entries, default, cfg, stdin, log):
         want = cfg.requested_model.casefold()
         for e in entries:
             if want in (e["label"].casefold(), e["text"].casefold()):
+                if e.get("disabled"):
+                    raise Blocked("requested_model is currently unavailable in Copilot")
                 return e
         raise Blocked("requested_model is not offered by this Copilot experience")
-    print("\nAvailable models (* = default, the last GPT entry):\n" + model_menu(entries, default), flush=True)
+    print("\nAvailable models (* = default, the last available GPT entry):\n" + model_menu(entries, default), flush=True)
     while True:
         print(f"Model number for this run (Enter = {default['label']}): ", end="", flush=True)
         try:
@@ -2337,6 +2714,9 @@ async def choose_model(entries, default, cfg, stdin, log):
             print(flush=True)
             return default
         if line.strip().isdigit() and 1 <= int(line) <= len(entries):
+            if entries[int(line) - 1].get("disabled"):
+                print("  That model is greyed out in Copilot right now - pick another one.", flush=True)
+                continue
             return entries[int(line) - 1]
         print("  Please type a number from the list, or press Enter for the default.", flush=True)
 
@@ -2356,12 +2736,18 @@ async def run_async(ctx, journal, ledger, listed, cases, todo, instr, message) -
             except ConnectionLost:
                 browser.context = None
             await reconcile_open_intents(runner, journal, by_key, log)
-        if todo and browser.context is None:
+        resumable = cfg.completion_mode == "json_result" and any(
+            r.get("contract") and r.get("state") in ("submitted", "fixup_sent") and k in by_key for k, r in journal.cases.items())
+        if (todo or resumable) and browser.context is None:
             await browser.start(launch=True)
         todo = [c for c in todo if runner.sent_ids.get(c.id) is None]
         if todo:
             await prepare_session(runner, browser, cfg, log, todo)
-        results = await runner.run(collections.deque(todo))
+        if resumable:
+            await runner.resume(by_key)
+        if todo or runner.pending:
+            await runner.run(collections.deque(todo))
+        results = runner.results
     except Stopped:
         journal.record("_run", "cancelled", note="stopped by user")
         log("stopped", note="state preserved; Edge left open")
@@ -2373,8 +2759,10 @@ async def run_async(ctx, journal, ledger, listed, cases, todo, instr, message) -
     finally:
         await runner.discard_prefetch()
         await browser.close()
+    results = runner.results
     summarise(ctx, journal, cases, listed, results)
-    unresolved = [k for k, (s, _) in results.items() if s not in ("submitted",)]
+    ok = ("submitted", "result_correct", "result_incorrect", "result_inconclusive")   # a valid verdict is a finished case
+    unresolved = [k for k, (s, _) in results.items() if s not in ok or k in runner.partial]
     return code or (1 if unresolved else 0)
 
 
@@ -2417,7 +2805,7 @@ def summarise(ctx, journal, cases, listed, results):
     summary = {"finished": now(), "counts": dict(counts), "cases": rows}
     print("\nSUMMARY  " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
     for r in rows:
-        if r["state"] not in ("submitted", "skipped_already_sent"):
+        if r["state"] not in ("submitted", "skipped_already_sent", "result_correct", "result_incorrect", "result_inconclusive"):
             print(f"  {r['case']}  {r['state']}  {r['reason']}")
     try:
         write_atomic(ctx.rt.logs / f"summary-{datetime.datetime.now():%Y%m%d-%H%M%S}.json", json.dumps(summary, indent=1))
@@ -2439,7 +2827,9 @@ def run_command(args) -> int:
         ledger = Ledger(ctx.rt.ledger, cfg.persist_retries)
         listed = sync_ledger(journal, ledger, ctx.log)
         cases, other, excluded = discover(cfg, ctx.policy, local_salt(ctx.rt), ctx.red)
-        instr = doc_of(ctx.policy.check(cfg.instructions_path, "instructions"))
+        instr = [doc_of(ctx.policy.check(cfg.instructions_path, "review guidance"))]
+        if cfg.completion_mode == "json_result":
+            instr.append(doc_of(ctx.policy.check(cfg.result_contract_path, "result contract")))
         todo, done = classify([c for c in cases if not c.blocked], ctx, journal, listed)
         for c in cases:
             if c.blocked:

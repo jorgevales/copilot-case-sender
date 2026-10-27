@@ -55,9 +55,13 @@ class Env:
         self.instr.write_text("synthetic instructions", "utf-8")
         self.msg = base / "base_message.md"
         self.msg.write_text("# Please review this synthetic case.\nThanks.", "utf-8")
+        self.contract = base / "result_contract.md"
+        self.contract.write_text("synthetic result contract", "utf-8")
         cfg = {**S.DEFAULTS, "cases_root": str(self.cases_root), "instructions_path": str(self.instr),
                "base_message_path": str(self.msg), "python_executable": sys.executable,
                "edge_executable": sys.executable, "runtime_root": str(self.runtime),
+               "completion_mode": "submission_only", "result_contract_path": str(self.contract),
+               "answer_stable_seconds": 0, "collect_poll_seconds": 0.01, "answer_overdue_minutes": 20,
                "stable_seconds": 0, "poll_ms": 1, "upload_no_progress": 0.3, "upload_timeout": 5, "send_confirm_seconds": 0.2,
                "reconcile_seconds": 0.3, "retry_backoff": [0.01], "op_timeout": 2, **overrides}
         self.cfg = types.SimpleNamespace(**cfg)
@@ -83,8 +87,9 @@ class Env:
 
     def runner(self):
         message = S.load_message(self.msg)
+        fixed = [S.doc_of(self.instr)] + ([S.doc_of(self.contract)] if self.cfg.completion_mode == "json_result" else [])
         r = S.Runner(self.cfg, self.rt, self.policy, self.journal, self.ledger, self.log, self.stop,
-                     FakeBrowser(self.world), self.red, message, S.doc_of(self.instr))
+                     FakeBrowser(self.world), self.red, message, fixed)
         r.prompt_version = "t"
         return r
 
@@ -104,6 +109,25 @@ def env():
     yield e
     e.close()
     shutil.rmtree(base, ignore_errors=True)
+
+
+@pytest.fixture
+def env2():
+    """Like env, but answers are collected (json_result mode)."""
+    base = Path(ROOT) / f"t-{uuid.uuid4().hex[:8]}"
+    base.mkdir(parents=True)
+    e = Env(base, completion_mode="json_result")
+    yield e
+    e.close()
+    shutil.rmtree(base, ignore_errors=True)
+
+
+def answer_json(verdict="Correct", rows=None, **extra):
+    rows = rows if rows is not None else [{"ITEM": "limit", "Customer_expectation": "500", "System_data": "500", "MATCH": verdict != "Incorrect"}]
+    return json.dumps({"COPILOT_RESULT": verdict, "JUSTIFICATION": "because", "A_B_COMPARISONS": rows, **extra})
+
+
+GOOD = answer_json()
 
 
 class FakeStop:
@@ -135,6 +159,7 @@ class FakeTab:
         self.target_id = "T" + uuid.uuid4().hex[:8]
         self.attached, self.users, self.message, self.polls, self.closed, self.gone = [], [], "", 0, False, False
         self.sent_names, self.base_b, self.resets, self.models = [], dict(behavior), 0, []
+        self.answers, self.replies, self.followups, self.gen_left = list(behavior.get("answers", [GOOD])), [], [], behavior.get("gen_polls", 0)
         self.page = types.SimpleNamespace(bring_to_front=lambda: asyncio.sleep(0))
         world.tabs[self.target_id] = self
 
@@ -150,6 +175,7 @@ class FakeTab:
         self._alive()
         self.resets += 1
         self.attached, self.users, self.message, self.polls, self.b = [], [], "", 0, dict(self.base_b)
+        self.replies, self.gen_left = [], self.b.get("gen_polls", 0)
 
     async def ensure_model(self, entry):
         self.models.append(entry)
@@ -219,6 +245,7 @@ class FakeTab:
         if mode == "no_effect":
             return
         self.users.append(self.message)
+        self._reply()
         self.sent_names = list(self.attached) if not self.b.get("names_hidden") else []
         if mode == "raise_after":
             self.w.lost = True
@@ -227,6 +254,25 @@ class FakeTab:
             self.w.lost = True
             self.gone = True
             raise S.ConnectionLost("lost right after send")
+
+    def _reply(self):                              # Copilot "answers" with the next scripted text (kept after the last one)
+        text = self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
+        self.replies.append({"text": text, "blocks": [text] if text.lstrip().startswith(("{", "[")) else []})
+
+    async def read_answer(self):
+        self._alive()
+        last = self.replies[-1] if self.replies else {"text": "", "blocks": []}
+        generating = self.gen_left > 0
+        self.gen_left = max(0, self.gen_left - 1) if self.b.get("gen_polls", 0) < 1000 else self.gen_left
+        return {"users": len(self.users), "replies": len(self.replies), "text": last["text"], "blocks": last["blocks"],
+                "generating": generating}
+
+    async def send_followup(self, text):
+        self._alive()
+        self.w.events.append(("foreground", self.target_id))
+        self.followups.append(text)
+        self.users.append(text)
+        self._reply()
 
     async def evidence(self, needle):
         self._alive()
@@ -289,6 +335,11 @@ class FakeBrowser:
         self.w.opened += 1
         b = self.w.behaviors.pop(0) if self.w.behaviors else {}
         return FakeTab(self.w, b)
+
+    async def open_url_tab(self, url):
+        tab = FakeTab(self.w, {})
+        tab.users, tab.replies = ["earlier message"], [{"text": GOOD, "blocks": [GOOD]}]
+        return tab
 
     async def find_tab(self, target_id):
         t = self.w.tabs.get(target_id)
@@ -1005,3 +1056,217 @@ def test_minimal_console_shows_only_the_essentials_and_the_real_id_never_reaches
 def test_console_detail_setting_is_validated(env):
     bad = types.SimpleNamespace(**{**vars(env.cfg), "approved_root": str(env.base), "console_detail": "loud"})
     assert any("console_detail" in p for p in S.validate_config(bad)[1])
+
+
+# ------------------------------------------------------------------ V2: answer contract, collection, fix-ups
+
+def parsed(text=None, blocks=None):
+    return S.parse_answer({"text": text if text is not None else "", "blocks": blocks if blocks is not None else [text or ""]})
+
+
+def test_valid_answers_in_every_verdict_pass():
+    for verdict in ("Correct", "Incorrect", "Inconclusive"):
+        obj, problems = parsed(answer_json(verdict))
+        assert obj and problems == [], (verdict, problems)
+    inconclusive_empty = answer_json("Inconclusive", rows=[])
+    assert parsed(inconclusive_empty)[1] == []                                   # rows may be empty only for Inconclusive
+
+
+def test_structure_and_verdict_problems_are_named():
+    row = {"ITEM": "x", "Customer_expectation": "a", "System_data": "a", "MATCH": True}
+    cases = {
+        "missing key": (json.dumps({"COPILOT_RESULT": "Correct", "A_B_COMPARISONS": [row]}), "missing key(s): JUSTIFICATION"),
+        "extra key": (answer_json(NOTES="hi"), "unexpected key(s): NOTES"),
+        "verdict word": (answer_json().replace('"Correct"', '"correct"'), "exactly Correct, Incorrect or Inconclusive"),
+        "empty justification": (answer_json().replace('"because"', '""'), "JUSTIFICATION must be non-empty"),
+        "row shape": (answer_json(rows=[{"ITEM": "x", "MATCH": True}]), "row 1 must have exactly"),
+        "match type": (answer_json(rows=[{**row, "MATCH": "yes"}]), "MATCH must be true or false"),
+        "correct with a difference": (answer_json("Correct", rows=[{**row, "MATCH": False}]), "Correct requires every MATCH"),
+        "incorrect without a difference": (answer_json("Incorrect", rows=[row]), "Incorrect requires at least one MATCH"),
+        "correct without rows": (answer_json("Correct", rows=[]), "needs at least one"),
+    }
+    for name, (text, expected) in cases.items():
+        obj, problems = parsed(text)
+        assert any(expected in x for x in problems), (name, problems)
+
+
+def test_answer_extraction_rules():
+    assert parsed("no code here at all", blocks=[])[0] is None and "no JSON object" in parsed("hello", blocks=[])[1][0]
+    obj, problems = parsed("{ not json", blocks=["{ not json"])
+    assert obj is None and "not valid JSON" in problems[0]
+    older, newer = answer_json("Incorrect"), answer_json("Correct")
+    assert parsed("x", blocks=[older, newer])[0]["COPILOT_RESULT"] == "Correct"        # the newest block wins
+    assert parsed("intro\n```json\n" + GOOD + "\n```\nthanks", blocks=[])[0]["COPILOT_RESULT"] == "Correct"   # fenced text works too
+    assert parsed(GOOD, blocks=[])[0]["COPILOT_RESULT"] == "Correct"                                           # bare JSON reply works
+    assert "no JSON object" in parsed("x", blocks=["[1, 2]"])[1][0]
+
+
+def test_plain_text_json_is_found_even_with_words_around_it_and_braces_inside_strings():
+    text = "Here is my review. " + answer_json() + " Hope that helps!"
+    obj, problems = parsed(text, blocks=[])
+    assert obj["COPILOT_RESULT"] == "Correct" and problems == []
+    tricky = answer_json(rows=[{"ITEM": "a {b} c", "Customer_expectation": "{x}", "System_data": "{x}", "MATCH": True}])
+    assert parsed("result: " + tricky, blocks=[])[1] == []
+    older, newer = answer_json("Incorrect"), answer_json("Correct")
+    assert parsed(older + "\nfixed:\n" + newer, blocks=[])[0]["COPILOT_RESULT"] == "Correct"      # newest object wins
+    wrong_only = '{"COPILOT_RESULT": "maybe"}'
+    assert parsed("x " + wrong_only, blocks=[])[1]                                                  # judged, so it can be named
+
+
+def run_json(env2, answers_by_tab=None, cases=1, **cfg):
+    for key, value in cfg.items():
+        setattr(env2.cfg, key, value)
+    for n in range(1, cases + 1):
+        env2.make_case(n)
+    found, _, _ = env2.cases()
+    if answers_by_tab:
+        env2.world.behaviors = answers_by_tab
+    r = env2.runner()
+    return found, r, run(r.run(collections.deque(found)))
+
+
+def test_a_valid_answer_is_collected_saved_and_shown(env2, capsys):
+    cases, r, results = run_json(env2, cases=2)
+    assert [v[0] for v in results.values()] == ["result_correct"] * 2
+    for c in cases:
+        saved = json.loads((env2.rt.results / f"{c.id}.json").read_text("utf-8"))
+        assert saved["status"] == "result_valid" and saved["result"]["COPILOT_RESULT"] == "Correct" and saved["raw_text"]
+    rows = list(__import__("csv").reader((env2.rt.results / "results.csv").open(encoding="utf-8")))
+    assert rows[0][:3] == ["instruction_id", "status", "verdict"] and len(rows) == 3
+    assert env2.journal.cases[cases[0].key]["state"] == "result_valid"
+    assert any(l.startswith("result_correct") for l in (x.strip() for x in env2.out))
+    assert env2.ledger.read()[cases[0].id] == "submitted"                       # the ledger still means "submitted"
+    assert len(env2.world.sends) == 2 and all(set(n).issuperset({"instructions.md", "result_contract.md"}) for _, n, _ in env2.world.sends)
+
+
+def test_answered_tab_is_reset_and_reused_for_the_next_case(env2):
+    env2.make_case(1)
+    env2.make_case(2)
+    cases, _, _ = env2.cases()
+    r = env2.runner()
+
+    async def go():
+        await r.run(collections.deque(cases[:1]))
+        await r.run(collections.deque(cases[1:]))                              # second run: needs a tab, takes the answered one
+    run(go())
+    assert env2.world.opened == 1 and list(env2.world.tabs.values())[0].resets == 1
+    assert len(env2.world.sends) == 2
+
+
+def test_wrong_structure_gets_a_fixup_in_the_same_chat_then_succeeds(env2):
+    bad = "Sure! Here is my review in plain words."
+    cases, r, results = run_json(env2, [{"answers": [bad, GOOD]}])
+    tab = list(env2.world.tabs.values())[0]
+    assert results[cases[0].key][0] == "result_correct" and len(tab.followups) == 1
+    assert S.FIXUP_TEXT in tab.followups[0] and "no JSON object" in tab.followups[0] and "plain text" in tab.followups[0]
+    assert env2.journal.cases[cases[0].key]["fixups"] == 1 and env2.world.opened == 1 and len(env2.world.sends) == 1
+
+
+def test_three_failed_fixups_resubmit_the_same_id_in_the_refreshed_tab(env2):
+    bad = '{"COPILOT_RESULT": "maybe"}'
+    cases, r, results = run_json(env2, [{"answers": [bad] * 4 + [GOOD]}])
+    tab = list(env2.world.tabs.values())[0]
+    assert results[cases[0].key][0] == "result_correct"
+    assert len(tab.followups) == 3 and tab.resets == 1 and env2.world.opened == 1      # same tab, refreshed once
+    assert len(env2.world.sends) == 2 and r.attempts[cases[0].key] == 2                 # the case was resubmitted once
+    assert list(env2.ledger.read()) == [cases[0].id]                                    # still one ledger line
+
+
+def test_resubmission_is_bounded_by_the_total_tries(env2):
+    cases, r, results = run_json(env2, [{"answers": ['{"x": 1}']}], max_attempts=2, immediate_retries=2)
+    assert results[cases[0].key][0] == "result_invalid" and r.attempts[cases[0].key] == 2
+    assert len(env2.world.sends) == 2 and len(list(env2.world.tabs.values())[0].followups) == 6   # 3 fix-ups per try
+    saved = json.loads((env2.rt.results / f"{cases[0].id}.json").read_text("utf-8"))
+    assert saved["status"] == "result_invalid" and saved["result"] is None
+
+
+def test_an_overdue_answer_is_flagged_never_resent_and_reported(env2):
+    cases, r, results = run_json(env2, [{"gen_polls": 10 ** 6}], answer_overdue_minutes=0.0004)
+    assert results[cases[0].key][0] == "response_timeout" and len(env2.world.sends) == 1
+    assert any("answer overdue" in l for l in env2.out) and env2.journal.cases[cases[0].key]["state"] == "response_timeout"
+
+
+def test_a_slow_answer_is_waited_for_not_judged_early(env2):
+    cases, r, results = run_json(env2, [{"gen_polls": 5}])
+    assert results[cases[0].key][0] == "result_correct" and len(list(env2.world.tabs.values())[0].followups) == 0
+
+
+def test_an_unanswered_earlier_submission_is_collected_after_a_restart_without_resending(env2):
+    env2.make_case(1)
+    cases, _, _ = env2.cases()
+    c = cases[0]
+    r = env2.runner()
+    tab = run(r.browser.open_tab())
+    tab.users, tab.replies = ["earlier message"], [{"text": GOOD, "blocks": [GOOD]}]       # answered while the tool was closed
+    env2.journal.record(c.key, "submitted", alias=c.alias, instruction_id=c.id, contract=True, target_id=tab.target_id,
+                        conversation_url="https://example.invalid/chat/conversation/x", ledger_written=True)
+    env2.ledger.add(c.id, "submitted")
+
+    async def go():
+        await r.resume({c.key: c})
+        return await r.run(collections.deque())
+    results = run(go())
+    assert results[c.key][0] == "result_correct" and env2.world.sends == []
+    older = env2.runner()                                                              # tab gone: the saved link is used
+    older.journal.record(c.key, "submitted", alias=c.alias, instruction_id=c.id, contract=True, target_id="T-gone",
+                         conversation_url="https://example.invalid/chat/conversation/x", ledger_written=True)
+
+    async def go2():
+        await older.resume({c.key: c})
+        return await older.run(collections.deque())
+    assert run(go2())[c.key][0] == "result_correct" and env2.world.sends == []
+
+
+def test_v1_submissions_without_a_contract_are_not_resumed(env2):
+    env2.make_case(1)
+    cases, _, _ = env2.cases()
+    c = cases[0]
+    env2.journal.record(c.key, "submitted", alias=c.alias, instruction_id=c.id, target_id="T-old", ledger_written=True)
+    r = env2.runner()
+    run(r.resume({c.key: c}))
+    assert r.pending == {} and c.key not in r.results
+
+
+def test_collector_never_takes_the_front_tab_between_foreground_and_send(env2):
+    for n in range(1, 5):
+        env2.make_case(n)
+    cases, _, _ = env2.cases()
+    results = run(env2.runner().run(collections.deque(cases)))
+    assert [v[0] for v in results.values()] == ["result_correct"] * 4
+    events = env2.world.events
+    for i, (kind, tid) in enumerate(events):
+        if kind == "send":
+            assert events[i - 1] == ("foreground", tid)
+
+
+def test_plan_with_two_fixed_files_and_the_limit(env2):
+    folder = env2.make_case(1, files=tuple(f"f{i:02d}.txt" for i in range(19)))        # 19 docs + 2 fixed = 21 > 20
+    cases, _, _ = env2.cases()
+    S.inventory(cases[0], env2.cfg, env2.policy)
+    fixed = [S.doc_of(env2.instr), S.doc_of(env2.contract)]
+    plan, left = S.build_plan(cases[0], fixed, env2.cfg, env2.policy)
+    assert [p["name"] for p in plan[:2]] == ["instructions.md", "result_contract.md"] and len(plan) == 20 and len(left) == 1
+
+
+def test_json_mode_needs_a_contract_and_verdict_colours(env2, monkeypatch, capsys):
+    bad = types.SimpleNamespace(**{**vars(env2.cfg), "approved_root": str(env2.base), "result_contract_path": ""})
+    assert any("result_contract_path" in p for p in S.validate_config(bad)[1])
+    monkeypatch.setattr(S, "use_colour", lambda: True)
+    log = S.Log(None, env2.red)
+    for phase in ("result_correct", "result_incorrect", "result_inconclusive"):
+        log(phase, "case-aaa111")
+    out = capsys.readouterr().out.splitlines()
+    assert out[0].startswith("\x1b[42;97m") and out[1].startswith("\x1b[41;97m") and out[2].startswith("\x1b[43;30m")
+
+
+def test_greyed_out_models_are_flagged_skipped_as_default_and_refused(env):
+    models = [dict(m) for m in MODELS]
+    models[-1]["disabled"] = True                                              # GPT-6.1 Sol greyed out by Copilot
+    default = S.pick_default(models)
+    assert default["label"] == "GPT-5.6 Sol Think deeper"                      # last AVAILABLE GPT entry
+    assert "(unavailable now)" in S.model_menu(models, default)
+    answer = run(S.choose_model(models, default, env.cfg, FakeStdin(["10", ""]), env.log))
+    assert answer is default                                                   # "10" was refused, Enter took the default
+    pinned = types.SimpleNamespace(**{**vars(env.cfg), "requested_model": "GPT-6.1 Sol"})
+    with pytest.raises(S.Blocked):
+        run(S.choose_model(models, default, pinned, FakeStdin(), env.log))

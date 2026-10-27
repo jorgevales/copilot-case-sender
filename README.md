@@ -13,7 +13,8 @@ ones are typed once during setup and stay in your local, git-ignored `sender_con
 1. Put `Run.cmd` and `copilot_case_sender.py` together in a folder on `S:`.
 2. Double-click `Run.cmd`. It asks once for `PYTHON_EXECUTABLE` (paste the path, quotes are fine; it also looks
    for a `python\python.exe` beside it) and then starts `setup`.
-3. `setup` asks you to paste: `CASES_ROOT`, the **Review guidance** `.md` file, the `base_message` file, `PYTHON_EXECUTABLE`,
+3. `setup` asks you to paste: `CASES_ROOT`, the **Review guidance** `.md` file, the `base_message` file, the **Result contract**
+   `.md` (Enter = no answer collection), `PYTHON_EXECUTABLE`,
    `EDGE_EXECUTABLE`, `RUNTIME_ROOT` (and optionally a Node.js `node.exe`). Pressing Enter keeps a shown default;
    a folder pasted where a file is expected is searched for the expected name. Re-run `Run.cmd setup` any time to edit.
 4. `Run.cmd check` validates everything (nothing is sent). `Run.cmd plan` shows the queue and any blocked cases.
@@ -78,6 +79,44 @@ Speed comes from removing dead time, never from skipping a check: DOM-event poll
 round-trip per poll, warm tabs ready before the first case, model selection and tab preparation in parallel with your
 prompt, file bulk-assignment, and **pipelining** of the next case's inventory. Sends themselves never overlap.
 
+### V2: the answer contract and result collection
+
+`review_guidance.md` tells Copilot *what to analyse and how*; **`result_contract.md`** (shipped in this repo as a strict
+template – edit it freely) tells it *exactly what to answer*. Both are attached to every case (2 fixed files, so up to 18
+case documents under the 20 limit). Your `base_message` should tell Copilot to answer only as the contract defines.
+
+**The answer is plain text, not a code box** (code boxes sometimes fail to render): one JSON object, on one line:
+
+    {"COPILOT_RESULT":"Correct|Incorrect|Inconclusive","JUSTIFICATION":"text","A_B_COMPARISONS":[{"ITEM":"what","Customer_expectation":"value","System_data":"live value","MATCH":true}]}
+
+The tool reads only the **newest assistant reply** of that case's chat once Copilot has stopped generating and the text
+has been unchanged for `answer_stable_seconds`. It finds the JSON object anywhere in the text (words around it or a code
+block are tolerated) and checks it strictly: exactly the 3 keys, the verdict exactly `Correct`/`Incorrect`/`Inconclusive`,
+each row exactly `ITEM`, `Customer_expectation`, `System_data`, `MATCH` (true/false), and the verdict must agree with the
+rows (`Correct` ⇒ every `MATCH` true; `Incorrect` ⇒ at least one false; both need at least one row).
+
+* **Not valid?** The tool immediately asks, in the same chat, for “your exact same answer, unchanged in content, in the
+  correct structure” and names what was wrong – up to `fixup_requests` (3) times.
+* **Still not valid?** The same instruction ID is resubmitted in the **same tab refreshed to a new chat**, inside the same
+  5-tries budget (the only case where a submitted ID is sent again: no valid answer exists). After the last try the case
+  ends as `result_invalid`.
+* **Slow answers:** after `answer_overdue_minutes` (20) the console shows “answer overdue”; the tool keeps waiting and
+  never resubmits a case Copilot may still be answering. When nothing else is left to send it is reported as
+  `response_timeout`.
+* **Collection runs in the background**: cases are still sent one by one; while Copilot answers, the next case is
+  sent. A collector visits each answering tab (bringing it to the front – the sender and the collector never use the
+  front tab at the same time), judges finished answers and sends fix-ups. A tab whose answer is collected is reset to a
+  new chat and reused when a later case needs a tab.
+* **Results** (local, in `RUNTIME_ROOT\results`): `<instruction ID>.json` (the validated answer + raw text) and
+  `results.csv` (ID, status, verdict, rows, differences, tries, fixups, left-out files). The console prints each verdict:
+  Correct white on green, Incorrect white on red, Inconclusive black on yellow. A valid verdict, even *Incorrect*, is a
+  finished case; the ledger still means “submitted” and a case with a valid answer is skipped on re-runs.
+* **Re-runs:** a case submitted earlier but never answered gets its answer collected from its saved chat (same tab by exact
+  target ID, else the saved conversation link in a new tab) – never resent for that. Cases submitted before V2 are not
+  touched.
+* Model picker: models that Copilot greys out (for example after a usage limit) are shown as unavailable, are never the
+  default, and choosing one stops the run with a clear message instead of burning retries.
+
 ### Re-runs and manual resend
 `RUNTIME_ROOT\sent_instructions.txt` lists every instruction ID that was submitted (or is `uncertain`). Those IDs are
 **never sent again**. To resend one yourself (new documents, a failed process…) **delete its line** and save; the next
@@ -87,8 +126,9 @@ ones are never retried – check them in Copilot first.
 ### Outcomes
 `queued · preflight_blocked · preparing · uploading · upload_ready · send_intent · submitted · retry_pending ·
 submission_uncertain · failed_exhausted · cancelled` (+ run-level `recovery_required`). These are *transport*
-outcomes. **Response collection and result validation are not delivered in this version** (`completion_mode` only
-accepts `submission_only`); “submitted” never means “the analysis was correct”.
+outcomes: “submitted” never means “the analysis was correct”. With `completion_mode: json_result` (V2, below) each
+submitted case continues with `fixup_sent · result_valid · result_invalid · response_timeout`;
+`completion_mode: submission_only` is the V1 behaviour (send only).
 
 Blocked (never silently skipped, other cases continue): unsupported type, empty file, over `max_file_mb`,
 unreadable/locked file, likely password-protected Office/PDF file, link not followed.
@@ -197,6 +237,7 @@ Needs `pytest`; refuses to run without `SENDER_TEST_ROOT` (never uses system Tem
 | CDP loss during upload / right after send; target missing → uncertain; no resend | **Tested here** (fake page) |
 | Crash between send and persistence; ledger repair/release; retry exhaustion; cancel | **Tested here** |
 | No cross-case contamination; redaction of console/summary | **Tested here** |
+| V2 on real Copilot: contract + guidance attached, plain-text JSON answers read back, Correct / Incorrect / Inconclusive verdicts from 3 synthetic cases, results.csv and per-case JSON | **Live-tested** (about 15 s from send to verdict); the fix-up and resubmission loops are **tested here** with a fake page |
 | Real Copilot: sign-in auto-detection, model discovery + selection, 5 warm tabs, intercepted file chooser (no Windows dialog), exact-20-file upload, send, confirmation in the same tab, no cross-case mixing, re-run skips sent IDs, manual release, over-limit partial send | **Live-tested** on a Microsoft 365 Copilot profile with synthetic files (about 7–11 s per case); the VDI is yours to re-confirm |
 | Upload-error → Try again ×2 → same-tab refresh → 5 tries; model picker with a different model list | **Tested here** with a fake page (could not be provoked on the real page) |
 | Green/yellow status colours | **Tested here** (escape codes; look on your console) |
