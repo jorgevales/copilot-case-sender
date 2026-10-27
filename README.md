@@ -29,15 +29,43 @@ Queue = immediate child folders of `CASES_ROOT` named `<32 hex instruction ID>[ 
 `.edge-debug-9223` (any letter case) is excluded before anything else touches it. Other folders are reported
 by a safe alias (`other-xxxxxx`); two folders with the same ID are both blocked and reported, never merged.
 
-For each case, strictly one at a time:
-fresh tab → inventory of **direct files** (set `recursive_documents` to include subfolders) → attach all documents
-+ instructions in **one** `DOM.setFileInputFiles` call → type `base_message` → wait until the **exact** attachment
-set is present with no transfer/error and Send enabled (held steady for `stable_seconds`) → record `send_intent`
-→ click Send once → confirm the user message in *that* tab → record `submitted`, then add the ID to the ledger.
+### Start of a run (once)
+1. **Sign-in detection.** Edge opens; the tool keeps checking (every 0.25 s, no overall limit) until a Copilot tab shows
+   both the chat composer and the model button, then continues **by itself**. If you are already signed in nothing is
+   asked. After 1 s of waiting it tells you to sign in in the Edge window; pressing **Enter** in the terminal is only a
+   manual fallback (ignored when the terminal is redirected).
+2. **Model discovery** (~3 s): the model button's menu is read – modes (Auto, Quick response, Think deeper) and every
+   provider submenu (Claude, GPT …); nothing is hard-coded, so added or removed models just appear.
+3. **You choose** by number, **Enter = default = the last entry listed under GPT** (no version parsing). Setting
+   `requested_model` skips the question. `model_prompt_seconds` (default 0 = wait) can make an unattended run continue
+   with the default.
+4. **Warm-up in parallel with step 3:** up to `warm_tabs` (default 8, never more than the cases to send) Copilot tabs are
+   opened at once and then walked through one by one like a person would (brought forward, pointer over the composer,
+   a short pause) so Copilot wakes each one. After your answer every tab applies the chosen model in the background.
+
+### Per case, strictly one at a time
+take a warm tab → check the model label (a cheap read) → attach all documents + instructions in **one bulk
+assignment** → type `base_message` while the transfer runs → wait until the **exact** attachment set is present with no
+transfer/error and Send enabled (held steady for `stable_seconds`) → record `send_intent` → click Send once → confirm
+the user message in *that* tab → record `submitted`, then add the ID to the ledger. Inventory of the next case runs
+meanwhile (**direct files** only unless `recursive_documents` is set). Cases beyond the warmed tabs open a new tab on
+demand (V1 is meant for a handful of controlled cases; recycling answered tabs is a later version).
+
+**How files are attached (no Windows file window).** The `+` button's "Upload images and files" entry normally opens
+Windows' own file dialog, which broke sends on the VDI. The tool registers a Playwright *file-chooser listener* on every
+tab, which intercepts the chooser: the dialog never appears and the full file list is handed to the page in one call
+(`set_files`). Only that one menu entry is ever clicked; the quick-action buttons under the composer are never touched.
+A simulated drag-and-drop was tried and **does not work** in this Copilot (the page receives the drop, ignores it).
+
+**Failures:** if Copilot shows a real upload error with its own *Try again* button, that button is clicked (max 2
+times, only inside an upload-error message – never the response *Regenerate*). Still failing → **the same tab is
+refreshed to the original Copilot chat link** (new chat) and the same case is tried again, **up to 5 tries in total**
+(first 3 back-to-back, then the case moves to the end of the queue for the rest). A connection loss before sending
+reconnects and continues; after sending it never resends (see *Uncertain sends*).
 
 Speed comes from removing dead time, never from skipping a check: DOM-event polling (no fixed sleeps), one browser
-round-trip per poll, no copying of files unless a name clash needs an alias, and **pipelining** – while case N
-uploads, case N+1's folder is inventoried and its fresh tab is opened. Sends themselves never overlap.
+round-trip per poll, warm tabs ready before the first case, model selection and tab preparation in parallel with your
+prompt, file bulk-assignment, and **pipelining** of the next case's inventory. Sends themselves never overlap.
 
 ### Re-runs and manual resend
 `RUNTIME_ROOT\sent_instructions.txt` lists every instruction ID that was submitted (or is `uncertain`). Those IDs are
@@ -158,7 +186,8 @@ Needs `pytest`; refuses to run without `SENDER_TEST_ROOT` (never uses system Tem
 | CDP loss during upload / right after send; target missing → uncertain; no resend | **Tested here** (fake page) |
 | Crash between send and persistence; ledger repair/release; retry exhaustion; cancel | **Tested here** |
 | No cross-case contamination; redaction of console/summary | **Tested here** |
-| Real Copilot: fresh chat, 3-file and exact-20-file upload, send, confirmation in the same tab, no cross-case mixing, re-run skips sent IDs, manual release by deleting a ledger line, over-limit partial send | **Live-tested** on a personal Microsoft 365 profile with synthetic files (about 5–13 s per case); re-check on your tenant |
+| Real Copilot: sign-in auto-detection, model discovery + selection, 5 warm tabs, intercepted file chooser (no Windows dialog), exact-20-file upload, send, confirmation in the same tab, no cross-case mixing, re-run skips sent IDs, manual release, over-limit partial send | **Live-tested** on a Microsoft 365 Copilot profile with synthetic files (about 7–11 s per case); the VDI is yours to re-confirm |
+| Upload-error → Try again ×2 → same-tab refresh → 5 tries; model picker with a different model list | **Tested here** with a fake page (could not be provoked on the real page) |
 | Green/yellow status colours | **Tested here** (escape codes; look on your console) |
 | Unresponsive renderer on a real Edge | **Needs your Windows/VDI** (error path tested with a fake) |
 
@@ -166,7 +195,7 @@ Needs `pytest`; refuses to run without `SENDER_TEST_ROOT` (never uses system Tem
 
 Reused ideas (re-written, not imported): dedicated-profile Edge launch with loopback debugging; `/json/version`
 polling and endpoint validation; browser-WebSocket-then-HTTP `connect_over_cdp` with the 3-6-12-20-30 s ladder;
-exact target-ID rebinding; the composer/attachment/Send/Stop selectors; `DOM.setFileInputFiles` bulk assignment (the
+exact target-ID rebinding; the composer/attachment/Send/Stop selectors; bulk file assignment (originally `DOM.setFileInputFiles`, now through an intercepted file chooser; the
 quarantined `playwright_bulk` route is **not** restored); Send-versus-Stop guarding; first-launch private install.
 Dropped: the old audit workflow (CSV/allow-lists, merge-status JSON, merged PDFs, case-size categories, multi-case
 packing, audit prompt/response contract/result parser), indefinite reconnect loops, permissive Edge flags, Temp

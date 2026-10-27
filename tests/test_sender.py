@@ -133,7 +133,8 @@ class FakeTab:
         self.w, self.b = world, behavior
         self.target_id = "T" + uuid.uuid4().hex[:8]
         self.attached, self.users, self.message, self.polls, self.closed, self.gone = [], [], "", 0, False, False
-        self.sent_names = []
+        self.sent_names, self.base_b, self.resets, self.models = [], dict(behavior), 0, []
+        self.page = types.SimpleNamespace(bring_to_front=lambda: asyncio.sleep(0))
         world.tabs[self.target_id] = self
 
     def _alive(self):
@@ -143,6 +144,20 @@ class FakeTab:
     async def fresh(self):
         self._alive()
         return not self.users and not self.attached
+
+    async def reset(self):                       # "go to the original chat link again": a brand-new chat in the same tab
+        self._alive()
+        self.resets += 1
+        self.attached, self.users, self.message, self.polls, self.b = [], [], "", 0, dict(self.base_b)
+
+    async def ensure_model(self, entry):
+        self.models.append(entry)
+
+    async def adopt(self):
+        pass
+
+    async def discover_models(self):
+        return list(MODELS)
 
     async def url(self):
         return "https://example.invalid/chat/" + self.target_id
@@ -220,11 +235,43 @@ class FakeTab:
         pass
 
 
+MODELS = ([{"group": "Modes", "label": m, "text": m} for m in ("Auto", "Quick response", "Think deeper")]
+          + [{"group": "Claude", "label": m, "text": m} for m in ("Sonnet 5", "Sonnet 5.5", "Opus 5.5")]
+          + [{"group": "GPT", "label": m, "text": m} for m in ("GPT-5.6 Sol Quick response", "GPT-6", "GPT-5.6 Sol Think deeper", "GPT-6.1 Sol")])
+
+
+class FakeStdin:
+    """Scripted terminal: lines come out in order, then 'nothing typed yet' (hangs) or EOF (None)."""
+
+    def __init__(self, lines=(), eof=False):
+        self.lines, self.eof, self.drained = list(lines), eof, 0
+
+    async def line(self):
+        if self.lines:
+            return self.lines.pop(0)
+        if self.eof:
+            return None
+        await asyncio.sleep(3600)
+
+    def drain(self):
+        self.drained += 1
+        self.lines.clear()
+
+
 class FakeBrowser:
     def __init__(self, world):
         self.w = world
         world.lost = False
         self.context = object()
+        self.stop = FakeStop()
+        self.ready_after = 0                    # find_ready_tab returns a tab only after this many polls
+
+    async def open_tabs(self, count):
+        return [await self.open_tab() for _ in range(count)]
+
+    async def find_ready_tab(self):
+        self.ready_after -= 1
+        return FakeTab(self.w, {}) if self.ready_after <= 0 else None
 
     @property
     def generation(self):
@@ -518,16 +565,16 @@ def test_delayed_chips_wait_for_the_full_set(env):
     assert env.world.sends[0][1].__len__() == 3
 
 
-def test_partial_upload_abandons_unsent_composer_then_retries_sequentially(env):
+def test_partial_upload_refreshes_the_same_tab_then_retries_sequentially(env):
     env.world.behaviors = [{"partial": 1}]
     env.make_case(1)
     cases, _, _ = env.cases()
     results = run(env.runner().run(collections.deque(cases)))
     assert results[cases[0].key][0] == "submitted"
     routes = [c[2] for c in env.world.attach_calls]
-    assert routes == ["bulk", "sequential"] and env.world.opened == 2          # whole plan re-sent only on a FRESH conversation
-    first = list(env.world.tabs.values())[0]
-    assert first.closed and not first.users                                     # abandoned unsent tab, nothing was sent from it
+    assert routes == ["bulk", "sequential"] and env.world.opened == 1          # whole plan re-sent only after a refresh to a NEW chat
+    tab = list(env.world.tabs.values())[0]
+    assert tab.resets == 1 and not tab.closed                                   # the SAME tab went back to the original chat link
     assert len(env.world.sends) == 1
 
 
@@ -535,9 +582,12 @@ def test_unexpected_extra_attachment_never_sends(env):
     env.world.behaviors = [{"extra": True}] * 6
     env.make_case(1)
     cases, _, _ = env.cases()
-    results = run(env.runner().run(collections.deque(cases)))
+    r = env.runner()
+    results = run(r.run(collections.deque(cases)))
     assert results[cases[0].key][0] == "failed_exhausted" and env.world.sends == []
     assert env.journal.cases[cases[0].key]["state"] == "failed_exhausted"
+    assert r.attempts[cases[0].key] == 5 and env.world.opened == 1             # exactly 5 tries, all in the one tab
+    assert list(env.world.tabs.values())[0].closed                              # leftover unsent tab closed at the end
 
 
 def test_cdp_loss_during_upload_reconnects_and_retries_without_sending_twice(env):
@@ -641,6 +691,7 @@ def test_failed_case_goes_to_queue_tail_and_attempts_are_bounded(env):
     assert results[cases[1].key][0] == "submitted"                                  # next case was not held up
     assert results[cases[0].key][0] == "submitted"                                  # tail retry succeeded
     assert r.attempts[cases[0].key] == 3 and r.attempts[cases[0].key] <= env.cfg.max_attempts
+    assert env.world.opened <= 2
 
 
 def test_cancel_before_send_is_clean_and_sends_nothing(env):
@@ -822,3 +873,88 @@ def test_over_limit_sends_first_files_and_warns_loudly(env):
 
 def test_exit_status_treats_partial_as_not_fully_successful(env):
     assert "submitted_partial" not in ("submitted",)
+
+
+# ------------------------------------------------------------------ sign-in, model choice, warm-up
+
+def test_default_model_is_the_last_gpt_entry_whatever_it_is_called():
+    assert S.pick_default(MODELS)["label"] == "GPT-6.1 Sol"
+    renamed = [{"group": "GPT", "label": x, "text": x} for x in ("Alpha", "Zeta")]
+    assert S.pick_default(renamed)["label"] == "Zeta"                          # no version numbers are parsed
+    no_gpt = MODELS[:6]
+    assert S.pick_default(no_gpt)["label"] == "Opus 5.5"                       # falls back to the last real model
+    assert S.pick_default([]) is None
+    text = S.model_menu(MODELS, S.pick_default(MODELS))
+    assert "* 10. GPT-6.1 Sol" in text and "Claude" in text and "Modes" in text
+
+
+def test_model_answers_enter_number_invalid_override_and_no_terminal(env, capsys):
+    default = S.pick_default(MODELS)
+    ask = lambda lines, cfg=env.cfg, entries=MODELS, eof=False: run(S.choose_model(entries, default, cfg, FakeStdin(lines, eof), env.log))
+    assert ask([""]) is default
+    assert ask(["4"])["label"] == "Sonnet 5"
+    assert ask(["99", "x", "2"])["label"] == "Quick response"                  # invalid answers are asked again
+    assert ask([], eof=True) is default                                        # redirected input: take the default
+    assert ask([], entries=[]) is None                                         # picker unreadable: leave Copilot as is
+    pinned = types.SimpleNamespace(**{**vars(env.cfg), "requested_model": "opus 5.5"})
+    assert ask([], pinned)["label"] == "Opus 5.5"                              # setting skips the question
+    with pytest.raises(S.Blocked):
+        ask([], types.SimpleNamespace(**{**vars(env.cfg), "requested_model": "nope"}))
+
+
+def test_label_matches_requires_the_same_model_not_a_prefix_of_another():
+    e = {"label": "GPT-6.1 Sol"}
+    assert S.label_matches("GPT-6.1 Sol", e) and S.label_matches("gpt-6.1 sol", e)
+    assert not S.label_matches("GPT-6", e) and not S.label_matches("", e)
+    assert S.label_matches("GPT-5.6 Sol", {"label": "GPT-5.6 Sol Think deeper"})     # button may show a shorter title
+
+
+def test_login_is_detected_automatically_and_an_early_enter_is_discarded(env):
+    b = FakeBrowser(env.world)
+    b.ready_after = 3
+    stdin = FakeStdin()
+    tab = run(S.wait_for_login(b, stdin, env.log))
+    assert tab is not None and stdin.drained == 1 and env.world.opened == 0     # moved on by itself, no keypress needed
+
+
+def test_enter_is_only_a_fallback_and_missing_terminal_input_is_ignored(env):
+    b = FakeBrowser(env.world)
+    b.ready_after = 10 ** 6                                                    # never detected
+    tab = run(S.wait_for_login(b, FakeStdin([""]), env.log))
+    assert env.world.opened == 1 and tab.target_id                             # user confirmed manually
+    b2, calls = FakeBrowser(env.world), {"n": 0}
+    b2.ready_after = 10 ** 6
+    real = b2.find_ready_tab
+
+    async def counting():
+        calls["n"] += 1
+        if calls["n"] == 4:
+            b2.ready_after = 0
+        return await real()
+    b2.find_ready_tab = counting
+    run(S.wait_for_login(b2, FakeStdin(eof=True), env.log))                     # EOF must NOT count as "continue"
+    assert calls["n"] == 4
+
+
+def test_session_warmup_fills_the_pool_and_applies_the_model_in_the_background(env):
+    for n in range(1, 4):
+        env.make_case(n)
+    cases, _, _ = env.cases()
+    r = env.runner()
+    cfg = types.SimpleNamespace(**{**vars(env.cfg), "warm_tabs": 8, "requested_model": "GPT-6.1 Sol"})
+    async def go():                                    # one event loop: the background model tasks live in it
+        await S.prepare_session(r, r.browser, cfg, env.log, cases)
+        assert len(r.pool) == 3                         # min(warm_tabs, cases)
+        assert r.model["label"] == "GPT-6.1 Sol"
+        return await r.run(collections.deque(cases))
+    results = run(go())
+    assert [v[0] for v in results.values()] == ["submitted"] * 3 and env.world.opened == 2   # first + 2 warmed, none opened ad hoc
+    assert all(t.models and t.models[0]["label"] == "GPT-6.1 Sol" for t in env.world.tabs.values())
+
+
+def test_every_setting_the_code_reads_has_a_default():
+    import re as _re
+    source = SRC.read_text("utf-8")
+    used = set(_re.findall(r"\bcfg\.([a-z_]+)", source)) | set(_re.findall(r"self\.cfg\.([a-z_]+)", source))
+    missing = sorted(k for k in used if k not in S.DEFAULTS and k not in S.REQUIRED)
+    assert missing == []

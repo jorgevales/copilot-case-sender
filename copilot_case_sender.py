@@ -33,6 +33,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import tempfile
 import time
 import types
@@ -333,7 +334,10 @@ DEFAULTS = {
     "op_timeout": 20, "stable_seconds": 1.0, "poll_ms": 150,
     "upload_timeout": 600, "upload_no_progress": 90, "upload_retry_clicks": 2,
     "send_confirm_seconds": 30, "reconcile_seconds": 45,
-    "immediate_retries": 2, "max_attempts": 4, "retry_backoff": [2, 5, 15], "persist_retries": 5,
+    "immediate_retries": 3, "max_attempts": 5,             # a failed case is tried up to 5 times in total
+    "warm_tabs": 8, "warm_dwell_seconds": 0.4,             # tabs prepared (and visibly walked through) before the run
+    "model_prompt_seconds": 0,                              # 0 = wait for your answer; Enter always takes the default
+    "retry_backoff": [2, 5, 15], "persist_retries": 5,
     "diagnostics_capture": False,     # screenshots/HTML are SENSITIVE, local-only, off by default
 }
 REQUIRED = ["cases_root", "instructions_path", "base_message_path", "python_executable",
@@ -432,7 +436,7 @@ def setup_command() -> int:
     value = ask("Node.js node.exe (optional; Enter = use the copy bundled with Playwright)", cur.get("node_executable") or node, True)
     cur["node_executable"] = str(resolve_file(value, "node.exe") or "") if value else ""
     if ask("Change optional settings (port, URL, model, recursion, limits)? y/N", "n").lower().startswith("y"):
-        for key in ("cdp_port", "copilot_url", "requested_model", "recursive_documents", "max_attachments", "over_limit_mode",
+        for key in ("cdp_port", "copilot_url", "requested_model", "recursive_documents", "max_attachments", "over_limit_mode", "warm_tabs",
                     "dependency_directory", "approved_root", "approved_unc_root"):
             value = ask(f"  {key}", str(cur.get(key, "")), True)
             default = DEFAULTS[key]
@@ -1293,6 +1297,30 @@ class EdgeBrowser:
         await tab.start()
         return tab
 
+    async def open_tabs(self, count: int) -> list:
+        """Warm-up: open `count` Copilot tabs at once, then walk through them one by one like a person
+        (forward, pointer over the composer) so Copilot fully wakes each of them."""
+        tabs = [CopilotTab(await self.context.new_page(), self.cfg, self.stop) for _ in range(count)]
+        await asyncio.gather(*(t.navigate() for t in tabs))
+        for t in tabs:
+            await t.activate()
+        return tabs
+
+    async def find_ready_tab(self):
+        """A Copilot page of this browser that already shows the chat composer + model button."""
+        origin = "{0.scheme}://{0.netloc}".format(urlparse(self.cfg.copilot_url))
+        seen = False
+        for page in list(self.context.pages):
+            if page.url.startswith(origin):
+                seen = True
+                tab = CopilotTab(page, self.cfg, self.stop)
+                if await tab.is_ready():
+                    return tab
+        if not seen:  # nothing on Copilot yet (e.g. all tabs closed): open one so sign-in can be seen
+            page = await self.context.new_page()
+            await page.goto(self.cfg.copilot_url, wait_until="domcontentloaded", timeout=60000)
+        return None
+
     async def find_tab(self, target_id: str):
         """Rebind by EXACT target id - never by tab index or a shared URL."""
         for page in list(self.context.pages):
@@ -1317,6 +1345,17 @@ SEND_BTN = ('button[aria-label="Send"], button[aria-label^="Send "]:not([aria-la
 USER_MSG = '[data-testid="chatQuestion"],.fai-UserMessage,[aria-labelledby^="user-message-"]'
 ASSISTANT_MSG = ('[data-testid="copilot-message-reply-div"] [data-testid="markdown-reply"],'
                  '[data-testid="copilot-message-div"] [data-testid="markdown-reply"],.fai-CopilotMessage__content')
+UPLOAD_ITEM = re.compile(r"upload", re.I)          # menu entry "Upload images and files" under the + button
+READY_JS = ("() => { const vis = e => !!(e && (e.offsetWidth || e.offsetHeight)); const q = s => document.querySelector(s);"
+            " return vis(q(" + json.dumps(", ".join(EDITORS)) + ")) && vis(q(\"button[aria-label*='model selector' i], #gptModeSwitcher\")); }")
+# First visible menu = modes + provider entries (aria-haspopup); a provider's models open as the 2nd menu.
+MENU_JS = r"""idx => {
+  const norm = v => String(v || '').replace(/\s+/g, ' ').trim();
+  const menus = [...document.querySelectorAll('[role="menu"]')].filter(m => m.offsetWidth || m.getClientRects().length);
+  const m = menus[idx]; if (!m) return null;
+  return [...m.querySelectorAll('[role="menuitem"],[role="menuitemradio"]')].filter(e => e.closest('[role="menu"]') === m).map(e => {
+    const span = [...e.querySelectorAll('span')].find(x => norm(x.textContent) && ![...x.querySelectorAll('span')].some(y => norm(y.textContent)));   // first leaf span = the name
+    return {text: norm(e.textContent), title: norm(span ? span.textContent : e.textContent), popup: e.getAttribute('aria-haspopup') || ''}; }); }"""
 MODEL_SWITCHER = ("#gptModeSwitcher, [data-testid*='gptModeSwitcher' i], button[aria-label*='response mode' i], "
                   "button[aria-label*='model selector' i], button[aria-label*='mode selector' i]")
 
@@ -1378,12 +1417,26 @@ RETRY_JS = r"""() => {   // click "Try again" ONLY inside an upload-error alert 
   return false; }"""
 
 
+def label_matches(current, entry) -> bool:
+    """Does the model button text show this entry?  (exact, or one is the other plus a descriptive suffix)"""
+    cur, label = norm_ws(current).casefold(), norm_ws(entry["label"]).casefold()
+    return bool(cur) and (cur == label or label.startswith(cur + " ") or cur.startswith(label + " "))
+
+
 class CopilotTab:
     """Everything that touches one Copilot page.  All other code sees only these small methods, so the
     transaction logic can be tested against a fake tab."""
 
     def __init__(self, page, cfg, stop):
         self.page, self.cfg, self.stop, self.target_id = page, cfg, stop, ""
+        self._chooser = None
+        # Registering a file-chooser listener makes Playwright INTERCEPT the chooser: Windows' own file dialog can
+        # never open (it used to break the send).  We answer the chooser ourselves with the whole file list.
+        page.on("filechooser", self._on_chooser)
+
+    def _on_chooser(self, chooser):
+        if self._chooser is not None and not self._chooser.done():
+            self._chooser.set_result(chooser)
 
     async def _ev(self, script, arg=None):
         return await asyncio.wait_for(self.page.evaluate(script, arg) if arg is not None else self.page.evaluate(script),
@@ -1392,8 +1445,45 @@ class CopilotTab:
     @guarded
     async def start(self):
         self.target_id = await asyncio.wait_for(page_target_id(self.page), self.cfg.op_timeout)
+        await self.reset()
+
+    @guarded
+    async def reset(self):
+        """Back to a brand-new Copilot chat in THIS tab (open the original chat link again)."""
         await self.page.goto(self.cfg.copilot_url, wait_until="domcontentloaded", timeout=60000)
         await self.wait_composer()
+        if not await self._is_fresh():
+            await self._new_chat()
+
+    @guarded
+    async def adopt(self):
+        """Take over a tab that is already signed in (the login tab): same tab id, fresh chat."""
+        self.target_id = await asyncio.wait_for(page_target_id(self.page), self.cfg.op_timeout)
+        if not await self._is_fresh():
+            await self.reset()
+
+    async def is_ready(self) -> bool:
+        """Sign-in proof: the composer AND the model button are both on screen."""
+        try:
+            return bool(await asyncio.wait_for(self.page.evaluate(READY_JS), 1.5))
+        except Exception:
+            return False
+
+    @guarded
+    async def navigate(self):
+        """Start loading Copilot without waiting for it (warm-up opens many tabs at once)."""
+        self.target_id = await asyncio.wait_for(page_target_id(self.page), self.cfg.op_timeout)
+        await self.page.goto(self.cfg.copilot_url, wait_until="domcontentloaded", timeout=60000)
+
+    @guarded
+    async def activate(self):
+        """Do what a person would: bring the tab forward, move the pointer over the composer and let Copilot wake up."""
+        await self.page.bring_to_front()
+        await self.wait_composer()
+        box = await (await self._editor()).bounding_box()
+        if box:
+            await self.page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2, steps=6)
+        await asyncio.sleep(self.cfg.warm_dwell_seconds)
         if not await self._is_fresh():
             await self._new_chat()
 
@@ -1443,43 +1533,22 @@ class CopilotTab:
     async def snapshot(self) -> dict:
         return await self._ev(SNAPSHOT_JS)
 
-    async def _file_input_node(self, session):
-        doc = await session.send("DOM.getDocument", {"depth": -1, "pierce": True})
-        ids = (await session.send("DOM.querySelectorAll", {"nodeId": doc["root"]["nodeId"], "selector": "input[type=file]"}))["nodeIds"]
-        return ids[-1] if ids else None
-
-    async def _ensure_input(self):
-        """Expose Copilot's live file input: click the Add button (DOM click, then a real click), then any
-        'upload from device' menu item.  Tries until the input exists or the timeout passes."""
-        deadline = time.monotonic() + self.cfg.op_timeout
-        n = 0
-        while time.monotonic() < deadline:
-            if await self.page.locator("input[type='file']").count():
-                return
-            n += 1
-            if n % 2:
-                await self._ev("sel => { const b = document.querySelector(sel); if (b) b.click(); return !!b; }", ATTACH_BTN.split(", ")[1])
-            else:
-                btn = self.page.locator(ATTACH_BTN).first
-                if await btn.count():
-                    await btn.click(timeout=3000, force=True, no_wait_after=True)
-            await asyncio.sleep(0.05)
-            await self._ev(r"""() => { const rx = /upload|from (?:this )?device|computer|browse files/i;
-                const el = [...document.querySelectorAll('[role="menuitem"],[role="button"],button')].find(x => rx.test(x.textContent || x.getAttribute('aria-label') || ''));
-                if (el) el.click(); }""")
-            await asyncio.sleep(0.05)
-        raise UiError("Copilot showed an attach button but no file input appeared")
-
     async def _assign(self, files: list):
-        await self._ensure_input()
-        session = await self.page.context.new_cdp_session(self.page)
-        try:  # DOM.setFileInputFiles = browser-local assignment (no OS dialog); success != upload success
-            node = await self._file_input_node(session)
-            if node is None:
-                raise UiError("no file input found after opening the picker")
-            await session.send("DOM.setFileInputFiles", {"files": [os.path.abspath(f) for f in files], "nodeId": node})
-        finally:
-            await session.detach()
+        """Bulk-attach through the + menu -> "Upload images and files" -> intercepted file chooser.
+        Only that one menu entry is ever clicked; nothing else on the page (quick-action buttons, other
+        menu items) can open Windows' file dialog because the chooser is intercepted anyway."""
+        paths = [os.path.abspath(f) for f in files]
+        self._chooser = asyncio.get_running_loop().create_future()
+        await self.page.locator(ATTACH_BTN).first.click(timeout=10000)
+        item = self.page.get_by_role("menuitem", name=UPLOAD_ITEM).first
+        deadline = time.monotonic() + self.cfg.op_timeout
+        while not self._chooser.done() and time.monotonic() < deadline:
+            if await item.count():
+                await item.click(timeout=5000)
+                break
+            await asyncio.sleep(0.05)
+        chooser = await asyncio.wait_for(self._chooser, self.cfg.op_timeout)
+        await chooser.set_files(paths)   # the whole list at once; success here != upload success
 
     @guarded
     async def attach(self, paths: list, route: str):
@@ -1508,21 +1577,72 @@ class CopilotTab:
             return ""
         return await ed.evaluate("e => ('value' in e) ? e.value : (e.innerText || e.textContent || '')")
 
+    async def _menu(self, index: int, expect_open: str = "", not_these=()) -> list:
+        """Items of the index-th open menu.  With expect_open, wait until that provider entry is expanded; with
+        not_these, ignore a submenu still showing the previous provider's models (it is replaced a moment later)."""
+        if expect_open:
+            await self.page.wait_for_function(
+                "t => [...document.querySelectorAll('[role=menuitem][aria-haspopup][aria-expanded=true]')]"
+                ".some(e => e.textContent.includes(t)) && document.querySelectorAll('[role=menu]').length > 1",
+                arg=expect_open, timeout=self.cfg.op_timeout * 1000, polling=50)
+        deadline = time.monotonic() + self.cfg.op_timeout
+        while time.monotonic() < deadline:
+            items = await self._ev(MENU_JS, index)
+            if items and {m["text"] for m in items} != set(not_these):
+                return items
+            await asyncio.sleep(0.05)
+        raise UiError("the model menu did not open")
+
     @guarded
-    async def select_model(self, name: str):
-        sw = self.page.locator(MODEL_SWITCHER).first
-        if not await sw.count():
-            raise Blocked("requested model: no model selector found in this Copilot experience")
-        if name.lower() in norm_ws(await sw.text_content()).lower():
+    async def discover_models(self) -> list:
+        """List what the picker offers: [{'group', 'label', 'text'}].  Modes are plain entries; each provider
+        entry (Claude, GPT ...) is hovered to read its models.  The picker is closed again afterwards."""
+        await self.page.locator(MODEL_SWITCHER).first.click(timeout=10000)
+        top = await self._menu(0)
+        found = [{"group": "Modes", "label": m["title"], "text": m["text"]} for m in top if not m["popup"]]
+        previous = ()
+        for provider in [m for m in top if m["popup"]]:
+            await self.page.locator("[role=menuitem][aria-haspopup]", has_text=provider["title"]).first.hover()
+            models = await self._menu(1, provider["title"], previous)
+            previous = {m["text"] for m in models}
+            found += [{"group": provider["title"], "label": m["text"], "text": m["text"]} for m in models]
+        await self._close_menus()
+        return found
+
+    async def _close_menus(self):
+        """Escape closes a submenu first, then the menu: repeat until no menu is left open."""
+        for _ in range(4):
+            if not await self._ev("() => [...document.querySelectorAll('[role=menu]')].some(m => m.offsetWidth || m.getClientRects().length)"):
+                return
+            await self.page.keyboard.press("Escape")
+            await asyncio.sleep(0.1)
+
+    @guarded
+    async def select_model(self, entry: dict):
+        switcher = self.page.locator(MODEL_SWITCHER).first
+        if label_matches(await switcher.text_content(), entry):
             return
-        await sw.click(timeout=10000)
-        opt = self.page.get_by_role("menuitemradio", name=re.compile(re.escape(name), re.I)).or_(
-            self.page.get_by_role("menuitem", name=re.compile(re.escape(name), re.I))).first
-        if not await opt.count():
-            raise Blocked("requested model is not offered by this Copilot experience")
-        await opt.click(timeout=10000)
-        if name.lower() not in norm_ws(await sw.text_content()).lower():
-            raise Blocked("requested model could not be confirmed after selection")
+        await self._close_menus()                 # a menu left open would make the next click close it
+        await switcher.click(timeout=10000)
+        await self._menu(0)
+        index = 0
+        if entry["group"] != "Modes":
+            await self.page.locator("[role=menuitem][aria-haspopup]", has_text=entry["group"]).first.hover()
+            await self._menu(1, entry["group"])
+            index = 1
+        pattern = re.compile("^" + re.escape(entry["text"]) + "$")
+        await self.page.locator("[role=menu]").nth(index).locator("[role=menuitem],[role=menuitemradio]", has_text=pattern).first.click(timeout=10000)
+        deadline = time.monotonic() + self.cfg.op_timeout
+        while time.monotonic() < deadline:
+            if label_matches(await switcher.text_content(), entry):
+                return
+            await asyncio.sleep(0.1)
+        raise UiError("the model choice could not be confirmed on the page")
+
+    async def ensure_model(self, entry):
+        """Cheap when already right (reads the button label); selects otherwise.  None = leave Copilot's default."""
+        if entry:
+            await self.select_model(entry)
 
     @guarded
     async def click_upload_retry(self) -> bool:
@@ -1601,6 +1721,9 @@ class Runner:
         self.sent_ids = ledger.read()
         self.attempts = collections.Counter()
         self.prefetch = None  # (case key, asyncio.Task)
+        self.pool = collections.deque()   # warm, signed-in, fresh tabs: (tab, connection generation)
+        self.retry_tab = {}               # case key -> (tab, generation): an unsent tab reset for the next try
+        self.model = None                 # chosen model entry (None = Copilot's own default)
 
     # -- helpers ------------------------------------------------------------------------------
     def rec(self, case, state, **fields):
@@ -1626,10 +1749,20 @@ class Runner:
         tab = None
         if want_tab:
             try:
-                tab = await self.browser.open_tab()
+                tab = self.pool_tab() or await self.browser.open_tab()
             except Exception as exc:  # pipeline is an optimisation: failing here only loses the head start
                 self.log("prefetch", case.alias, note=safe_exc(self.redact, exc))
         return Prepared(case, plan, tab=tab, generation=self.browser.generation, left_out=left_out)
+
+    def pool_tab(self, key=None):
+        """A warm tab (or the case's own reset retry tab) from the current browser connection, else None."""
+        entries = [self.retry_tab.pop(key)] if key in self.retry_tab else []
+        while not entries and self.pool:
+            entries.append(self.pool.popleft())
+        for tab, generation in entries:
+            if generation == self.browser.generation:   # a reconnect makes older tab objects stale
+                return tab
+        return None
 
     def start_prefetch(self, nxt):
         if nxt is not None and (self.prefetch is None):
@@ -1670,22 +1803,24 @@ class Runner:
                  prompt_version=self.prompt_version, omitted=len(prep.left_out), left_out=prep.left_out)
         tab, usable = prep.tab, prep.tab
         prep.tab = None
-        intent = False
+        intent = reusable = False
         try:
             if not files_unchanged(prep.plan):
                 raise AttemptFailed("documents changed while preparing")
             paths = await asyncio.to_thread(stage_aliases, prep.plan, self.rt, aid)
-            tab = usable or await self.browser.open_tab()
+            tab = usable or self.pool_tab(case.key) or await self.browser.open_tab()
             self.rec(case, "preparing", target_id=tab.target_id, url=await tab.url())
-            if not await tab.fresh():
+            pending = getattr(tab, "model_task", None)    # background model selection started right after your choice
+            if pending:
+                await asyncio.gather(pending, return_exceptions=True)
+            fresh, _ = await asyncio.gather(tab.fresh(), tab.ensure_model(self.model))
+            if not fresh:
                 raise AttemptFailed("conversation was not fresh")
             self.rec(case, "uploading")
             await tab.attach(paths, route)
             self.log("uploading", case.alias, attempt=n, route=route, expected=len(expected))
             self.start_prefetch(nxt)                     # pipeline: next case prepares while this uploads
-            await tab.set_message(self.message)          # composer + model work overlaps the transfer
-            if self.cfg.requested_model:
-                await tab.select_model(self.cfg.requested_model)
+            await tab.set_message(self.message)          # typing the message overlaps the file transfer
             await self.wait_upload_ready(tab, case, expected)
             await self.pre_send_checks(tab, case, prep.plan)
             self.rec(case, "upload_ready", observed=len(expected))
@@ -1707,13 +1842,26 @@ class Runner:
                 raise
             await self.browser.reconnect()               # may raise RecoveryRequired -> run pauses
             raise AttemptFailed("browser connection lost before send")
+        except AttemptFailed:
+            reusable = True
+            raise
         except UiError as exc:
+            reusable = True
             raise AttemptFailed(str(exc)) from exc
         finally:
             if tab and not intent:
                 if self.cfg.diagnostics_capture:
                     await tab.capture(self.rt.diagnostics / f"LOCAL-ONLY-{case.alias}-{n}")
-                await self._abandon(tab)                 # unsent composer: safe to discard
+                kept = False
+                if reusable:        # unsent and still alive: refresh THIS tab to a new chat for the next try
+                    try:
+                        await tab.reset()
+                        self.retry_tab[case.key] = (tab, self.browser.generation)
+                        kept = True
+                    except Exception:
+                        pass
+                if not kept:
+                    await self._abandon(tab)             # unsent composer: safe to discard
             if not intent:
                 clean_staging(self.rt, aid)
 
@@ -1886,6 +2034,8 @@ class Runner:
                 if outcome == "submitted" and prep.left_out:
                     outcome = "submitted_partial"
                     reason = f"{len(prep.left_out)} file(s) left out (attachment limit) - sent files only"
+            if case.key in self.retry_tab and outcome != "retry_pending":   # finished: close its leftover unsent tab
+                await self._abandon(self.retry_tab.pop(case.key)[0])
             results[case.key] = (outcome, reason)
             if outcome in ("failed_exhausted", "preflight_blocked") and reason:
                 same_reason[reason] += 1
@@ -2047,6 +2197,107 @@ async def reconcile_open_intents(runner: Runner, journal: Journal, cases_by_key:
             journal.record(key, "retry_pending", alias=rec.get("alias", ""), note="run ended before any send")
 
 
+class StdinLines:
+    """One background reader for the terminal, shared by every prompt (and usable as the 'press Enter' fallback)."""
+
+    def __init__(self):
+        self.loop, self.q, self.eof = asyncio.get_running_loop(), asyncio.Queue(), False
+        threading.Thread(target=self._pump, daemon=True).start()
+
+    def _pump(self):
+        try:
+            for line in sys.stdin:
+                self.loop.call_soon_threadsafe(self.q.put_nowait, line.rstrip("\r\n"))
+        except Exception:
+            pass
+        self.loop.call_soon_threadsafe(self._end)
+
+    def _end(self):
+        self.eof = True
+        self.q.put_nowait(None)
+
+    def drain(self):
+        while not self.q.empty() and not self.eof:
+            self.q.get_nowait()
+
+    async def line(self):
+        """Next typed line; None when there is no terminal input (redirected/closed)."""
+        if self.eof and self.q.empty():
+            return None
+        return await self.q.get()
+
+
+async def wait_for_login(browser, stdin, log):
+    """Poll (fast, no overall limit) until a Copilot tab shows the composer + model button = signed in.
+    The moment that happens the run moves on by itself; pressing Enter is only a manual fallback."""
+    enter, announced, t0 = asyncio.ensure_future(stdin.line()), False, time.monotonic()
+    try:
+        while True:
+            browser.stop.check()
+            tab = await browser.find_ready_tab()
+            if tab:
+                await tab.adopt()
+                stdin.drain()       # an early Enter must not answer the model question
+                return tab
+            if enter.done() and enter.result() is not None:
+                log("login", note="continuing on your confirmation")
+                tab = await browser.open_tab()   # waits for the composer like any new tab
+                stdin.drain()
+                return tab
+            if enter.done():
+                enter = asyncio.ensure_future(asyncio.sleep(3600))   # no terminal input available: auto-detect only
+            if not announced and time.monotonic() - t0 > 1.0:
+                print("Waiting for Copilot sign-in: sign in in the Edge window - I continue by myself as soon as the chat "
+                      "appears (or press Enter here to continue manually).", flush=True)
+                announced = True
+            await asyncio.sleep(0.25)
+    finally:
+        enter.cancel()
+
+
+def pick_default(entries):
+    """Default model: the LAST one listed under GPT (models change fast, so no version-number parsing)."""
+    gpt = [e for e in entries if re.search(r"gpt|openai", e["group"], re.I)]
+    pool = gpt or [e for e in entries if e["group"] != "Modes"] or entries
+    return pool[-1] if pool else None
+
+
+def model_menu(entries, default) -> str:
+    lines, group = [], None
+    for i, e in enumerate(entries, 1):
+        if e["group"] != group:
+            group = e["group"]
+            lines.append(f"  {group}")
+        lines.append(f"   {'*' if e is default else ' '} {i:>2}. {e['label']}")
+    return "\n".join(lines)
+
+
+async def choose_model(entries, default, cfg, stdin, log):
+    """Ask which model to use (Enter = default).  `requested_model` in the settings skips the question."""
+    if not entries:
+        log("model", note="the model list could not be read - continuing with Copilot's current model")
+        return None
+    if cfg.requested_model:
+        want = cfg.requested_model.casefold()
+        for e in entries:
+            if want in (e["label"].casefold(), e["text"].casefold()):
+                return e
+        raise Blocked("requested_model is not offered by this Copilot experience")
+    print("\nAvailable models (* = default, the last GPT entry):\n" + model_menu(entries, default), flush=True)
+    while True:
+        print(f"Model number for this run (Enter = {default['label']}): ", end="", flush=True)
+        try:
+            line = await asyncio.wait_for(stdin.line(), cfg.model_prompt_seconds or None)
+        except asyncio.TimeoutError:
+            line = None
+        if line is None or not line.strip():
+            print(flush=True)
+            return default
+        if line.strip().isdigit() and 1 <= int(line) <= len(entries):
+            return entries[int(line) - 1]
+        print("  Please type a number from the list, or press Enter for the default.", flush=True)
+
+
 async def run_async(ctx, journal, ledger, listed, cases, todo, instr, message) -> int:
     cfg, log = ctx.cfg, ctx.log
     stop = Stopper()
@@ -2065,6 +2316,8 @@ async def run_async(ctx, journal, ledger, listed, cases, todo, instr, message) -
         if todo and browser.context is None:
             await browser.start(launch=True)
         todo = [c for c in todo if runner.sent_ids.get(c.id) is None]
+        if todo:
+            await prepare_session(runner, browser, cfg, log, todo)
         results = await runner.run(collections.deque(todo))
     except Stopped:
         journal.record("_run", "cancelled", note="stopped by user")
@@ -2080,6 +2333,32 @@ async def run_async(ctx, journal, ledger, listed, cases, todo, instr, message) -
     summarise(ctx, journal, cases, listed, results)
     unresolved = [k for k, (s, _) in results.items() if s not in ("submitted",)]
     return code or (1 if unresolved else 0)
+
+
+async def prepare_session(runner, browser, cfg, log, todo):
+    """Sign-in -> model list -> (warm-up of up to `warm_tabs` tabs runs while you choose) -> model applied."""
+    stdin = StdinLines()
+    first = await wait_for_login(browser, stdin, log)
+    log("login", note="Copilot is signed in")
+    try:
+        entries = await first.discover_models()
+    except SenderError as exc:
+        log("model", note=f"model discovery failed: {safe_exc(runner.redact, exc)}")
+        entries = []
+    count = max(1, min(int(cfg.warm_tabs), len(todo)))
+    warm = asyncio.ensure_future(browser.open_tabs(count - 1)) if count > 1 else None   # prepares while you choose
+    try:
+        runner.model = await choose_model(entries, pick_default(entries), cfg, stdin, log)
+        tabs = [first] + (await warm if warm else [])
+    except BaseException:
+        if warm:
+            warm.cancel()
+        raise
+    runner.pool.extend((t, browser.generation) for t in tabs)
+    await first.page.bring_to_front()
+    for tab in tabs[1:]:      # every other tab applies the chosen model in the background, in parallel
+        tab.model_task = asyncio.ensure_future(tab.ensure_model(runner.model))
+    log("session", note=f"{len(tabs)} tab(s) ready" + (f", model: {runner.model['label']}" if runner.model else ""))
 
 
 def summarise(ctx, journal, cases, listed, results):
