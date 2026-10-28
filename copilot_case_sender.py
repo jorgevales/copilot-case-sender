@@ -1353,20 +1353,26 @@ class EdgeBrowser:
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
         return tab
 
-    async def find_ready_tab(self):
-        """A Copilot page of this browser that already shows the chat composer + model button."""
+    async def find_ready_tabs(self) -> list:
+        """Every Copilot page of this browser that already shows the chat composer + model button (tabs sign in
+        and load at different speeds, so this can grow from one poll to the next)."""
         origin = "{0.scheme}://{0.netloc}".format(urlparse(self.cfg.copilot_url))
-        seen = False
+        seen, ready = False, []
         for page in list(self.context.pages):
             if page.url.startswith(origin):
                 seen = True
                 tab = CopilotTab(page, self.cfg, self.stop)
                 if await tab.is_ready():
-                    return tab
+                    ready.append(tab)
         if not seen:  # nothing on Copilot yet (e.g. all tabs closed): open one so sign-in can be seen
             page = await self.context.new_page()
             await page.goto(self.cfg.copilot_url, wait_until="domcontentloaded", timeout=60000)
-        return None
+        return ready
+
+    async def find_ready_tab(self):
+        """The first Copilot page that already shows the chat composer + model button."""
+        ready = await self.find_ready_tabs()
+        return ready[0] if ready else None
 
     async def find_tab(self, target_id: str):
         """Rebind by EXACT target id - never by tab index or a shared URL."""
@@ -2692,9 +2698,8 @@ def model_menu(entries, default) -> str:
 
 async def choose_model(entries, default, cfg, stdin, log):
     """Ask which model to use (Enter = default).  `requested_model` in the settings skips the question."""
-    if not entries:
-        log("model", note="the model list could not be read - continuing with Copilot's current model")
-        return None
+    if not entries:      # never reached from prepare_session (it retries until a list is read); no silent fallback
+        raise RecoveryRequired("the model list could not be read - run again so you can choose a model")
     if cfg.requested_model:
         want = cfg.requested_model.casefold()
         for e in entries:
@@ -2766,16 +2771,42 @@ async def run_async(ctx, journal, ledger, listed, cases, todo, instr, message) -
     return code or (1 if unresolved else 0)
 
 
+async def discover_models_anywhere(browser, first, redact, log):
+    """Read the model list from ANY signed-in Copilot tab, as long as it takes.  Tabs load at different speeds, so the
+    tab found first may not show its picker yet: keep trying it and every other ready tab (re-scanned each round).
+    There is deliberately no fallback - the user always chooses the model - so only a stop request ends this.
+    Returns (tab, entries); that tab becomes the session's first tab."""
+    announced, tried_note, candidates = False, None, [first]      # the tab that proved the sign-in is tried first
+    while True:
+        browser.stop.check()
+        for tab in candidates:
+            browser.stop.check()
+            try:
+                entries = await tab.discover_models()
+                if entries:
+                    if tab is not first:
+                        await tab.adopt()
+                        log("model", note="model list read from another Copilot tab")
+                    return tab, entries
+            except SenderError as exc:
+                note = f"model discovery failed in a tab: {safe_exc(redact, exc)}"
+                if note != tried_note:       # one log line per distinct problem, not one per retry
+                    log("model", note=note)
+                    tried_note = note
+        if not announced:
+            print("Waiting for the Copilot model list - trying every signed-in Copilot tab until one shows it "
+                  "(Ctrl+C to stop).", flush=True)
+            announced = True
+        await browser.stop.sleep(1.0)
+        candidates = [first] + [t for t in await browser.find_ready_tabs() if t.page is not first.page]   # others may be ready now
+
+
 async def prepare_session(runner, browser, cfg, log, todo):
     """Sign-in -> model list -> (warm-up of up to `warm_tabs` tabs runs while you choose) -> model applied."""
     stdin = StdinLines()
     first = await wait_for_login(browser, stdin, log)
     log("login", note="Copilot is signed in")
-    try:
-        entries = await first.discover_models()
-    except SenderError as exc:
-        log("model", note=f"model discovery failed: {safe_exc(runner.redact, exc)}")
-        entries = []
+    first, entries = await discover_models_anywhere(browser, first, runner.redact, log)
     count = max(1, min(int(cfg.warm_tabs), len(todo)))
     warm = asyncio.ensure_future(browser.open_tabs(count - 1)) if count > 1 else None   # prepares while you choose
     try:

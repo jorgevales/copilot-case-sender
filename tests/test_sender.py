@@ -325,6 +325,10 @@ class FakeBrowser:
         self.ready_after -= 1
         return FakeTab(self.w, {}) if self.ready_after <= 0 else None
 
+    async def find_ready_tabs(self):
+        tab = await self.find_ready_tab()
+        return [tab] if tab else []
+
     @property
     def generation(self):
         return self.w.generation
@@ -952,7 +956,8 @@ def test_model_answers_enter_number_invalid_override_and_no_terminal(env, capsys
     assert ask(["4"])["label"] == "Sonnet 5"
     assert ask(["99", "x", "2"])["label"] == "Quick response"                  # invalid answers are asked again
     assert ask([], eof=True) is default                                        # redirected input: take the default
-    assert ask([], entries=[]) is None                                         # picker unreadable: leave Copilot as is
+    with pytest.raises(S.RecoveryRequired):
+        ask([], entries=[])                                                    # no list: never silently use Copilot's own model
     pinned = types.SimpleNamespace(**{**vars(env.cfg), "requested_model": "opus 5.5"})
     assert ask([], pinned)["label"] == "Opus 5.5"                              # setting skips the question
     with pytest.raises(S.Blocked):
@@ -964,6 +969,54 @@ def test_label_matches_requires_the_same_model_not_a_prefix_of_another():
     assert S.label_matches("GPT-6.1 Sol", e) and S.label_matches("gpt-6.1 sol", e)
     assert not S.label_matches("GPT-6", e) and not S.label_matches("", e)
     assert S.label_matches("GPT-5.6 Sol", {"label": "GPT-5.6 Sol Think deeper"})     # button may show a shorter title
+
+
+def test_model_list_is_retried_across_tabs_until_one_shows_it_with_no_fallback(env):
+    slow, quick = FakeTab(env.world, {}), FakeTab(env.world, {})
+    attempts = {"slow": 0}
+
+    async def slow_picker():                       # this tab is signed in but its picker never opens
+        attempts["slow"] += 1
+        raise S.UiError("the model menu did not open")
+    slow.discover_models = slow_picker
+    quick_calls = {"n": 0}
+
+    async def late_picker():                       # the other tab only gets a working picker on its 3rd try
+        quick_calls["n"] += 1
+        return list(MODELS) if quick_calls["n"] >= 3 else []
+    quick.discover_models = late_picker
+    b = FakeBrowser(env.world)
+
+    async def ready():                             # the 2nd tab only becomes ready after the first round
+        return [slow] if attempts["slow"] < 1 else [slow, quick]
+    b.find_ready_tabs = ready
+    tab, entries = run(S.discover_models_anywhere(b, slow, env.red, env.log))
+    assert tab is quick and entries == MODELS and attempts["slow"] >= 3 and quick_calls["n"] == 3
+
+
+def test_model_list_search_ends_only_on_a_stop_request(env):
+    tab = FakeTab(env.world, {})
+
+    async def broken():
+        raise S.UiError("the model menu did not open")
+    tab.discover_models = broken
+    b = FakeBrowser(env.world)
+
+    async def only_one():
+        return [tab]
+    b.find_ready_tabs = only_one
+    calls = {"n": 0}
+    real = b.stop.check
+
+    def check():
+        calls["n"] += 1
+        if calls["n"] > 12:
+            raise S.Stopped("stop requested")
+        real()
+    b.stop.check = check
+    with pytest.raises(S.Stopped):
+        run(S.discover_models_anywhere(b, tab, env.red, env.log))
+    assert calls["n"] > 12                          # it kept trying instead of falling back to "no model"
 
 
 def test_login_is_detected_automatically_and_an_early_enter_is_discarded(env):

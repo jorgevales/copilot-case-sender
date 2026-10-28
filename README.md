@@ -37,6 +37,9 @@ by a safe alias (`other-xxxxxx`); two folders with the same ID are both blocked 
    manual fallback (ignored when the terminal is redirected).
 2. **Model discovery** (~3 s): the model button's menu is read – modes (Auto, Quick response, Think deeper) and every
    provider submenu (Claude, GPT …); nothing is hard-coded, so added or removed models just appear.
+   Copilot tabs sign in and load at different speeds, so if the first tab's picker is not ready the script keeps trying
+   it and every other signed-in Copilot tab (re-scanned each second) until one shows the list. There is no fallback
+   such as sending with Copilot's current model: you always get the list and always choose. Only Ctrl+C ends the wait.
 3. **You choose** by number, **Enter = default = the last entry listed under GPT** (no version parsing). Setting
    `requested_model` skips the question. `model_prompt_seconds` (default 0 = wait) can make an unattended run continue
    with the default.
