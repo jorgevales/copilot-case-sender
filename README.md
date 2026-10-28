@@ -79,7 +79,10 @@ tab, which intercepts the chooser: the dialog never appears and the full file li
 A simulated drag-and-drop was tried and **does not work** in this Copilot (the page receives the drop, ignores it).
 
 **Failures:** if Copilot shows a real upload error with its own *Try again* button, that button is clicked (max 2
-times, only inside an upload-error message – never the response *Regenerate*). Still failing → **the same tab is
+times, only inside an upload-error message – never the response *Regenerate*). No such button (or still failing) →
+the tool waits `upload_error_grace_seconds` (3 s) and looks again, because the message sometimes clears by itself.
+Still there → inside the same try, a **fresh chat in the same tab and the same files attached again**, up to
+`upload_recoveries` (2) times. Nothing has been sent at any of these points. Still failing → **the same tab is
 refreshed to the original Copilot chat link** (new chat) and the same case is tried again, **up to 5 tries in total**
 (first 3 back-to-back, then the case moves to the end of the queue for the rest). A connection loss before sending
 reconnects and continues; after sending it never resends (see *Uncertain sends*).
@@ -157,6 +160,25 @@ Nothing is ever merged, converted, split across chats or dropped silently.
 ### Console colours
 A successfully submitted case prints **white text on green**; `submitted_partial` and `WARNING` print black on
 yellow. Colour is used only on a real console (not in redirected output or log files; `NO_COLOR` disables it).
+
+### Moving cursor (optional)
+At the start of `run` the tool asks: *Show a moving cursor in Edge so you can follow what the tool does?*
+**Enter = Yes, N = No** (no time limit). It makes each case about 2-3 seconds slower. To stop being asked, set
+`visual_cursor` in `setup` (or `sender_config.json`): `ask` (default), `on` or `off`.
+
+What you see: one dark-blue pointer in the Edge page that is in front. It glides to each thing the tool works on and
+stays where it last acted.
+- **Solid ring**: the tool really clicked there. It means the click was sent, not that it worked.
+- **Dashed ring**: a pretend click, shown for things that are not a click by the tool: closing a menu (the tool
+  presses Escape), the upload "Try again" button (clicked by a page script), and a change of browser tab.
+- **Blue glow around the message box**: the message is being typed in (one normal fill, no extra click).
+- **Tab change**: the pointer goes to the right or left edge of the page (the side of the next tab), gives a pretend
+  click, then the tab really changes and the pointer stays at that spot. A web page cannot draw on Edge's own tab bar.
+
+It is only a drawing: it cannot be clicked, never types, clicks or focuses anything, and if it fails the run carries
+on exactly as without it. Work on hidden background tabs is not drawn. It is hidden in diagnostic screenshots and
+removed from every tab when the run ends. Size, colours and timings can be changed with `visual_cursor_options`
+(see `VISUAL_DEFAULTS` in section 8b of the script); for example `{"move_ms": 150}` makes it faster.
 
 ### Uncertain sends
 A send is *uncertain* when `send_intent` was saved but no user message with your text could be seen in the same tab
@@ -248,7 +270,7 @@ Needs `pytest`; refuses to run without `SENDER_TEST_ROOT` (never uses system Tem
 | No cross-case contamination; redaction of console/summary | **Tested here** |
 | V2 on real Copilot: contract + guidance attached, plain-text JSON answers read back, Correct / Incorrect / Inconclusive verdicts from 3 synthetic cases, results.csv and per-case JSON | **Live-tested** (about 15 s from send to verdict); the fix-up and resubmission loops are **tested here** with a fake page |
 | Real Copilot: sign-in auto-detection, model discovery + selection, 5 warm tabs, intercepted file chooser (no Windows dialog), exact-20-file upload, send, confirmation in the same tab, no cross-case mixing, re-run skips sent IDs, manual release, over-limit partial send | **Live-tested** on a Microsoft 365 Copilot profile with synthetic files (about 7–11 s per case); the VDI is yours to re-confirm |
-| Upload-error → Try again ×2 → same-tab refresh → 5 tries; model picker with a different model list | **Tested here** with a fake page (could not be provoked on the real page) |
+| Upload-error → Try again ×2 → 3 s second look → fresh chat + attach again ×2 → same-tab refresh → 5 tries; model picker with a different model list | **Tested here** with a fake page. Upload errors were seen live on an account that refused uploads; the extra recovery steps are not yet confirmed live |
 | Green/yellow status colours | **Tested here** (escape codes; look on your console) |
 | Unresponsive renderer on a real Edge | **Needs your Windows/VDI** (error path tested with a fake) |
 

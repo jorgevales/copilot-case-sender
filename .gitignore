@@ -8,3 +8,7 @@ __pycache__/
 .pytest_cache/
 .venv/
 .env
+
+# Local graphify knowledge graph and Claude Code config: keep out of the repo unless requested
+graphify-out/
+.claude/

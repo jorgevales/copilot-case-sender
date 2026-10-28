@@ -152,6 +152,7 @@ class World:
         self.events = []                                  # ordered ("foreground"|"send", tab id): proves what came first
         self.generation, self.reconnects, self.reconnect_fail = 1, 0, False
         self.opened = 0
+        self.upload_errors = 0                            # how many page snapshots still show Copilot's upload error
 
 
 class FakeTab:
@@ -217,12 +218,16 @@ class FakeTab:
         elif "delay" in self.b:
             shown = min(n, self.polls // self.b["delay"])
         complete = shown == n and n > 0
+        error = ""
+        if self.w.upload_errors > 0 and n:
+            self.w.upload_errors -= 1
+            error, complete, shown = "An error occurred while uploading your file. Try again", False, 0
         chips = [{"label": x, "text": x + " PDF", "title": ""} for x in self.attached[:shown]]
         if self.b.get("hidden_label"):              # overflow-hidden chips only expose text, not a label
             chips = [{"label": "", "text": x + " 12 KB", "title": ""} for x in self.attached[:shown]]
         return {"chips": chips + ([{"label": "extra.pdf", "text": "", "title": ""}] if self.b.get("extra") else []),
                 "active": [] if complete else ["chip"], "sendEnabled": complete and bool(self.message),
-                "generating": False, "error": "", "limit": ""}
+                "generating": False, "error": error, "limit": ""}
 
     async def set_message(self, text):
         self._alive()
@@ -724,6 +729,35 @@ def test_cdp_loss_during_upload_reconnects_and_retries_without_sending_twice(env
     cases, _, _ = env.cases()
     results = run(env.runner().run(collections.deque(cases)))
     assert results[cases[0].key][0] == "submitted" and env.world.reconnects >= 1 and len(env.world.sends) == 1
+
+
+def test_an_upload_error_that_clears_by_itself_is_waited_out_in_the_same_chat(env):
+    env.world.upload_errors = 1                          # shown once, gone after the short pause
+    env.make_case(1)
+    cases, _, _ = env.cases()
+    results = run(env.runner().run(collections.deque(cases)))
+    assert results[cases[0].key][0] == "submitted" and len(env.world.sends) == 1
+    assert len(env.world.attach_calls) == 1 and any("looking again" in o for o in env.out)
+
+
+def test_a_lasting_upload_error_gets_a_fresh_chat_and_the_files_again_before_any_send(env):
+    env.world.upload_errors = 2                          # still there after the pause: recovery in the same tab
+    env.make_case(1)
+    cases, _, _ = env.cases()
+    results = run(env.runner().run(collections.deque(cases)))
+    tab_ids = {c[0] for c in env.world.attach_calls}
+    assert results[cases[0].key][0] == "submitted" and len(env.world.sends) == 1
+    assert len(env.world.attach_calls) == 2 and len(tab_ids) == 1                       # same tab, attached again
+    assert any("fresh chat in the same tab" in o for o in env.out)
+
+
+def test_upload_errors_that_never_clear_fail_the_attempt_unsent_and_the_case_is_retried(env):
+    env.world.upload_errors = 6                          # attempt 1: 3 uploads x 2 looks; attempt 2 is clean
+    env.make_case(1)
+    cases, _, _ = env.cases()
+    results = run(env.runner().run(collections.deque(cases)))
+    assert results[cases[0].key][0] == "submitted" and len(env.world.sends) == 1
+    assert len(env.world.attach_calls) == 4                                             # 1 + 2 recoveries, then attempt 2
 
 
 def test_cdp_loss_right_after_send_rebinds_by_target_and_confirms(env):
@@ -1424,3 +1458,169 @@ def test_greyed_out_models_are_flagged_skipped_as_default_and_refused(env):
     pinned = types.SimpleNamespace(**{**vars(env.cfg), "requested_model": "GPT-6.1 Sol"})
     with pytest.raises(S.Blocked):
         run(S.choose_model(models, default, pinned, FakeStdin(), env.log))
+
+
+# ------------------------------------------------------------------ visual cursor (8b): drawing never changes the real action
+
+class CursorPage:
+    """Fake page: records every drawing step; `fail` = each step raises, `hang` = each step never answers."""
+
+    def __init__(self, ctx=None, fail=False, hang=False, retry=None):
+        self.ops, self.fail, self.hang, self.retry, self.fronted = [], fail, hang, retry, 0
+        self.context = ctx or types.SimpleNamespace(pages=[self])
+
+    def on(self, *a):
+        pass
+
+    async def evaluate(self, script, arg=None):
+        if script is S.RETRY_JS:
+            return self.retry
+        self.ops.append((arg[0], arg[1]))
+        if self.fail:
+            raise RuntimeError("Target page, context or browser has been closed")
+        if self.hang:
+            await asyncio.sleep(30)
+        op, a = arg[0], arg[1]
+        if op in ("move", "show", "pretend"):
+            self.at = a
+        elif op == "edge":
+            self.at = [1000 if a == "right" else 14, 300]                         # page edge, middle height
+        return {"at": getattr(self, "at", arg[3]), "ok": True, "wait": 0}
+
+    async def bring_to_front(self):
+        self.fronted += 1
+
+
+class CursorLoc:
+    def __init__(self, page, error=None):
+        self.page, self.error, self.calls = page, error, []
+
+    async def bounding_box(self, timeout=None):
+        return {"x": 100, "y": 50, "width": 40, "height": 20}
+
+    async def click(self, **kw):
+        self.calls.append(("click", kw))
+        if self.error:
+            raise self.error
+        return "clicked"
+
+    async def fill(self, text, **kw):
+        self.calls.append(("fill", text, kw))
+        return None
+
+    async def evaluate(self, script, arg=None, timeout=None):
+        assert script is S.TRACK_JS                                             # read-only: the glow follows the box
+        self.page.ops.append(("track", arg))
+        return True
+
+
+def test_cursor_off_is_exactly_the_original_action():
+    page = CursorPage()
+    loc = CursorLoc(page)
+    vc = S.VisualCursor()                                                       # the default: off
+    assert run(vc.click(loc, timeout=15000)) == "clicked"
+    run(vc.fill(loc, "hello", timeout=20000))
+    assert loc.calls == [("click", {"timeout": 15000}), ("fill", "hello", {"timeout": 20000})]
+    assert page.ops == []                                                       # nothing drawn, nothing injected
+
+
+def test_cursor_on_draws_around_one_real_click_and_one_fill():
+    page = CursorPage()
+    loc = CursorLoc(page)
+    vc = S.VisualCursor({"cap_ms": 50}, enabled=True)
+    assert run(vc.click(loc, timeout=15000)) == "clicked"
+    assert [op for op, _ in page.ops] == ["move", "press", "release"] and page.ops[-1] == ("release", "real")
+    assert page.ops[0][1] == [120, 60]                                          # centre of the element
+    page.ops.clear()
+    run(vc.fill(loc, "hello", timeout=20000))
+    assert [op for op, _ in page.ops] == ["move", "track", "track", "move"]     # glow before and after; no ring
+    assert [c[0] for c in loc.calls] == ["click", "fill"] and vc.at == [120, 60]  # stays on the box's last line
+
+
+def test_a_broken_or_frozen_drawing_never_stops_or_repeats_the_real_action():
+    for page in (CursorPage(fail=True), CursorPage(hang=True)):
+        loc = CursorLoc(page)
+        vc = S.VisualCursor({"cap_ms": 50}, enabled=True)
+        t0 = time.monotonic()
+        assert run(vc.click(loc, timeout=15000)) == "clicked"
+        assert loc.calls == [("click", {"timeout": 15000})] and time.monotonic() - t0 < 2
+
+
+def test_the_original_playwright_error_comes_out_unchanged():
+    page = CursorPage()
+    boom = TimeoutError("Timeout 15000ms exceeded")
+    loc = CursorLoc(page, error=boom)
+    vc = S.VisualCursor({"cap_ms": 50}, enabled=True)
+    with pytest.raises(TimeoutError) as err:
+        run(vc.click(loc, timeout=15000))
+    assert err.value is boom and len(loc.calls) == 1
+    assert page.ops[-1] == ("release", "none")                                  # un-pressed, but no "clicked" ring
+
+
+def test_only_the_tab_in_front_is_drawn_on():
+    front, back = CursorPage(), CursorPage()
+    vc = S.VisualCursor({"cap_ms": 50}, enabled=True)
+    run(vc.click(CursorLoc(front)))
+    run(vc.click(CursorLoc(back)))                                              # background tab: real click only
+    assert front.ops and back.ops == []
+
+
+def test_tab_change_is_a_pretend_click_at_the_edge_then_one_real_switch():
+    ctx = types.SimpleNamespace(pages=[])
+    one, two = CursorPage(ctx), CursorPage(ctx)
+    ctx.pages += [one, two]
+    vc = S.VisualCursor({"cap_ms": 50}, enabled=True)
+    run(vc.click(CursorLoc(one)))
+    one.ops.clear()
+    run(vc.switch(two, two.bring_to_front))
+    assert one.ops == [("edge", "right")] and two.fronted == 1                  # tab 2 is to the right of tab 1
+    assert two.ops == [("show", [1000, 300])]                                   # stays at that edge spot on the new tab
+    run(vc.switch(two, two.bring_to_front))                                     # already in front: no scene
+    assert two.fronted == 2 and len(two.ops) == 1
+    run(vc.switch(one, one.bring_to_front))
+    assert two.ops[-1] == ("edge", "left")
+
+
+def test_upload_retry_is_still_clicked_by_the_page_and_only_marked_by_the_cursor():
+    cfg = types.SimpleNamespace(op_timeout=2)
+    page = CursorPage(retry={"x": 30, "y": 40})
+    tab = S.CopilotTab(page, cfg, FakeStop())
+    assert run(tab.click_upload_retry()) is True and page.ops == []             # cursor off: unchanged behaviour
+    S.CopilotTab.cursor = S.VisualCursor({"cap_ms": 50}, enabled=True)
+    try:
+        assert run(tab.click_upload_retry()) is True
+        assert page.ops == [("pretend", [30, 40])]                              # dashed ring, no input
+        page.retry = False
+        assert run(tab.click_upload_retry()) is False
+    finally:
+        S.CopilotTab.cursor = S.VisualCursor()
+
+
+def test_cursor_question_enter_is_yes_n_is_no_and_settings_skip_it(env, monkeypatch, capsys):
+    def answers(*lines):
+        it = iter(lines)
+        monkeypatch.setattr("builtins.input", lambda prompt="": next(it))
+    answers("")
+    assert S.choose_visual_cursor(env.cfg) is True
+    answers("maybe", "N")
+    assert S.choose_visual_cursor(env.cfg) is False and "Enter for Yes" in capsys.readouterr().out
+    monkeypatch.setattr("builtins.input", lambda prompt="": (_ for _ in ()).throw(EOFError()))
+    assert S.choose_visual_cursor(env.cfg) is True
+    for mode, want in (("on", True), ("off", False)):
+        assert S.choose_visual_cursor(types.SimpleNamespace(visual_cursor=mode)) is want
+    bad = types.SimpleNamespace(**{**vars(env.cfg), "approved_root": str(env.base), "visual_cursor": "sometimes"})
+    assert any("visual_cursor" in p for p in S.validate_config(bad)[1])
+
+
+def test_teardown_removes_the_drawing_from_every_page_and_turns_it_off():
+    one, two = CursorPage(), CursorPage()
+    vc = S.VisualCursor({"cap_ms": 50}, enabled=True)
+    run(vc.click(CursorLoc(one)))
+    vc.front = two
+    run(vc.click(CursorLoc(two)))
+    run(vc.teardown())
+    assert one.ops[-1][0] == "teardown" and two.ops[-1][0] == "teardown"
+    loc = CursorLoc(one)
+    one.ops.clear()
+    run(vc.click(loc))
+    assert one.ops == [] and loc.calls                                          # off again: real action only

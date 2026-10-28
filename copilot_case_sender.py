@@ -9,6 +9,7 @@ One file, read top to bottom.  Sections:
   6. Cases           discovery, document inventory, attachment plan
   7. Dependencies    first-launch install of Playwright into a private folder
   8. Browser         Edge launch + CDP connect (Playwright connect_over_cdp), Copilot page adapter
+ 8b. Visual cursor   optional pointer drawn in the page so a person can follow the run (observation only)
   9. Transaction     upload -> verify -> send -> confirm / reconcile, queue and retries
  10. Commands        setup | check | plan | run
 
@@ -67,6 +68,7 @@ class ConnectionLost(SenderError): ...        # CDP/target gone (page-level)
 class UiError(SenderError): ...               # Copilot page did not behave as expected
 class Blocked(SenderError): ...               # deterministic, never retried (config/policy/input)
 class AttemptFailed(SenderError): ...         # a retriable, provably-unsent failure
+class UploadError(AttemptFailed): ...         # Copilot showed an upload error (recovered in the same attempt first)
 class Stopped(SenderError): ...               # user asked to stop (only raised at safe points)
 
 
@@ -337,6 +339,8 @@ DEFAULTS = {
     "reconnect_budget_seconds": 180, "endpoint_wait_seconds": 90, "login_wait_seconds": 300,
     "op_timeout": 20, "stable_seconds": 1.0, "poll_ms": 150,
     "upload_timeout": 600, "upload_no_progress": 90, "upload_retry_clicks": 2,
+    "upload_error_grace_seconds": 3,  # an upload error is looked at again after this pause (it sometimes clears by itself)
+    "upload_recoveries": 2,           # then: fresh chat in the same tab + attach again, this many times per attempt (all unsent)
     "send_confirm_seconds": 30, "reconcile_seconds": 45,
     "immediate_retries": 3, "max_attempts": 5,             # a failed case is tried up to 5 times in total
     "warm_tabs": 8, "warm_dwell_seconds": 0.4,             # tabs prepared (and visibly walked through) before the run
@@ -349,6 +353,8 @@ DEFAULTS = {
     "answer_overdue_minutes": 20,     # flag a slow answer (never resent); "answer_stable_seconds": text unchanged = finished
     "answer_stable_seconds": 3, "collect_poll_seconds": 2,
     "diagnostics_capture": False,     # screenshots/HTML are SENSITIVE, local-only, off by default
+    "visual_cursor": "ask",           # moving cursor in Edge: "ask" at every run, "on" always, "off" never
+    "visual_cursor_options": {},      # look and timing overrides, see VISUAL_DEFAULTS (section 8b)
 }
 REQUIRED = ["cases_root", "instructions_path", "base_message_path", "python_executable",
             "edge_executable", "runtime_root"]
@@ -456,6 +462,9 @@ def setup_command() -> int:
     detail = ask("Console output: 1 = minimal (queue total, ID being sent, attachments, result), 2 = full detail",
                  "2" if cur.get("console_detail") == "full" else "1")
     cur["console_detail"] = "full" if detail.strip() == "2" else "minimal"
+    shown = ask("Moving cursor in Edge so you can follow the tool: ask = ask at every run, on = always, off = never",
+                cur.get("visual_cursor") or "ask").strip().lower()
+    cur["visual_cursor"] = shown if shown in ("ask", "on", "off") else "ask"
     if ask("Change optional settings (port, URL, model, recursion, limits)? y/N", "n").lower().startswith("y"):
         for key in ("cdp_port", "copilot_url", "requested_model", "recursive_documents", "max_attachments", "over_limit_mode", "warm_tabs",
                     "dependency_directory", "approved_root", "approved_unc_root"):
@@ -511,6 +520,10 @@ def validate_config(cfg):
         problems.append(str(exc))
     if cfg.console_detail not in ("minimal", "full"):
         problems.append("console_detail must be 'minimal' or 'full'")
+    if cfg.visual_cursor not in ("ask", "on", "off"):
+        problems.append("visual_cursor must be 'ask', 'on' or 'off'")
+    if not isinstance(cfg.visual_cursor_options, dict):
+        problems.append("visual_cursor_options must be a JSON object")
     if cfg.over_limit_mode not in ("send_partial", "block"):
         problems.append("over_limit_mode must be 'send_partial' or 'block'")
     if cfg.completion_mode not in ("json_result", "submission_only"):
@@ -1503,7 +1516,7 @@ RETRY_JS = r"""() => {   // click "Try again" ONLY inside an upload-error alert 
     if (!vis(box) || box.closest('[data-testid="copilot-message-reply-div"],[data-testid="copilot-message-div"]')) continue;
     if (!/upload/i.test(box.textContent || '')) continue;
     const b = [...box.querySelectorAll('button,[role="button"]')].find(x => /try again|retry/i.test(x.textContent || x.getAttribute('aria-label') || ''));
-    if (b) { b.click(); return true; }
+    if (b) { const r = b.getBoundingClientRect(); b.click(); return {x: r.left + r.width / 2, y: r.top + r.height / 2}; }
   }
   return false; }"""
 
@@ -1550,7 +1563,7 @@ class CopilotTab:
     async def foreground(self):
         """Bring this tab to the front and wait until the page reports itself visible.  A background tab is
         throttled by the browser: talking to it can time out and a send can silently not happen."""
-        await self.page.bring_to_front()
+        await self.cursor.switch(self.page, self.page.bring_to_front)
         deadline = time.monotonic() + self.cfg.op_timeout
         while time.monotonic() < deadline:
             if await self._ev("() => document.visibilityState === 'visible'"):
@@ -1581,10 +1594,11 @@ class CopilotTab:
     @guarded
     async def activate(self):
         """Do what a person would: bring the tab forward, move the pointer over the composer and let Copilot wake up."""
-        await self.page.bring_to_front()
+        await self.cursor.switch(self.page, self.page.bring_to_front)
         await self.wait_composer()
         box = await (await self._editor()).bounding_box()
         if box:
+            await self.cursor.follow(self.page, box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
             await self.page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2, steps=6)
         await asyncio.sleep(self.cfg.warm_dwell_seconds)
         if not await self._is_fresh():
@@ -1616,7 +1630,7 @@ class CopilotTab:
     async def _new_chat(self):
         btn = self.page.locator('[data-testid="new-chat-button"], button:has-text("New chat"), a:has-text("New chat")').first
         if await btn.count():
-            await btn.click(timeout=15000)
+            await self.cursor.click(btn, timeout=15000)
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             if await self._is_fresh():
@@ -1647,12 +1661,12 @@ class CopilotTab:
             await plus.wait_for(state="visible", timeout=15000)
         except Exception:
             plus = self.page.locator(ATTACH_BTN).first          # other Copilot variants
-        await plus.click(timeout=10000)
+        await self.cursor.click(plus, timeout=10000)
         item = self.page.get_by_role("menuitem", name=UPLOAD_ITEM).first
         deadline = time.monotonic() + self.cfg.op_timeout
         while not self._chooser.done() and time.monotonic() < deadline:
             if await item.count():
-                await item.click(timeout=5000)
+                await self.cursor.click(item, timeout=5000)
                 break
             await asyncio.sleep(0.05)
         chooser = await asyncio.wait_for(self._chooser, self.cfg.op_timeout)
@@ -1667,7 +1681,10 @@ class CopilotTab:
         for i, p in enumerate(paths, 1):
             await self._assign([p])
             deadline = time.monotonic() + 60
-            while time.monotonic() < deadline and len((await self.snapshot())["chips"]) < i:
+            while time.monotonic() < deadline:
+                snap = await self.snapshot()
+                if len(snap["chips"]) >= i or snap["error"]:     # an error is handled by wait_upload_ready
+                    break
                 await self.stop.sleep(0.15)
 
     @guarded
@@ -1675,8 +1692,8 @@ class CopilotTab:
         ed = await self._editor()
         if ed is None:
             raise UiError("the Copilot message editor was not found")
-        await ed.click(timeout=10000)
-        await ed.fill(text, timeout=20000)  # fill inserts text only - it cannot press Enter
+        await self.cursor.click(ed, timeout=10000)
+        await self.cursor.fill(ed, text, timeout=20000)  # fill inserts text only - it cannot press Enter
 
     @guarded
     async def message_text(self) -> str:
@@ -1705,12 +1722,12 @@ class CopilotTab:
     async def discover_models(self) -> list:
         """List what the picker offers: [{'group', 'label', 'text'}].  Modes are plain entries; each provider
         entry (Claude, GPT ...) is hovered to read its models.  The picker is closed again afterwards."""
-        await self.page.locator(MODEL_SWITCHER).first.click(timeout=10000)
+        await self.cursor.click(self.page.locator(MODEL_SWITCHER).first, timeout=10000)
         top = await self._menu(0)
         found = [{"group": "Modes", "label": m["title"], "text": m["text"], "disabled": m["disabled"]} for m in top if not m["popup"]]
         previous = ()
         for provider in [m for m in top if m["popup"]]:
-            await self.page.locator("[role=menuitem][aria-haspopup]", has_text=provider["title"]).first.hover()
+            await self.cursor.hover(self.page.locator("[role=menuitem][aria-haspopup]", has_text=provider["title"]).first)
             models = await self._menu(1, provider["title"], previous)
             previous = {m["text"] for m in models}
             found += [{"group": provider["title"], "label": m["text"], "text": m["text"], "disabled": m["disabled"]} for m in models]
@@ -1722,6 +1739,7 @@ class CopilotTab:
         for _ in range(4):
             if not await self._ev("() => [...document.querySelectorAll('[role=menu]')].some(m => m.offsetWidth || m.getClientRects().length)"):
                 return
+            await self.cursor.outside(self.page)      # shown as a pretend click beside the menu; Escape does the work
             await self.page.keyboard.press("Escape")
             await asyncio.sleep(0.1)
 
@@ -1731,11 +1749,11 @@ class CopilotTab:
         if label_matches(await switcher.text_content(), entry):
             return
         await self._close_menus()                 # a menu left open would make the next click close it
-        await switcher.click(timeout=10000)
+        await self.cursor.click(switcher, timeout=10000)
         await self._menu(0)
         index = 0
         if entry["group"] != "Modes":
-            await self.page.locator("[role=menuitem][aria-haspopup]", has_text=entry["group"]).first.hover()
+            await self.cursor.hover(self.page.locator("[role=menuitem][aria-haspopup]", has_text=entry["group"]).first)
             await self._menu(1, entry["group"])
             index = 1
         pattern = re.compile("^" + re.escape(entry["text"]) + "$")
@@ -1743,7 +1761,7 @@ class CopilotTab:
         if await item.get_attribute("aria-disabled") == "true":      # greyed out by Copilot (e.g. usage limit reached)
             await self._close_menus()
             raise RecoveryRequired(f"the chosen model ({entry['label']}) is not available in Copilot right now - run again and pick another one")
-        await item.click(timeout=10000)
+        await self.cursor.click(item, timeout=10000)
         deadline = time.monotonic() + self.cfg.op_timeout
         while time.monotonic() < deadline:
             if label_matches(await switcher.text_content(), entry):
@@ -1758,12 +1776,15 @@ class CopilotTab:
 
     @guarded
     async def click_upload_retry(self) -> bool:
-        return bool(await self._ev(RETRY_JS))
+        hit = await self._ev(RETRY_JS)
+        if isinstance(hit, dict):     # the page script clicked it; the cursor only marks the spot
+            await self.cursor.pretend(self.page, hit["x"], hit["y"])
+        return bool(hit)
 
     @guarded
     async def click_send(self):
         # EXACTLY one action; the selector excludes "Stop generating" by construction.
-        await self.page.locator(SEND_BTN).first.click(timeout=15000)
+        await self.cursor.click(self.page.locator(SEND_BTN).first, timeout=15000)
 
     @guarded
     async def evidence(self, needle: str) -> dict:
@@ -1781,9 +1802,9 @@ class CopilotTab:
         ed = await self._editor()
         if ed is None:
             raise UiError("the Copilot message editor was not found")
-        await ed.click(timeout=10000)
-        await ed.fill(text, timeout=20000)
-        await self.page.locator(SEND_BTN).first.click(timeout=15000)
+        await self.cursor.click(ed, timeout=10000)
+        await self.cursor.fill(ed, text, timeout=20000)
+        await self.cursor.click(self.page.locator(SEND_BTN).first, timeout=15000)
 
     @guarded
     async def close(self):
@@ -1791,11 +1812,358 @@ class CopilotTab:
 
     async def capture(self, base: Path):
         """Local-only diagnostics; sensitive by nature, never part of shareable output."""
+        await self.cursor.hidden(self.page, True)          # evidence shows the real page, not our drawing
         try:
             await self.page.screenshot(path=str(base) + ".png", timeout=10000)
             write_atomic(Path(str(base) + ".html"), await self.page.content())
         except Exception:
             pass
+        await self.cursor.hidden(self.page, False)
+
+
+# --------------------------------------------------------------------------------------------
+# 8b. VISUAL CURSOR (optional; lets a person watching Edge follow the run - observation only)
+# --------------------------------------------------------------------------------------------
+#
+# One light-blue pointer, drawn inside the page that is in front.  It never clicks, types or focuses anything:
+# every real action is still the original Playwright call, made exactly once, and its errors come out unchanged.
+# Anything that goes wrong with the drawing (closed tab, navigation, slow renderer) is ignored.
+#  - Solid ring = the tool really clicked there.  Dashed ring = a pretend click (menu closed with Escape,
+#    upload "Try again" clicked by the page script, change of browser tab).  A ring never means "it worked".
+#  - The cursor stays where it last acted; it is carried to the next tab at the same screen spot.
+#  - A web page cannot draw on Edge's own tab bar, so a tab change is shown at the page edge on that tab's side.
+#  - One cursor only; work on hidden background tabs is not drawn.  Drawn with DOM calls and a constructed
+#    stylesheet inside a closed shadow root (no HTML strings: Copilot's CSP / Trusted Types stay satisfied).
+#    Fixed to the viewport (it does not follow an element that scrolls).  Hidden in diagnostics screenshots.
+
+PEBBLE_PATH = ("M6.3 5.2 C6.8 4.6 7.5 4.4 8.2 4.7 L31.6 13.3 C33.5 14 33.4 16.6 31.5 17.2 L21.3 20.3 L17.6 30.6 "
+               "C17 32.4 14.4 32.4 13.8 30.6 L6 7.2 C5.8 6.5 5.9 5.7 6.3 5.2 Z")
+VISUAL_DEFAULTS = {
+    "size": 38,                                       # px; about 20% bigger than a normal pointer
+    "path": PEBBLE_PATH, "tip": [6.2, 5.6],           # the pointer drawing (SVG path in a 40x40 box) and its hot spot
+    "colors": ["#93BFF6", "#337BD8", "#0F4FA8"],      # "deep ocean" fill: tip -> middle -> tail
+    "rim": "#FFFFFF", "rim_width": 2, "edge": "#0A2540", "edge_width": 0.9,
+    "shadow": "drop-shadow(0 1px 1px rgba(4,20,40,.32)) drop-shadow(0 4px 7px rgba(4,20,40,.20))",
+    "ring": "#1F66C2", "ripple_size": 40, "ripple_width": 1.6, "ripple_opacity": 0.95, "glow": "#337BD8",
+    "move_ms": 220, "press_ms": 90, "ripple_ms": 520, "edit_ms": 700,
+    "cap_ms": 400,                                    # most the drawing may delay one real action
+    "idle_opacity": 1.0, "reduced_motion": "auto",    # auto = follow Windows "reduce motion"; "on" = always jump; "off" = always glide
+    "in_captures": False, "z_index": 2147483647,
+}
+
+OVERLAY_JS = r"""([op, arg, o, at]) => {
+  const K = '__caseSenderCursor';
+  let s = window[K];
+  if (op === 'teardown') { if (s) s.teardown(); return null; }
+  if (s && !s.host.isConnected) { s.teardown(); s = null; }
+  if (!s) {
+    if (op === 'hide') return null;
+    s = window[K] = make();
+  }
+  return s.run(op, arg);
+
+  function make() {
+    const reduce = o.reduced_motion === 'on' || (o.reduced_motion !== 'off' && matchMedia('(prefers-reduced-motion: reduce)').matches);
+    const move = reduce ? 0 : o.move_ms, k = o.size / 40, tx = o.tip[0] * k, ty = o.tip[1] * k;
+    const host = document.createElement('div');
+    host.setAttribute('aria-hidden', 'true');
+    host.style.cssText = 'all:initial;position:fixed;inset:0;pointer-events:none;z-index:' + o.z_index + ';contain:strict';
+    const root = host.attachShadow({mode: 'closed'});
+    const sheet = new CSSStyleSheet();
+    sheet.replaceSync(`*{pointer-events:none;box-sizing:border-box}
+      .c{position:absolute;left:0;top:0;width:${o.size}px;height:${o.size}px;opacity:0;will-change:transform;
+         transition:transform ${move}ms cubic-bezier(.2,.8,.2,1),opacity 160ms ease-out}
+      .c.on{opacity:1} .c.on.idle{opacity:${o.idle_opacity}}
+      .b{width:100%;height:100%;transform-origin:${tx}px ${ty}px;transition:transform ${reduce ? 0 : 180}ms cubic-bezier(.3,.7,.3,1)}
+      .b svg{display:block;width:100%;height:100%;overflow:visible;filter:${o.shadow}}
+      .c.press .b{transform:scale(.86) rotate(-3deg);transition-duration:${o.press_ms}ms}
+      .c.rel .b{animation:rel 240ms cubic-bezier(.3,1.6,.5,1)}
+      @keyframes rel{0%{transform:scale(.86) rotate(-3deg)}60%{transform:scale(1.04) rotate(.5deg)}100%{transform:none}}
+      .r{position:absolute;width:${o.ripple_size}px;height:${o.ripple_size}px;margin:${-o.ripple_size / 2}px 0 0 ${-o.ripple_size / 2}px;
+         border-radius:50%;border:${o.ripple_width}px solid ${o.ring};opacity:0;transform:scale(.1);
+         animation:rip ${o.ripple_ms}ms cubic-bezier(.16,.84,.32,1) forwards}
+      .r.p{border-style:dashed;animation-duration:${o.ripple_ms + 80}ms}
+      @keyframes rip{0%{opacity:${o.ripple_opacity};transform:scale(.1)}100%{opacity:0;transform:scale(1)}}
+      .e{position:absolute;border-radius:14px;opacity:0;transition:opacity 160ms ease-out;box-shadow:0 0 0 2px ${o.glow}bf,0 0 0 6px ${o.glow}2e}
+      .e.on{opacity:1}
+      .g{position:absolute;top:18%;bottom:18%;width:3px;border-radius:3px;opacity:0;transition:opacity 180ms;
+         background:linear-gradient(to bottom,transparent,${o.glow},transparent)}
+      .g.on{opacity:.95}`);
+    root.adoptedStyleSheets = [sheet];
+    const div = cls => { const d = document.createElement('div'); d.className = cls; root.appendChild(d); return d; };
+    const e = div('e'), g = div('g'), c = div('c'), b = document.createElement('div');
+    b.className = 'b'; c.appendChild(b);
+    const NS = 'http://www.w3.org/2000/svg';
+    const el = (tag, attrs, parent) => { const n = document.createElementNS(NS, tag); for (const a in attrs) n.setAttribute(a, attrs[a]); parent.appendChild(n); return n; };
+    const svg = el('svg', {viewBox: '0 0 40 40'}, b), defs = el('defs', {}, svg);
+    const fill = el('linearGradient', {id: 'vcf', x1: '.1', y1: '.05', x2: '.75', y2: '1'}, defs);
+    o.colors.forEach((col, i) => el('stop', {offset: [0, .48, 1][i] ?? 1, 'stop-color': col}, fill));
+    const shade = el('radialGradient', {id: 'vcs', cx: '.72', cy: '.86', r: '.55'}, defs);
+    el('stop', {offset: 0, 'stop-color': o.edge, 'stop-opacity': .22}, shade);
+    el('stop', {offset: 1, 'stop-color': o.edge, 'stop-opacity': 0}, shade);
+    el('path', {d: o.path}, el('clipPath', {id: 'vcc'}, defs));
+    el('path', {d: o.path, fill: 'none', stroke: o.edge, 'stroke-width': 2 * o.edge_width + o.rim_width, 'stroke-linejoin': 'round', 'stroke-opacity': .82}, svg);
+    el('path', {d: o.path, fill: 'url(#vcf)', stroke: o.rim, 'stroke-width': o.rim_width, 'stroke-linejoin': 'round'}, svg);
+    const lit = el('g', {'clip-path': 'url(#vcc)'}, svg);
+    el('rect', {width: 40, height: 40, fill: 'url(#vcs)'}, lit);
+    if (o.highlight) {
+      el('path', {d: 'M8.6 7.2 L29.4 14.9', stroke: '#FFFFFF', 'stroke-opacity': .6, 'stroke-width': 1.1, 'stroke-linecap': 'round'}, lit);
+      el('path', {d: 'M8.3 8.4 L13.4 23.8', stroke: '#FFFFFF', 'stroke-opacity': .35, 'stroke-width': .9, 'stroke-linecap': 'round'}, lit);
+    }
+    document.documentElement.appendChild(host);
+
+    const timers = new Set();
+    const later = (fn, ms) => { const t = setTimeout(() => { timers.delete(t); fn(); }, ms); timers.add(t); return t; };
+    const drop = t => { if (t) { clearTimeout(t); timers.delete(t); } };
+    let x = null, y = null, leanT = null, idleT = null, editT = null, editI = null;
+    const fit = (v, max) => Math.max(2, Math.min(max - 2, v));
+    const inView = p => p && p[0] >= 0 && p[1] >= 0 && p[0] <= innerWidth && p[1] <= innerHeight;
+    function put(nx, ny, glide) {
+      nx = fit(nx, innerWidth); ny = fit(ny, innerHeight);
+      const slide = glide && x !== null && !reduce;
+      if (!slide) c.style.transition = 'none';
+      c.style.transform = `translate(${nx - tx}px, ${ny - ty}px)`;
+      drop(leanT);
+      b.style.transform = slide ? `rotate(${Math.max(-5, Math.min(5, (nx - x) / 40))}deg)` : '';
+      if (slide) leanT = later(() => { b.style.transform = ''; }, move * .7);
+      if (!slide) { c.getBoundingClientRect(); c.style.transition = ''; }
+      c.classList.add('on'); c.classList.remove('idle', 'press');
+      x = nx; y = ny;
+      return slide ? move : 0;
+    }
+    function press() { drop(leanT); b.style.transform = ''; c.classList.remove('rel'); c.classList.add('press'); }
+    function release(kind) {
+      c.classList.remove('press');
+      if (!reduce) { c.classList.add('rel'); later(() => c.classList.remove('rel'), 260); }
+      if ((kind === 'real' || kind === 'pretend') && x !== null) {
+        const old = root.querySelectorAll('.r');
+        if (old.length > 5) old[0].remove();
+        const r = document.createElement('div');
+        r.className = kind === 'pretend' ? 'r p' : 'r';
+        r.style.left = x + 'px'; r.style.top = y + 'px';
+        root.appendChild(r);
+        later(() => r.remove(), o.ripple_ms + 300);     // timer, not animationend: background tabs skip animations
+      }
+      drop(idleT); idleT = later(() => c.classList.add('idle'), 1500);
+    }
+    function pretendAt(px, py) {
+      const wait = put(px, py, true);
+      later(() => { press(); later(() => release('pretend'), o.press_ms); }, wait);
+      return wait + o.press_ms;
+    }
+    const onResize = () => { if (x !== null) put(x, y, false); };   // a smaller window: clamp, never a fake click
+    addEventListener('resize', onResize);
+    if (at) put(at[0], at[1], false);                                // new document: continue from the last spot
+    const api = {
+      host,
+      track(el, ms) {      // glow around the text box, re-measured every 50 ms so it grows with a long message
+        const fitBox = () => {
+          if (!el.isConnected) return;
+          const r = el.getBoundingClientRect();
+          Object.assign(e.style, {left: (r.left - 1) + 'px', top: (r.top - 1) + 'px', width: (r.width + 2) + 'px', height: (r.height + 2) + 'px'});
+        };
+        drop(editT); clearInterval(editI);
+        fitBox(); e.classList.add('on');
+        editI = setInterval(fitBox, 50);
+        editT = later(() => { clearInterval(editI); editI = null; e.classList.remove('on'); }, ms);
+      },
+      teardown() {
+        removeEventListener('resize', onResize);
+        clearInterval(editI);
+        timers.forEach(clearTimeout); timers.clear();
+        host.remove();
+        if (window[K] === api) delete window[K];
+      },
+      run(op, a) {
+        let wait = 0, ok = true;
+        if (op === 'show') { if (a) put(a[0], a[1], false); }
+        else if (op === 'move') { if (inView(a)) wait = put(a[0], a[1], true); else ok = false; }
+        else if (op === 'press') press();
+        else if (op === 'release') release(a);
+        else if (op === 'pretend') { if (inView(a)) wait = pretendAt(a[0], a[1]); else ok = false; }
+        else if (op === 'outside') {
+          const menus = [...document.querySelectorAll('[role=menu]')].filter(m => m.offsetWidth || m.getClientRects().length)
+            .map(m => m.getBoundingClientRect());
+          if (!menus.length) ok = false;
+          else {
+            const left = Math.min(...menus.map(r => r.left)), right = Math.max(...menus.map(r => r.right));
+            wait = pretendAt(left > 60 ? left - 36 : right + 36, menus[0].top + Math.min(menus[0].height / 2, 80));
+          }
+        }
+        else if (op === 'edge') {
+          const right = a !== 'left';
+          g.style.left = right ? (innerWidth - 6) + 'px' : '3px';
+          g.classList.add('on');
+          wait = pretendAt(right ? innerWidth - 14 : 14, innerHeight / 2);
+          later(() => g.classList.remove('on'), wait + 400);
+        }
+        else if (op === 'hide') host.style.visibility = a ? 'hidden' : '';
+        return {at: x === null ? null : [x, y], ok, wait};
+      },
+    };
+    return api;
+  }
+}"""
+TRACK_JS = "(el, ms) => { const s = window.__caseSenderCursor; if (s && s.host.isConnected) s.track(el, ms); return !!s; }"
+
+
+class VisualCursor:
+    """The optional pointer.  Every method that wraps a real action calls it exactly once and returns its result;
+    with `enabled` False (the default) each of them is just that call."""
+
+    def __init__(self, options=None, enabled: bool = False):
+        self.enabled = enabled
+        self.o = {**VISUAL_DEFAULTS, **(options if isinstance(options, dict) else {})}
+        self.o["highlight"] = self.o["path"] == PEBBLE_PATH       # the top-edge sheen is drawn for the pebble only
+        self.cap = max(0.05, float(self.o["cap_ms"]) / 1000)
+        self.front = None     # page the run last brought forward: the only one drawn on
+        self.at = None        # last spot [x, y] in the window, carried from tab to tab
+        self.pages = set()
+
+    def _live(self, page) -> bool:
+        if not self.enabled or page is None:
+            return False
+        if self.front is None:
+            self.front = page
+        return page is self.front
+
+    async def _js(self, page, op, arg=None, deadline=None):
+        """One drawing step, time-capped.  Any failure is ignored: the drawing never decides what happens."""
+        limit = self.cap if deadline is None else max(0.05, deadline - time.monotonic())
+        try:
+            res = await asyncio.wait_for(page.evaluate(OVERLAY_JS, [op, arg, self.o, self.at]), limit)
+        except Exception:
+            return None
+        if op != "teardown":
+            self.pages.add(page)
+        if isinstance(res, dict) and res.get("at"):
+            self.at = res["at"]
+        return res if isinstance(res, dict) else None
+
+    async def _pause(self, res, deadline=None):
+        if res and res.get("wait"):
+            left = self.cap if deadline is None else deadline - time.monotonic()
+            await asyncio.sleep(max(0.0, min(res["wait"] / 1000, left)))
+
+    async def _box(self, locator, deadline):
+        try:
+            ms = max(1, (deadline - time.monotonic()) * 1000)
+            return await asyncio.wait_for(locator.bounding_box(timeout=ms), ms / 1000 + 0.05)
+        except Exception:
+            return None
+
+    async def _glide(self, page, point, deadline) -> bool:
+        res = await self._js(page, "move", point, deadline)
+        if not res or not res.get("ok"):
+            return False
+        await self._pause(res, deadline)
+        return True
+
+    async def _act(self, locator, action, kind, position=None):
+        """Glide to the element, show the press, run the ORIGINAL action once, then the ring (kind 'real') or nothing."""
+        page = getattr(locator, "page", None)
+        if not self._live(page):
+            return await action()
+        deadline = time.monotonic() + self.cap
+        box = await self._box(locator, deadline)
+        moved = False
+        if box:
+            pos = position or {"x": box["width"] / 2, "y": box["height"] / 2}
+            moved = await self._glide(page, [box["x"] + pos["x"], box["y"] + pos["y"]], deadline)
+        if moved and kind == "real":
+            await self._js(page, "press", None, deadline)
+        try:
+            result = await action()
+        except Exception:
+            if moved and kind == "real":
+                await self._js(page, "release", "none")     # un-press; no ring, the input may never have been issued
+            raise
+        if moved and kind == "real":
+            await self._js(page, "release", "real")
+        return result
+
+    async def click(self, locator, **kw):
+        return await self._act(locator, lambda: locator.click(**kw), "real", kw.get("position"))
+
+    async def hover(self, locator, **kw):
+        return await self._act(locator, lambda: locator.hover(**kw), "none", kw.get("position"))
+
+    async def _glow(self, locator, deadline=None):
+        """Glow around the text box that follows its live size (read-only; ignored if it fails)."""
+        limit = self.cap if deadline is None else max(0.05, deadline - time.monotonic())
+        try:
+            await asyncio.wait_for(locator.evaluate(TRACK_JS, self.o["edit_ms"], timeout=limit * 1000), limit + 0.05)
+        except Exception:
+            pass
+
+    async def fill(self, locator, text, **kw):
+        """Rest on the left part of the box with a glow around it, then the one real fill (no extra click).
+        The glow keeps its size in step with the box, so it grows as a long message makes the box taller."""
+        page = getattr(locator, "page", None)
+        glowing = False
+        if self._live(page):
+            deadline = time.monotonic() + self.cap
+            box = await self._box(locator, deadline)
+            if box and await self._glide(page, [box["x"] + min(48, box["width"] / 2), box["y"] + box["height"] / 2], deadline):
+                await self._glow(locator, deadline)
+                glowing = True
+        result = await locator.fill(text, **kw)
+        if glowing:
+            await self._glow(locator)      # restart its timer: stays on while the box finishes growing
+            deadline = time.monotonic() + self.cap
+            box = await self._box(locator, deadline)
+            if box:                        # rest on the last line of the (now taller) box
+                await self._glide(page, [box["x"] + min(48, box["width"] / 2), box["y"] + max(box["height"] - 14, box["height"] / 2)], deadline)
+        return result
+
+    async def follow(self, page, x, y):
+        """Glide along with a real page.mouse.move (the caller still makes that move)."""
+        if self._live(page):
+            deadline = time.monotonic() + self.cap
+            await self._glide(page, [x, y], deadline)
+
+    async def pretend(self, page, x, y):
+        """Pretend click (dashed ring) at a point: something the page script clicked, never input from us."""
+        if self._live(page):
+            await self._pause(await self._js(page, "pretend", [x, y]))
+
+    async def outside(self, page):
+        """Pretend click beside the open menu; the caller then presses Escape as before."""
+        if self._live(page):
+            await self._pause(await self._js(page, "outside"))
+
+    async def switch(self, page, bring):
+        """Browser-tab change: pretend click at the page edge on the next tab's side, then the REAL switch (`bring`,
+        called once), then the cursor waits at that same spot on the new tab."""
+        old = self.front
+        if not self.enabled or old is page:
+            return await bring()
+        self.front = page
+        if old is not None:
+            try:
+                pages = page.context.pages
+                side = "right" if pages.index(page) > pages.index(old) else "left"
+            except Exception:
+                side = "right"
+            await self._pause(await self._js(old, "edge", side))
+        result = await bring()
+        if self.at:
+            await self._js(page, "show", self.at)
+        return result
+
+    async def hidden(self, page, hide: bool):
+        if self.enabled and not self.o["in_captures"]:
+            await self._js(page, "hide", hide)
+
+    async def teardown(self):
+        """Remove every drawing, listener and timer this run added; afterwards the cursor is off."""
+        pages, self.pages = list(self.pages), set()
+        self.enabled, self.front, self.at = False, None, None
+        for page in pages:
+            await self._js(page, "teardown")
+
+
+CopilotTab.cursor = VisualCursor()      # off; `run` replaces it after asking (one cursor shared by every tab)
 
 
 # --------------------------------------------------------------------------------------------
@@ -2108,12 +2476,26 @@ class Runner:
             fresh, _ = await asyncio.gather(tab.fresh(), tab.ensure_model(self.model))
             if not fresh:
                 raise AttemptFailed("conversation was not fresh")
-            self.rec(case, "uploading")
-            await tab.attach(paths, route)
-            self.log("uploading", case.alias, attempt=n, route=route, expected=len(expected))
-            self.start_prefetch(nxt)                     # pipeline: next case prepares while this uploads
-            await tab.set_message(self.message)          # typing the message overlaps the file transfer
-            await self.wait_upload_ready(tab, case, expected)
+            for recovery in range(int(self.cfg.upload_recoveries) + 1):
+                self.rec(case, "uploading", **({"recovery": recovery} if recovery else {}))
+                await tab.attach(paths, route)
+                self.log("uploading", case.alias, attempt=n, route=route, expected=len(expected))
+                self.start_prefetch(nxt)                 # pipeline: next case prepares while this uploads
+                await tab.set_message(self.message)      # typing the message overlaps the file transfer
+                try:
+                    await self.wait_upload_ready(tab, case, expected)
+                    break
+                except UploadError:
+                    if recovery >= int(self.cfg.upload_recoveries):
+                        raise
+                # nothing was sent: open a fresh chat in THIS tab and attach the same files again
+                self.log("upload-recovery", case.alias, attempt=n,
+                         note=f"upload error - fresh chat in the same tab, attaching again ({recovery + 1}/{self.cfg.upload_recoveries})")
+                await tab.reset()
+                await tab.foreground()
+                fresh, _ = await asyncio.gather(tab.fresh(), tab.ensure_model(self.model))
+                if not fresh:
+                    raise AttemptFailed("conversation was not fresh")
             await self.pre_send_checks(tab, case, prep.plan)
             self.rec(case, "upload_ready", observed=len(expected))
             self.stop.check()
@@ -2163,16 +2545,22 @@ class Runner:
         """Observe-only loop: never re-assigns files.  Fails on stall/error/extra; succeeds only after the
         exact set has been ready continuously for stable_seconds."""
         cfg, t0 = self.cfg, time.monotonic()
-        last_sig, last_change, stable_since, clicks = None, time.monotonic(), None, 0
+        last_sig, last_change, stable_since, clicks, waited = None, time.monotonic(), None, 0, False
         while True:
             snap = await tab.snapshot()
             verdict = judge_upload(snap, expected)
             if snap["limit"]:
                 raise Blocked("Copilot reported an attachment limit for this case")
             if snap["error"]:
-                if clicks >= cfg.upload_retry_clicks or not await tab.click_upload_retry():
-                    raise AttemptFailed("Copilot reported an upload error")
-                clicks += 1
+                if clicks < cfg.upload_retry_clicks and await tab.click_upload_retry():
+                    clicks += 1
+                elif not waited:            # no "Try again" button (left): look once more after a short pause
+                    waited = True
+                    self.log("upload-recovery", case.alias, note=f"upload error shown - looking again in {cfg.upload_error_grace_seconds}s")
+                    await self.stop.sleep(cfg.upload_error_grace_seconds)
+                    continue
+                else:
+                    raise UploadError("Copilot reported an upload error")
                 last_change, stable_since = time.monotonic(), None
             if verdict["extra"]:
                 self.note_chips(case, snap, expected, time.monotonic() - t0)
@@ -3069,6 +3457,7 @@ async def run_async(ctx, journal, ledger, listed, cases, todo, instr, message) -
         code = code or 1
         raise
     finally:
+        await CopilotTab.cursor.teardown()              # drawings removed from every tab; Edge itself stays open
         try:
             bfacts = await asyncio.wait_for(browser_facts(browser, runner), 20)   # before the connection is closed
         except Exception:
@@ -3153,7 +3542,7 @@ async def prepare_session(runner, browser, cfg, log, todo):
             warm.cancel()
         raise
     runner.pool.extend((t, browser.generation) for t in tabs)
-    await first.page.bring_to_front()
+    await CopilotTab.cursor.switch(first.page, first.page.bring_to_front)
     for tab in tabs[1:]:      # every other tab applies the chosen model in the background, in parallel
         tab.model_task = asyncio.ensure_future(tab.ensure_model(runner.model))
     log("session", note=f"{len(tabs)} tab(s) ready" + (f", model: {runner.model['label']}" if runner.model else ""))
@@ -3182,6 +3571,22 @@ def summarise(ctx, journal, cases, listed, results):
         print("Unresolved cases are NOT successes: check the Copilot chats; uncertain ones are never resent.")
 
 
+def choose_visual_cursor(cfg) -> bool:
+    """`visual_cursor` "on"/"off" decides; "ask" (the default) asks once per run.  Enter = Yes, N = No, no time limit."""
+    mode = str(cfg.visual_cursor).lower()
+    if mode in ("on", "off"):
+        return mode == "on"
+    while True:
+        try:
+            answer = input("Show a moving cursor in Edge so you can follow what the tool does? "
+                           "It makes each case about 2-3 seconds slower. Enter = Yes, N = No: ").strip().lower()
+        except EOFError:
+            return True        # input ended unexpectedly: same as Enter
+        if answer in ("", "n", "no"):
+            return answer == ""
+        print("  Please press Enter for Yes, or type N for No.")
+
+
 def run_command(args) -> int:
     cfg = load_config()
     if getattr(args, "detail", None):
@@ -3203,6 +3608,9 @@ def run_command(args) -> int:
                 journal.record(c.key, "preflight_blocked", alias=c.alias, instruction_id=c.id, reason=c.blocked)
         ctx.log("queue", note=f"{len(todo)} instruction(s) queued; {len(done)} already sent, {excluded} excluded, "
                               f"{len(other)} unrecognised, {sum(1 for c in cases if c.blocked)} blocked")
+        if todo:
+            CopilotTab.cursor = VisualCursor(cfg.visual_cursor_options, choose_visual_cursor(cfg))
+            ctx.log("session", note="moving cursor " + ("on" if CopilotTab.cursor.enabled else "off"))
         return asyncio.run(run_async(ctx, journal, ledger, listed, cases, todo, instr, message))
     except BaseException as exc:
         if not getattr(ctx, "reported", None):       # failed before/outside the run loop: still leave a report
