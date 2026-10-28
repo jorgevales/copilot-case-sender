@@ -1200,6 +1200,12 @@ class EdgeBrowser:
         self.pw = self.browser = self.context = None
         self.generation = 0
         self.api = None
+        self.launched = self.attach_logged = False     # launched: this run started Edge itself (else we joined an open one)
+
+    @property
+    def reused(self) -> bool:
+        """Joined an Edge that was already open on the port: its prepared Copilot tabs are used, none are added."""
+        return not self.launched
 
     # -- launch -------------------------------------------------------------------------------
     def _variants(self):
@@ -1239,14 +1245,17 @@ class EdgeBrowser:
         if payload:
             if not endpoint_valid(payload, port):
                 raise UiError("the debugging endpoint is not a loopback browser endpoint on the expected port")
-            if not port_owned_by_profile(self.rt.profile, payload):
-                raise UiError("this debugging port belongs to a different browser/profile - choose another cdp_port")
+            if not self.launched and not self.attach_logged:   # an Edge that was open before us (any process): use it as it is
+                self.attach_logged = True
+                self.log("edge-attach", note="using the Edge session already open on this port"
+                         + ("" if port_owned_by_profile(self.rt.profile, payload) else " (started by another process)"))
             return payload
         if not launch:
             return None
         for variant in self._variants():
             self.log("edge-launch", variant=variant)
             proc = self._launch(variant)
+            self.launched = True
             deadline = time.monotonic() + self.cfg.endpoint_wait_seconds
             while time.monotonic() < deadline:
                 await self.stop.sleep(0.4)
@@ -2801,6 +2810,25 @@ async def discover_models_anywhere(browser, first, redact, log):
         candidates = [first] + [t for t in await browser.find_ready_tabs() if t.page is not first.page]   # others may be ready now
 
 
+async def existing_tabs(browser, first, wanted, log) -> list:
+    """Up to `wanted` more signed-in Copilot tabs that were already open in a joined Edge (no tab is opened)."""
+    if wanted < 1 or not browser.reused:
+        return []
+    tabs = []
+    for tab in await browser.find_ready_tabs():
+        if len(tabs) >= wanted:
+            break
+        if tab.page is first.page:
+            continue
+        try:
+            await tab.adopt()           # same tab, fresh chat if it was not already one
+        except SenderError:
+            continue
+        tabs.append(tab)
+    log("session", note=f"using {len(tabs) + 1} Copilot tab(s) that were already open")
+    return tabs
+
+
 async def prepare_session(runner, browser, cfg, log, todo):
     """Sign-in -> model list -> (warm-up of up to `warm_tabs` tabs runs while you choose) -> model applied."""
     stdin = StdinLines()
@@ -2808,10 +2836,11 @@ async def prepare_session(runner, browser, cfg, log, todo):
     log("login", note="Copilot is signed in")
     first, entries = await discover_models_anywhere(browser, first, runner.redact, log)
     count = max(1, min(int(cfg.warm_tabs), len(todo)))
-    warm = asyncio.ensure_future(browser.open_tabs(count - 1)) if count > 1 else None   # prepares while you choose
+    # Joined an already-open Edge: its prepared tabs are the pool, nothing is opened.  Otherwise warm tabs while you choose.
+    warm = asyncio.ensure_future(browser.open_tabs(count - 1)) if count > 1 and not browser.reused else None
     try:
         runner.model = await choose_model(entries, pick_default(entries), cfg, stdin, log)
-        tabs = [first] + (await warm if warm else [])
+        tabs = [first] + (await warm if warm else await existing_tabs(browser, first, count - 1, log))
     except BaseException:
         if warm:
             warm.cancel()

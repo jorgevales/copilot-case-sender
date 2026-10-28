@@ -201,7 +201,7 @@ or the copy bundled in the package is used – `check` shows which.
 
 Dedicated Edge profile under `RUNTIME_ROOT\profile` + `chromium.connect_over_cdp` (no fresh Chromium). One
 controller lock per profile+port; loopback only (`--remote-debugging-address=127.0.0.1`, no wildcard origins); the
-port must belong to our profile (`DevToolsActivePort` when Edge writes it, otherwise Edge must be holding the profile `lockfile` – a heuristic) so your other debug sessions are never touched.
+an Edge that is **already open on the configured `cdp_port`** (opened by this tool earlier or by any other process) is joined as it is: its signed-in Copilot tabs are used directly (each reset to a fresh chat if it was not one), the model list is read from them right away, and **no extra tab is opened** (the pool is just the prepared tabs, at most `warm_tabs`/cases). Only when nothing is listening does the tool start its own Edge on the dedicated profile and warm up tabs itself. Other debug sessions on other ports are never touched, so keep `cdp_port` different from them.
 Handshake escalation `3, 6, 12, 20, 30 s`, browser WebSocket first then HTTP, **sequentially**, discovery refreshed
 each round, every attempt owned and cancelled/awaited. A bounded `reconnect_budget_seconds` ends in a durable
 `recovery_required` run state (exit code 4) instead of looping. Ctrl+C stops at the next safe point (second press

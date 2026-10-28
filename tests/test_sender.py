@@ -325,6 +325,8 @@ class FakeBrowser:
         self.ready_after -= 1
         return FakeTab(self.w, {}) if self.ready_after <= 0 else None
 
+    reused = False
+
     async def find_ready_tabs(self):
         tab = await self.find_ready_tab()
         return [tab] if tab else []
@@ -850,6 +852,40 @@ def test_handshake_hang_is_cancelled_and_budget_exhaustion_is_durable(env, monke
     b2 = edge_for(env, ["fail"] * 10, monkeypatch, handshake_timeouts=[0.05] * 50, reconnect_budget_seconds=0)
     with pytest.raises(S.RecoveryRequired):
         run(b2.connect())
+
+
+def test_an_edge_already_open_on_the_port_is_joined_even_if_another_process_started_it(env, monkeypatch):
+    port = env.cfg.cdp_port
+    payload = {"webSocketDebuggerUrl": f"ws://127.0.0.1:{port}/devtools/browser/abc"}
+
+    async def fake_version(p, timeout=1.5):
+        return payload
+    monkeypatch.setattr(S, "cdp_version", fake_version)
+    monkeypatch.setattr(S, "port_owned_by_profile", lambda profile, pl: False)       # someone else's Edge
+    b = S.EdgeBrowser(env.cfg, env.rt, env.policy, env.log, env.stop)
+    assert run(b.ensure_running(launch=False)) is payload and b.reused and not b.launched
+
+
+def test_prepared_tabs_of_a_joined_edge_are_the_pool_and_no_tab_is_opened(env):
+    for n in range(1, 4):
+        env.make_case(n)
+    cases, _, _ = env.cases()
+    r = env.runner()
+    b = r.browser
+    b.reused = True
+    ready = [FakeTab(env.world, {}) for _ in range(3)]
+
+    async def ready_tabs():
+        return list(ready)
+    b.find_ready_tab = lambda: asyncio.sleep(0, ready[0])
+    b.find_ready_tabs = ready_tabs
+    cfg = types.SimpleNamespace(**{**vars(env.cfg), "warm_tabs": 8, "requested_model": "GPT-6.1 Sol"})
+
+    async def go():
+        await S.prepare_session(r, b, cfg, env.log, cases)
+        return [t for t, _ in r.pool]
+    pool = run(go())
+    assert [t.target_id for t in pool] == [t.target_id for t in ready] and env.world.opened == 0
 
 
 def test_endpoint_validation_rejects_foreign_hosts_and_ports():
