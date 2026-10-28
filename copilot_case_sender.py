@@ -38,6 +38,7 @@ import threading
 import tempfile
 import time
 import types
+import unicodedata
 import urllib.request
 import uuid
 from pathlib import Path
@@ -1436,8 +1437,10 @@ SNAPSHOT_JS = r"""() => {
   roots.forEach(r => {          // textContent (not innerText) so overflow-hidden chips are still counted
     const b = r.matches(RM) ? r : r.querySelector(RM);
     const text = norm(r.textContent);
-    chips.push({label: b ? norm(b.getAttribute('aria-label')).slice('Remove attachment '.length) : '', text, title: norm(r.getAttribute('title'))});
-    if (busy.test(text)) active.push('chip');
+    const label = b ? norm(b.getAttribute('aria-label')).slice('Remove attachment '.length) : '';
+    chips.push({label, text, title: norm(r.getAttribute('title'))});
+    // status words only: a file called "Pending_payments.pdf" or "Loading_report.docx" must not look like a running upload
+    if (busy.test(label ? text.split(label).join(' ') : text)) active.push('chip');
     r.querySelectorAll('[aria-busy="true"],[role="progressbar"],[class*="spinner" i]').forEach(e => { if (vis(e)) active.push('spinner'); });
   });
   const alertText = () => [...document.querySelectorAll('[role="alert"],[role="dialog"],[aria-live="assertive"],[class*="toast" i],[class*="messagebar" i]')]
@@ -1783,18 +1786,43 @@ class CopilotTab:
 # 9. TRANSACTION, QUEUE AND RETRIES
 # --------------------------------------------------------------------------------------------
 
+def _key(text) -> str:
+    return unicodedata.normalize("NFC", norm_ws(text)).casefold()
+
+
+def _find_name(haystack: str, needle: str) -> bool:
+    """`needle` appears in `haystack` as a whole name, not glued to more name characters ('a.pdf' is not in
+    'aa.pdf' nor in 'a.pdf.bak.txt').  Both are already normalised with _key."""
+    start = haystack.find(needle)
+    while start >= 0 and needle:
+        end = start + len(needle)
+        if not re.match(r"[\w.\-]", haystack[start - 1:start] or " ") and not re.match(r"[\w\-]|\.\w", haystack[end:end + 2] or " "):
+            return True
+        start = haystack.find(needle, start + 1)
+    return False
+
+
 def resolve_chip(chip: dict, expected: list) -> str:
-    """Exact attachment name for a chip.  Prefer the 'Remove attachment <name>' label; otherwise the
-    chip text must be exactly an expected name plus only type/size decoration (no substring matching)."""
-    if chip.get("label"):
-        return chip["label"]
-    text = norm_ws(chip.get("title") or chip.get("text"))
-    for name in sorted(set(expected), key=len, reverse=True):
-        if text.casefold().startswith(name.casefold()):
-            rest = text[len(name):]
-            if re.fullmatch(r"[\s\W]*(?:[A-Za-z]{2,5})?[\s\d.,]*(?:bytes|[kmg]?b)?\s*", rest, re.I):
-                return name
-    return text
+    """Expected name a chip stands for (identity, never just a count).  Copilot may show the name with status
+    or size words around it ('Uploading x.pdf', 'x.pdf PDF 12 KB'), without the extension, or cut short with an
+    ellipsis; each of those still has to point at exactly one expected name.  Anything else stays as seen."""
+    shown = [norm_ws(chip.get(k)) for k in ("label", "title", "text") if norm_ws(chip.get(k))]
+    names = sorted(set(expected), key=len, reverse=True)
+    keys = {n: _key(n) for n in names}
+    stems = {n: _key(os.path.splitext(n)[0]) for n in names}
+    for text in shown:
+        k = _key(text)
+        for n in names:                                       # whole name, longest first
+            if k == keys[n] or _find_name(k, keys[n]):
+                return n
+        owners = [n for n in names if k == stems[n] or (stems[n] and _find_name(k, stems[n]))]
+        if len(owners) == 1 and len({stems[n] for n in names}) == len(names):   # extension hidden, stem unambiguous
+            return owners[0]
+        cut = k.rstrip(". …") if k.endswith(("…", "...")) else ""
+        owners = [n for n in names if len(cut) >= 8 and keys[n].startswith(cut)]
+        if len(owners) == 1:                                  # shortened with an ellipsis
+            return owners[0]
+    return shown[0] if shown else ""
 
 
 def needle_of(message: str) -> str:
@@ -1810,7 +1838,7 @@ def judge_upload(snap: dict, expected: list) -> dict:
     ready = (not missing and not extra and not snap["active"] and not snap["error"] and not snap["limit"]
              and snap["sendEnabled"] and not snap["generating"])
     return {"observed": sum(observed.values()), "missing": sum(missing.values()), "extra": sum(extra.values()),
-            "ready": ready, "signature": (sum(observed.values()), len(snap["active"]))}
+            "ready": ready, "signature": (sum(observed.values()), sum((observed & want).values()), len(snap["active"]))}
 
 
 # --- the answer contract: Copilot must reply with ONE JSON object, written as plain text, shaped like this -----
@@ -2129,8 +2157,12 @@ class Runner:
                     raise AttemptFailed("Copilot reported an upload error")
                 clicks += 1
                 last_change, stable_since = time.monotonic(), None
-            if verdict["extra"]:
+            if verdict["extra"] and verdict["observed"] > len(expected):     # more chips than files: a real extra attachment
+                self.dump_chips(case, snap, expected)
                 raise AttemptFailed("unexpected attachment present")
+            # Not more chips than files, only names that do not match (yet): while a big file loads Copilot may show it
+            # under a temporary hash-style name.  That is "still loading", not an error - it gets a longer stall window.
+            patience = cfg.upload_no_progress * (3 if verdict["extra"] else 1)
             if verdict["signature"] != last_sig:
                 last_sig, last_change = verdict["signature"], time.monotonic()
                 self.log("upload-progress", case.alias, expected=len(expected), observed=verdict["observed"])
@@ -2140,11 +2172,21 @@ class Runner:
                     return
             else:
                 stable_since = None
-            if time.monotonic() - last_change > cfg.upload_no_progress:
-                raise AttemptFailed(f"upload stalled at {verdict['observed']}/{len(expected)} attachments")
-            if time.monotonic() - t0 > cfg.upload_timeout:
-                raise AttemptFailed("upload timed out")
+            if time.monotonic() - last_change > patience or time.monotonic() - t0 > cfg.upload_timeout:
+                if verdict["extra"]:
+                    self.dump_chips(case, snap, expected)       # what the page called the files: lets the matching be tuned
+                raise AttemptFailed(f"upload stalled at {verdict['observed'] - verdict['extra']}/{len(expected)} attachments"
+                                    if time.monotonic() - last_change > patience else "upload timed out")
             await self.stop.sleep(cfg.poll_ms / 1000)
+
+    def dump_chips(self, case, snap, expected):
+        """What the page showed when the attachment set was rejected.  Real names: local state folder only."""
+        try:
+            write_atomic(self.rt.state / f"upload-mismatch-{case.alias}.json", json.dumps(
+                {"ts": now(), "expected": expected, "chips": snap["chips"], "active": snap["active"],
+                 "error": snap["error"], "limit": snap["limit"]}, indent=1))
+        except PersistenceError:
+            pass
 
     async def pre_send_checks(self, tab, case, plan):
         """Everything that must be true at the moment of sending (case, conversation, text, set, model)."""

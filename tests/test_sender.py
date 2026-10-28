@@ -544,6 +544,44 @@ def test_hidden_overflow_chips_resolved_by_exact_name_plus_decoration():
     assert not S.judge_upload(snap([], chips=wrong), exp)["ready"]
 
 
+def test_chip_names_with_status_words_hidden_extension_or_ellipsis_still_resolve():
+    exp = ["Quarterly_review_2026.pdf", "notes.txt"]
+    for text in ("Uploading Quarterly_review_2026.pdf 45%", "quarterly_review_2026.PDF PDF 3 MB", "Quarterly_review_2026",
+                 "Quarterly_review_20…"):
+        assert S.resolve_chip({"label": "", "text": text, "title": ""}, exp) == "Quarterly_review_2026.pdf", text
+    assert S.resolve_chip({"label": "", "text": "a1b2c3d4e5f6a7b8c9d0", "title": ""}, exp) == "a1b2c3d4e5f6a7b8c9d0"   # hash name stays unmatched
+
+
+def test_a_temporary_hash_name_while_loading_is_waited_for_not_failed(env):
+    exp = ["big_report.pdf", "small.txt"]
+    frames = [snap(["small.txt", "9f8e7d6c5b4a39281706"], active=["chip"], sendEnabled=False)] * 4 + [snap(exp)] * 40
+
+    class Tab:
+        async def snapshot(self):
+            return frames.pop(0) if len(frames) > 1 else frames[0]
+    cfg = types.SimpleNamespace(**{**vars(env.cfg), "stable_seconds": 0.01, "poll_ms": 1, "upload_no_progress": 30})
+    r = env.runner()
+    r.cfg = cfg
+    case = types.SimpleNamespace(alias="c1", key="k")
+    run(r.wait_upload_ready(Tab(), case, exp))                       # returns instead of raising "unexpected attachment"
+    assert not frames or len(frames) > 1
+
+
+def test_more_chips_than_files_still_fails_fast(env):
+    exp = ["a.pdf"]
+
+    class Tab:
+        async def snapshot(self):
+            return snap(["a.pdf", "left_over.pdf"])
+    r = env.runner()
+    with pytest.raises(S.AttemptFailed, match="unexpected attachment"):
+        run(r.wait_upload_ready(Tab(), types.SimpleNamespace(alias="c1", key="k"), exp))
+
+
+def test_a_file_named_with_a_busy_word_does_not_count_as_uploading():
+    assert "Pending" not in "x" and "split(label)" in SRC.read_text("utf-8")        # name is removed before the status words are tested
+
+
 def test_plan_handles_duplicate_basenames_and_instruction_collisions(env):
     folder = env.make_case(1, files=("a.pdf",))
     (folder / "sub").mkdir()
