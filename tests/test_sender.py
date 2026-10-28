@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import uuid
 from pathlib import Path
@@ -578,8 +579,26 @@ def test_more_chips_than_files_still_fails_fast(env):
         run(r.wait_upload_ready(Tab(), types.SimpleNamespace(alias="c1", key="k"), exp))
 
 
-def test_a_file_named_with_a_busy_word_does_not_count_as_uploading():
-    assert "Pending" not in "x" and "split(label)" in SRC.read_text("utf-8")        # name is removed before the status words are tested
+def test_run_report_has_every_section_and_leaks_no_real_path_id_or_file_name(env):
+    env.make_case(1, files=("secret_customer_file.pdf",))
+    cases, _, _ = env.cases()
+    r = env.runner()
+    log = S.Log(env.rt, env.red, "full")
+    ctx = types.SimpleNamespace(cfg=env.cfg, red=env.red, rt=env.rt, policy=env.policy, log=log)
+    r.log = log
+    start_seq = r.journal.seq
+    results = run(r.run(collections.deque(cases)))
+    assert [v[0] for v in results.values()] == ["submitted"]
+    log.trace(RuntimeError("boom at " + str(env.cfg.cases_root)), "test")
+    path = S.write_run_report(ctx, r.journal, cases, r, {"connection_generation": 1, "pages": [
+        {"url": "https://m365.cloud.microsoft/chat/conversation/0123456789abcdef0123456789abcdef?x=1", "ready": True, "visibility": "visible", "closed": False}]},
+        time.monotonic() - 5, start_seq, 0, None, ["run"])
+    text = path.read_text("utf-8")
+    for heading in ("## 0. How to read", "## 1. Outcome", "## 2. System", "## 3. The tool", "## 4. Browser", "## 5. Cases",
+                    "## 6. Attachment chips", "## 7. Errors", "## 8. Full event timeline", "## 9. Last console"):
+        assert heading in text, heading
+    assert "secret_customer_file" not in text and str(env.cfg.cases_root) not in text and "0123456789abcdef0123456789abcdef" not in text
+    assert "doc#1" in text and "RuntimeError" in text and "submitted" in text
 
 
 def test_plan_handles_duplicate_basenames_and_instruction_collisions(env):

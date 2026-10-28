@@ -36,6 +36,7 @@ import subprocess
 import sys
 import threading
 import tempfile
+import traceback
 import time
 import types
 import unicodedata
@@ -633,13 +634,18 @@ class Redactor:
             self.literals[v] = label
         self._rx = None
 
-    def __call__(self, text) -> str:
+    def literal(self, text) -> str:
+        """Only the registered values (paths, names, IDs); path/URL-shaped text is left alone."""
         text = str(text)
         if self.literals:
             if self._rx is None:
                 self._rx = re.compile("|".join(re.escape(k) for k in sorted(self.literals, key=len, reverse=True)), re.I)
             lowered = {k.lower(): v for k, v in self.literals.items()}
             text = self._rx.sub(lambda m: lowered.get(m.group(0).lower(), "<redacted>"), text)
+        return text
+
+    def __call__(self, text) -> str:
+        text = self.literal(text)
         for rx, label in self.GENERIC:
             text = rx.sub(label, text)
         return text
@@ -679,6 +685,7 @@ class Log:
 
     def __init__(self, rt: Runtime | None, redact: Redactor, detail: str = "full", show_ids: bool = False):
         self.redact, self.file, self.detail, self.show_ids = redact, None, detail, show_ids
+        self.events, self.errors, self.console = [], [], []        # in-memory copies for the run report (already redacted)
         if rt:
             self.file = rt.logs / f"events-{datetime.datetime.now():%Y%m%d-%H%M%S}.jsonl"
 
@@ -689,6 +696,8 @@ class Log:
         if shown:
             line = f"{line} instruction={shown}".strip()
         text = f"[{datetime.datetime.now():%H:%M:%S}] {alias or '-':<12} {phase:<18} {line}".rstrip()
+        self.console.append(text)
+        self.events.append({"ts": now(), "phase": phase, "case": alias, **fields})
         shade = {"submitted": "42;97",            # white text on green: sent successfully
                  "submitted_partial": "43;30",    # black on yellow: sent, but some files were left out
                  "WARNING": "43;30", "result_correct": "42;97", "result_incorrect": "41;97",
@@ -703,6 +712,12 @@ class Log:
                     fh.write(json.dumps({"ts": now(), "phase": phase, "case": alias, **fields}) + "\n")
             except OSError:
                 pass  # logging must never decide whether a case is sent; the journal is what matters
+
+
+    def trace(self, exc: BaseException, where: str = "") -> None:
+        """Remember an error with its call frames (file:line function) for the run report."""
+        frames = "\n".join(f"  {os.path.basename(f.filename)}:{f.lineno} {f.name}" for f in traceback.extract_tb(exc.__traceback__))
+        self.errors.append(f"[{now()}] {where} {type(exc).__name__}: {self.redact(str(exc))[:500]}\n{frames}")
 
 
 def register_redactions(red: Redactor, cfg, policy: PathPolicy | None) -> None:
@@ -1981,6 +1996,7 @@ class Runner:
         self.partial = set()              # cases sent with files left out (never reported as plain success)
         self.fg_lock = asyncio.Lock()     # only ONE party (sender or collector) works in the front tab at a time
         self.queue, self.queue_closed = None, False
+        self.chip_shapes = []             # what attachment chips looked like when names did not match (names hidden), for the run report
 
     # -- helpers ------------------------------------------------------------------------------
     def rec(self, case, state, **fields):
@@ -2157,6 +2173,8 @@ class Runner:
                     raise AttemptFailed("Copilot reported an upload error")
                 clicks += 1
                 last_change, stable_since = time.monotonic(), None
+            if verdict["extra"]:
+                self.note_chips(case, snap, expected, time.monotonic() - t0)
             if verdict["extra"] and verdict["observed"] > len(expected):     # more chips than files: a real extra attachment
                 self.dump_chips(case, snap, expected)
                 raise AttemptFailed("unexpected attachment present")
@@ -2178,6 +2196,18 @@ class Runner:
                 raise AttemptFailed(f"upload stalled at {verdict['observed'] - verdict['extra']}/{len(expected)} attachments"
                                     if time.monotonic() - last_change > patience else "upload timed out")
             await self.stop.sleep(cfg.poll_ms / 1000)
+
+    def note_chips(self, case, snap, expected, seconds: float):
+        """Shape-only record of the chips (no names) when some do not match, for the run report; deduplicated."""
+        rows = []
+        for c in snap["chips"]:
+            name = resolve_chip(c, expected)
+            raw = c.get("label") or c.get("title") or c.get("text") or ""
+            rows.append({"doc": expected.index(name) + 1 if name in expected else None, "via_label": bool(c.get("label")), **_shape(raw)})
+        key = (case.alias, json.dumps(rows, sort_keys=True), len(snap["active"]))
+        if len(self.chip_shapes) < 200 and (not self.chip_shapes or self.chip_shapes[-1].get("_key") != key):
+            self.chip_shapes.append({"_key": key, "case": case.alias, "after_s": round(seconds, 1), "chips": len(rows), "expected": len(expected),
+                                     "busy": len(snap["active"]), "error": bool(snap["error"]), "send_enabled": snap["sendEnabled"], "rows": rows})
 
     def dump_chips(self, case, snap, expected):
         """What the page showed when the attachment set was rejected.  Real names: local state folder only."""
@@ -2470,6 +2500,7 @@ class Runner:
                         break
                     except AttemptFailed as exc:
                         reason = self.redact(str(exc))
+                        getattr(self.log, "trace", lambda *a: None)(exc, f"{case.alias} attempt {n} ({route})")
                         self.rec(case, "retry_pending", reason=reason, attempt=n)
                         self.log("attempt-failed", case.alias, attempt=n, route=route, note=reason)
                         await self.stop.sleep(self.cfg.retry_backoff[min(n - 1, len(self.cfg.retry_backoff) - 1)])
@@ -2777,6 +2808,209 @@ async def choose_model(entries, default, cfg, stdin, log):
         print("  Please type a number from the list, or press Enter for the default.", flush=True)
 
 
+# --------------------------------------------------------------------------------------------
+# 11. RUN REPORT (a redacted, self-explaining account of the whole run, written for another LLM to read)
+# --------------------------------------------------------------------------------------------
+
+REPORT_GUIDE = """\
+This file describes ONE run of copilot_case_sender.py on the FNZ VDI. It was written for a reviewing LLM that cannot see the VDI:
+read it, work out what happened and why, and answer with (1) a diagnosis per problem, (2) concrete changes to the code or settings
+that would fix it, (3) anything this report did not capture that you would need next time.
+
+How the tool works, in short: for every case folder (an "instruction ID") it opens ONE fresh Microsoft 365 Copilot chat in a
+dedicated Edge window driven by Playwright over CDP, attaches the case documents plus the shared review guidance and result
+contract (max 20 attachments), types the base message, sends it exactly once, then reads Copilot's answer back as strict JSON.
+Case states: queued -> preparing -> uploading -> upload_ready -> send_intent -> submitted -> (fixup_sent) -> result_correct /
+result_incorrect / result_inconclusive / result_invalid / response_timeout; failures: retry_pending, failed_exhausted,
+preflight_blocked, submission_uncertain (never resent), cancelled, recovery_required.
+Invariants: at-most-once sending; one tab per case; tabs are brought to the front before work; files attach through the
+"+ -> Upload images and files" menu with the file chooser intercepted; a failed unsent attempt resets the SAME tab to a new chat.
+
+Privacy: everything below passed through the tool's redactor. Real paths, instruction IDs, file names and URLs never appear; cases
+are shown by alias (e.g. case-1a2b3c), files by position (doc#1), URLs by origin + shape. Timestamps are UTC (events) or local
+(console). "elapsed"/"seconds" fields are wall-clock seconds. Evidence level of everything here: observed on the VDI in this run.
+"""
+
+
+def redacted_json(obj, fn, indent=1) -> str:
+    """JSON text with every string VALUE passed through `fn` first (redacting the dumped text would mangle escaped backslashes)."""
+    def walk(o):
+        if isinstance(o, str):
+            return fn(o)
+        if isinstance(o, dict):
+            return {fn(str(k)): walk(v) for k, v in o.items()}
+        if isinstance(o, (list, tuple, set)):
+            return [walk(v) for v in o]
+        return o if isinstance(o, (int, float, bool, type(None))) else fn(str(o))
+    return json.dumps(walk(obj), indent=indent, ensure_ascii=False)
+
+
+def _shape(name: str) -> dict:
+    """What a file/chip name LOOKS like without revealing it: length, extension, hash-likeness."""
+    stem, ext = os.path.splitext(str(name))
+    return {"len": len(str(name)), "ext": ext.lower(), "hash_like": bool(re.fullmatch(r"[0-9a-f\-_]{16,}", stem, re.I)),
+            "has_space": " " in str(name), "non_ascii": any(ord(c) > 127 for c in str(name))}
+
+
+def _url_shape(url: str, red) -> str:
+    """origin + path with IDs masked, no query/fragment."""
+    p = urlparse(str(url))
+    path = re.sub(r"[0-9a-fA-F]{8,}(?:-[0-9a-fA-F]{4,}){0,4}|[A-Za-z0-9_-]{22,}", "<id>", p.path)
+    return red.literal(f"{p.scheme}://{p.netloc}{path}" if p.scheme else "<non-http page>")
+
+
+def system_facts(cfg, rt, policy) -> dict:
+    """Machine / interpreter / storage facts.  Nothing here is a secret; paths are left for the redactor."""
+    import locale
+    import platform
+    facts = {"os": platform.platform(), "os_version": platform.version(), "machine": platform.machine(),
+             "processor": platform.processor(), "cpu_count": os.cpu_count(), "python": sys.version.replace("\n", " "),
+             "python_flags": f"isolated={sys.flags.isolated} no_user_site={sys.flags.no_user_site} ignore_environment={sys.flags.ignore_environment} "
+                             f"dont_write_bytecode={sys.flags.dont_write_bytecode}",
+             "python_executable_name": os.path.basename(sys.executable), "playwright": playwright_version(), "pid": os.getpid(),
+             "timezone": f"{time.tzname} utc_offset_seconds={-time.timezone}", "locale": str(locale.getlocale()),
+             "stdout_encoding": getattr(sys.stdout, "encoding", None), "filesystem_encoding": sys.getfilesystemencoding(),
+             "stdin_is_terminal": bool(getattr(sys.stdin, "isatty", lambda: False)()), "cwd_is_tool_folder": os.path.samefile(os.getcwd(), os.path.dirname(os.path.abspath(__file__))),
+             "env_flags": {k: (k in os.environ) for k in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "PLAYWRIGHT_BROWSERS_PATH",
+                                                          "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD", "SESSIONNAME", "CLIENTNAME")},
+             "session_name": os.environ.get("SESSIONNAME", ""), "is_remote_session": os.environ.get("SESSIONNAME", "").upper().startswith("RDP")}
+    try:
+        class MEM(ctypes.Structure):
+            _fields_ = [("length", ctypes.c_ulong), ("load", ctypes.c_ulong), ("total", ctypes.c_ulonglong), ("avail", ctypes.c_ulonglong),
+                        ("totpage", ctypes.c_ulonglong), ("availpage", ctypes.c_ulonglong), ("totvirt", ctypes.c_ulonglong),
+                        ("availvirt", ctypes.c_ulonglong), ("ext", ctypes.c_ulonglong)]
+        m = MEM()
+        m.length = ctypes.sizeof(MEM)
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
+        facts["memory_mb"] = {"total": m.total >> 20, "available": m.avail >> 20, "load_percent": m.load}
+        facts["screen"] = f"{ctypes.windll.user32.GetSystemMetrics(0)}x{ctypes.windll.user32.GetSystemMetrics(1)}"
+    except Exception as exc:
+        facts["memory_mb"] = f"unavailable ({type(exc).__name__})"
+    for label, folder in (("runtime_root", cfg.runtime_root), ("cases_root", cfg.cases_root)):
+        try:
+            u = shutil.disk_usage(folder)
+            facts[f"disk_{label}_gb"] = {"total": u.total >> 30, "free": u.free >> 30}
+        except Exception as exc:
+            facts[f"disk_{label}_gb"] = f"unavailable ({type(exc).__name__})"
+    facts["storage"] = {"approved_root": str(getattr(policy, "approved_root", "") or cfg.approved_root or "(derived from runtime_root)"),
+                        "unc_root_known": bool(getattr(policy, "unc_root", "")),
+                        "runtime_root_is_unc": str(cfg.runtime_root).startswith("\\\\"), "cases_root_is_unc": str(cfg.cases_root).startswith("\\\\"),
+                        "edge_launch_spelling_memo": (rt.state / "edge-variant.txt").read_text().strip() if (rt.state / "edge-variant.txt").exists() else None}
+    try:
+        facts["runtime_files"] = {d: sorted(f"{p.name}:{p.stat().st_size}" for p in (rt.root / d).iterdir() if p.is_file())[-40:]
+                                  for d in ("state", "logs", "results")}
+    except Exception:
+        pass
+    return facts
+
+
+async def browser_facts(browser, runner) -> dict:
+    """Edge / tab facts, gathered BEFORE the browser connection is closed.  Every probe is best effort."""
+    out = {"launched_by_this_run": browser.launched, "joined_existing_edge": browser.reused, "port": browser.cfg.cdp_port,
+           "connection_generation": browser.generation, "connected": browser.context is not None}
+    try:
+        payload = await cdp_version(browser.cfg.cdp_port)
+        out["edge"] = {k: (payload or {}).get(k) for k in ("Browser", "Protocol-Version", "User-Agent", "V8-Version", "WebKit-Version")}
+    except Exception as exc:
+        out["edge"] = f"unavailable ({type(exc).__name__})"
+    pages = []
+    try:
+        for page in list(browser.context.pages):
+            tab = CopilotTab(page, browser.cfg, browser.stop)
+            try:
+                ready = await tab.is_ready()
+                vis = await asyncio.wait_for(page.evaluate("document.visibilityState"), 2)
+            except Exception:
+                ready, vis = None, None
+            pages.append({"url": page.url, "ready": ready, "visibility": vis, "closed": page.is_closed()})
+    except Exception as exc:
+        out["pages_error"] = type(exc).__name__
+    out["pages"] = pages
+    if runner:
+        out.update(pool_tabs=len(runner.pool), retry_tabs=len(runner.retry_tab), done_tabs=len(runner.done_tabs),
+                   model=(runner.model or {}).get("label") if runner.model else None, model_group=(runner.model or {}).get("group") if runner.model else None)
+    return out
+
+
+def _case_section(c, rec, journal_events, results, runner, red) -> list:
+    """Everything known about one case, from the journal events of this run."""
+    lines = [f"### {c.alias}", f"- final state: {results.get(c.key, (rec.get('state', 'queued'), rec.get('reason', c.blocked)))[0]}"
+             f" | reason: {red(results.get(c.key, (None, rec.get('reason', c.blocked)))[1] or '-')}"
+             f" | attempts used: {runner.attempts.get(c.key, 0) if runner else 0}"]
+    plan = next((e["plan"] for e in reversed(journal_events) if e.get("plan")), None)
+    if plan:
+        exts = collections.Counter(os.path.splitext(i["name"])[1].lower() or "(none)" for i in plan)
+        lines.append(f"- documents planned: {len(plan)} ({dict(exts)}), total {sum(i.get('size', 0) for i in plan)} bytes, "
+                     f"largest {max(i.get('size', 0) for i in plan)} bytes, aliased(renamed) {sum(1 for i in plan if i.get('aliased'))}, "
+                     f"left out over the limit: {next((e.get('omitted') for e in reversed(journal_events) if 'omitted' in e), 0)}")
+        lines.append("- files (position: size bytes, name shape): " + "; ".join(
+            f"doc#{n}: {i.get('size', 0)}B {json.dumps(_shape(i['name']))}" for n, i in enumerate(plan[:25], 1)))
+    prev = None
+    for e in journal_events:
+        t = datetime.datetime.fromisoformat(e["ts"]) if e.get("ts") else None
+        gap = f" (+{(t - prev).total_seconds():.0f}s)" if t and prev else ""
+        prev = t or prev
+        extra = {k: v for k, v in e.items() if k not in ("seq", "ts", "case", "state", "alias", "instruction_id", "plan", "left_out", "src")}
+        lines.append(f"  - {e.get('ts', '')[11:19]}{gap} {e['state']} " + (redacted_json(extra, red, indent=None)[:400] if extra else ""))
+    return lines
+
+
+def write_run_report(ctx, journal, cases, runner, bfacts, started, start_seq, code, crash, argv, path=None) -> Path | None:
+    """Write RUNTIME_ROOT\\logs\\run-report-<time>.md and return its path.  Never raises: a report must not change a run."""
+    cfg, red, rt = ctx.cfg, ctx.red, ctx.rt
+    try:
+        results = runner.results if runner else {}
+        try:
+            events = [json.loads(r) for r in journal.path.read_bytes().splitlines() if r.strip()]
+        except (OSError, ValueError):
+            events = []
+        events = [e for e in events if e.get("seq", 0) > start_seq]
+        by_case = collections.defaultdict(list)
+        for e in events:
+            by_case[e["case"]].append(e)
+        counts = collections.Counter((results.get(c.key) or (journal.cases.get(c.key, {}).get("state", "queued"),))[0] for c in cases)
+        script = Path(__file__)
+        try:
+            digest, size = hashlib.sha256(script.read_bytes()).hexdigest()[:16], script.stat().st_size
+        except OSError:
+            digest, size = "?", 0
+        out = [f"# Run report - {datetime.datetime.now():%Y-%m-%d %H:%M:%S} (local) - exit code {code}", "", "## 0. How to read this report", REPORT_GUIDE,
+               "## 1. Outcome", f"- command line: {red(' '.join(argv))}",
+               f"- duration: {time.monotonic() - started:.1f}s | exit code: {code} ({'ok' if code == 0 else 'see errors'}) | cases in scope: {len(cases)}",
+               f"- results by state: {dict(counts)}",
+               f"- stopped by user: {runner.stop.is_set if runner else 'n/a'} | browser reconnects: {max(0, (bfacts or {}).get('connection_generation', 1) - 1)}",
+               f"- uncaught error: {'none' if crash is None else type(crash).__name__ + ': ' + red(str(crash)[:500])}", "",
+               "## 2. System and environment", "```json", redacted_json(system_facts(cfg, rt, ctx.policy), red), "```", "",
+               "## 3. The tool and its settings", f"- script: {script.name} sha256[:16]={digest} size={size} bytes (compare with the repository to know which code ran)",
+               f"- prompt version: {getattr(runner, 'prompt_version', None)}", "```json",
+               redacted_json(vars(cfg), red.literal), "```", "",
+               "## 4. Browser and session", "```json", redacted_json(
+                   {**(bfacts or {}), "pages": [{**p, "url": _url_shape(p["url"], red)} for p in (bfacts or {}).get("pages", [])]}, red.literal), "```", ""]
+        if runner:
+            out += [f"- attachments in the review guidance + contract (fixed files): {len(runner.instr)}", f"- sent-ledger entries before the run: {len(runner.sent_ids)}", ""]
+        out += ["## 5. Cases (one block per case; timings are gaps between journal events)"]
+        for c in cases:
+            out += _case_section(c, journal.cases.get(c.key, {}), by_case.get(c.key, []), results, runner, red) + [""]
+        shapes = getattr(runner, "chip_shapes", []) if runner else []
+        out += ["## 6. Attachment chips as the Copilot page showed them (names hidden, shapes only)",
+                "Each row: how many chips vs files, and for every chip whether it matched an expected file (doc#N) or not, with its name shape "
+                "(hash_like=true means a temporary hash-style name while loading).", "```json", redacted_json([{k: v for k, v in x.items() if k != "_key"} for x in shapes[-60:]], red.literal), "```", ""]
+        errors = ctx.log.errors
+        out += ["## 7. Errors and tracebacks (frames: file:line function)", "```", red("\n\n".join(errors) if errors else "none recorded"), "```", ""]
+        evs = ctx.log.events
+        shown = evs if len(evs) <= 3000 else evs[:600] + [{"note": f"... {len(evs) - 2400} events omitted ..."}] + evs[-1800:]
+        out += ["## 8. Full event timeline (the redacted structured log of this run, one JSON object per line)", "```json"]
+        out += [json.dumps(e, default=str) for e in shown] + ["```", ""]
+        out += ["## 9. Last console lines", "```", red("\n".join(ctx.log.console[-120:])), "```"]
+        text = red.literal("\n".join(out))          # final blanket pass: any registered path/ID/URL that slipped through
+        path = path or rt.logs / f"run-report-{datetime.datetime.now():%Y%m%d-%H%M%S}.md"
+        write_atomic(path, text)
+        return path
+    except Exception as exc:                  # noqa: BLE001 - the report is diagnostics only
+        print(f"(run report could not be written: {type(exc).__name__})", flush=True)
+        return None
+
+
 async def run_async(ctx, journal, ledger, listed, cases, todo, instr, message) -> int:
     cfg, log = ctx.cfg, ctx.log
     stop = Stopper()
@@ -2784,7 +3018,7 @@ async def run_async(ctx, journal, ledger, listed, cases, todo, instr, message) -
     runner = Runner(cfg, ctx.rt, ctx.policy, journal, ledger, log, stop, browser, ctx.red, message, instr)
     runner.prompt_version = prompt_version(cfg, message)
     by_key = {c.key: c for c in cases}
-    code, results = 0, {}
+    code, results, crash, started, start_seq, bfacts = 0, {}, None, time.monotonic(), journal.seq, None
     try:
         if any(r.get("state") == "send_intent" for r in journal.cases.values()):
             try:  # look at the existing browser only; never start a new one just to reconcile
@@ -2812,14 +3046,28 @@ async def run_async(ctx, journal, ledger, listed, cases, todo, instr, message) -
         journal.record("_run", "recovery_required", note=ctx.red(str(exc)))
         log("paused", note=str(exc))
         code = 4
+    except BaseException as exc:
+        crash = exc
+        ctx.log.trace(exc, "run")
+        code = code or 1
+        raise
     finally:
+        try:
+            bfacts = await asyncio.wait_for(browser_facts(browser, runner), 20)   # before the connection is closed
+        except Exception:
+            bfacts = None
         await runner.discard_prefetch()
         await browser.close()
+        ctx.reported = write_run_report(ctx, journal, cases, runner, bfacts, started, start_seq, code, crash, sys.argv[1:])
     results = runner.results
     summarise(ctx, journal, cases, listed, results)
     ok = ("submitted", "result_correct", "result_incorrect", "result_inconclusive")   # a valid verdict is a finished case
     unresolved = [k for k, (s, _) in results.items() if s not in ok or k in runner.partial]
-    return code or (1 if unresolved else 0)
+    code = code or (1 if unresolved else 0)
+    if ctx.reported:      # same file, now with the final exit code and the summary lines on the console
+        ctx.reported = write_run_report(ctx, journal, cases, runner, bfacts, started, start_seq, code, crash, sys.argv[1:], path=ctx.reported)
+        print(f"Run report (redacted, for review): {ctx.reported}", flush=True)
+    return code
 
 
 async def discover_models_anywhere(browser, first, redact, log):
@@ -2939,6 +3187,13 @@ def run_command(args) -> int:
         ctx.log("queue", note=f"{len(todo)} instruction(s) queued; {len(done)} already sent, {excluded} excluded, "
                               f"{len(other)} unrecognised, {sum(1 for c in cases if c.blocked)} blocked")
         return asyncio.run(run_async(ctx, journal, ledger, listed, cases, todo, instr, message))
+    except BaseException as exc:
+        if not getattr(ctx, "reported", None):       # failed before/outside the run loop: still leave a report
+            ctx.log.trace(exc, "startup")
+            path = write_run_report(ctx, journal, locals().get("cases", []), None, None, time.monotonic(), journal.seq, 1, exc, sys.argv[1:])
+            if path:
+                print(f"Run report (redacted, for review): {path}", flush=True)
+        raise
     finally:
         journal.close()
 

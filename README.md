@@ -64,6 +64,12 @@ assignment** → type `base_message` while the transfer runs → wait until the 
 transfer/error and Send enabled (held steady for `stable_seconds`) → record `send_intent` → click Send once → confirm
 the user message in *that* tab → record `submitted`, then add the ID to the ledger. Inventory of the next case runs
 meanwhile (**direct files** only unless `recursive_documents` is set). Cases beyond the warmed tabs open a new tab on
+
+**Attachment names** are matched by identity but tolerantly: status or size words, a hidden extension or an ellipsis around a name are
+fine, and a file called e.g. `Pending_payments.pdf` is not mistaken for a running upload. While a big file loads Copilot may show it under a
+temporary hash-style name: that counts as *still loading* (stall window 3x `upload_no_progress`), never as an error. Only **more chips than
+files** fails at once ("unexpected attachment present"); the chip names are then saved to `RUNTIME_ROOT/state/upload-mismatch-<alias>.json`
+(local only).
 demand (V1 is meant for a handful of controlled cases; recycling answered tabs is a later version).
 
 **How files are attached (no Windows file window).** The `+` button's "Upload images and files" entry normally opens
@@ -255,3 +261,13 @@ quarantined `playwright_bulk` route is **not** restored); Send-versus-Stop guard
 Dropped: the old audit workflow (CSV/allow-lists, merge-status JSON, merged PDFs, case-size categories, multi-case
 packing, audit prompt/response contract/result parser), indefinite reconnect loops, permissive Edge flags, Temp
 deletion routines, and the thousands of lines of diagnostics/override layers.
+
+## Run report (your eyes inside the VDI)
+At the end of every `run` (also after a crash, a stop, or a failure before the queue starts) the tool writes
+`RUNTIME_ROOT\logs\run-report-<time>.md` and prints its path. It is meant to be pasted to another LLM: it starts with a guide (how the
+tool works, case states, invariants, what to answer), then the outcome and exit code, OS / Python / Playwright / Edge versions, CPU,
+memory, disk, screen, time zone, remote-session hints, the script hash, **every setting**, storage facts, browser facts (launched or
+joined, reconnects, tabs with ready/visible state, model chosen), one block per case (attempts, routes, reasons, gaps between steps,
+document counts / sizes / name *shapes*), how the attachment chips looked when names did not match, errors with call frames, the full
+event timeline and the last console lines. It is redacted like the other logs (cases by alias, files as `doc#N`, URLs by shape; no
+real paths, IDs or file names), so it is safe to hand over.
