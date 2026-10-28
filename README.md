@@ -269,5 +269,4 @@ tool works, case states, invariants, what to answer), then the outcome and exit 
 memory, disk, screen, time zone, remote-session hints, the script hash, **every setting**, storage facts, browser facts (launched or
 joined, reconnects, tabs with ready/visible state, model chosen), one block per case (attempts, routes, reasons, gaps between steps,
 document counts / sizes / name *shapes*), how the attachment chips looked when names did not match, errors with call frames, the full
-event timeline and the last console lines. It is redacted like the other logs (cases by alias, files as `doc#N`, URLs by shape; no
-real paths, IDs or file names), so it is safe to hand over.
+event timeline and the last console lines. It is deliberately **not redacted**: it contains the real paths, instruction IDs and folders, file names, URLs, chip labels, environment variables and full error tracebacks, so it stays on the VDI and the user hands it over. The only things never included are credentials: environment variables whose names look like secrets are hidden, and no cookie, token or `.env` content is read. The console and `events-*.jsonl` logs stay redacted.

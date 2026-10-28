@@ -579,7 +579,8 @@ def test_more_chips_than_files_still_fails_fast(env):
         run(r.wait_upload_ready(Tab(), types.SimpleNamespace(alias="c1", key="k"), exp))
 
 
-def test_run_report_has_every_section_and_leaks_no_real_path_id_or_file_name(env):
+def test_run_report_is_unredacted_complete_and_hides_only_credential_looking_env_vars(env, monkeypatch):
+    monkeypatch.setenv("MY_SERVICE_TOKEN", "hunter2-secret-value")
     env.make_case(1, files=("secret_customer_file.pdf",))
     cases, _, _ = env.cases()
     r = env.runner()
@@ -589,7 +590,10 @@ def test_run_report_has_every_section_and_leaks_no_real_path_id_or_file_name(env
     start_seq = r.journal.seq
     results = run(r.run(collections.deque(cases)))
     assert [v[0] for v in results.values()] == ["submitted"]
-    log.trace(RuntimeError("boom at " + str(env.cfg.cases_root)), "test")
+    try:
+        raise RuntimeError("boom at " + str(env.cfg.cases_root))
+    except RuntimeError as exc:
+        log.trace(exc, "test")
     path = S.write_run_report(ctx, r.journal, cases, r, {"connection_generation": 1, "pages": [
         {"url": "https://m365.cloud.microsoft/chat/conversation/0123456789abcdef0123456789abcdef?x=1", "ready": True, "visibility": "visible", "closed": False}]},
         time.monotonic() - 5, start_seq, 0, None, ["run"])
@@ -597,7 +601,11 @@ def test_run_report_has_every_section_and_leaks_no_real_path_id_or_file_name(env
     for heading in ("## 0. How to read", "## 1. Outcome", "## 2. System", "## 3. The tool", "## 4. Browser", "## 5. Cases",
                     "## 6. Attachment chips", "## 7. Errors", "## 8. Full event timeline", "## 9. Last console"):
         assert heading in text, heading
-    assert "secret_customer_file" not in text and str(env.cfg.cases_root) not in text and "0123456789abcdef0123456789abcdef" not in text
+    assert "secret_customer_file.pdf" in text and str(env.cfg.cases_root) in text and "0123456789abcdef0123456789abcdef" in text
+    assert "hunter2-secret-value" not in text
+    assert "MY_SERVICE_TOKEN" in text
+    assert "boom at" in text
+    assert "Traceback" in text
     assert "doc#1" in text and "RuntimeError" in text and "submitted" in text
 
 

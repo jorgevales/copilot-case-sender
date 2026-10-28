@@ -685,19 +685,20 @@ class Log:
 
     def __init__(self, rt: Runtime | None, redact: Redactor, detail: str = "full", show_ids: bool = False):
         self.redact, self.file, self.detail, self.show_ids = redact, None, detail, show_ids
-        self.events, self.errors, self.console = [], [], []        # in-memory copies for the run report (already redacted)
+        self.events, self.errors, self.console = [], [], []        # in-memory copies for the run report: REAL values, never printed or filed
         if rt:
             self.file = rt.logs / f"events-{datetime.datetime.now():%Y%m%d-%H%M%S}.jsonl"
 
     def __call__(self, phase: str, alias: str = "", **fields) -> None:
+        raw = {k: (v if isinstance(v, (str, int, float, bool, type(None))) else str(v)) for k, v in fields.items()}
+        self.console.append(f"[{datetime.datetime.now():%H:%M:%S}] {alias or '-':<12} {phase:<18} " + " ".join(f"{k}={v}" for k, v in raw.items()))
+        self.events.append({"ts": now(), "phase": phase, "case": alias, "instruction_id": self.redact.ids.get(alias, ""), **raw})
         fields = {k: (self.redact(v) if isinstance(v, str) else v) for k, v in fields.items()}
         line = " ".join(f"{k}={v}" for k, v in fields.items())
         shown = self.redact.ids.get(alias) if self.show_ids else None
         if shown:
             line = f"{line} instruction={shown}".strip()
         text = f"[{datetime.datetime.now():%H:%M:%S}] {alias or '-':<12} {phase:<18} {line}".rstrip()
-        self.console.append(text)
-        self.events.append({"ts": now(), "phase": phase, "case": alias, **fields})
         shade = {"submitted": "42;97",            # white text on green: sent successfully
                  "submitted_partial": "43;30",    # black on yellow: sent, but some files were left out
                  "WARNING": "43;30", "result_correct": "42;97", "result_incorrect": "41;97",
@@ -716,8 +717,8 @@ class Log:
 
     def trace(self, exc: BaseException, where: str = "") -> None:
         """Remember an error with its call frames (file:line function) for the run report."""
-        frames = "\n".join(f"  {os.path.basename(f.filename)}:{f.lineno} {f.name}" for f in traceback.extract_tb(exc.__traceback__))
-        self.errors.append(f"[{now()}] {where} {type(exc).__name__}: {self.redact(str(exc))[:500]}\n{frames}")
+        full = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        self.errors.append(f"[{now()}] {where} {type(exc).__name__}: {exc}\n{full}")
 
 
 def register_redactions(red: Redactor, cfg, policy: PathPolicy | None) -> None:
@@ -2203,10 +2204,11 @@ class Runner:
         for c in snap["chips"]:
             name = resolve_chip(c, expected)
             raw = c.get("label") or c.get("title") or c.get("text") or ""
-            rows.append({"doc": expected.index(name) + 1 if name in expected else None, "via_label": bool(c.get("label")), **_shape(raw)})
+            rows.append({"doc": expected.index(name) + 1 if name in expected else None, "via_label": bool(c.get("label")), "label": c.get("label"),
+                         "text": c.get("text"), "title": c.get("title"), **_shape(raw)})
         key = (case.alias, json.dumps(rows, sort_keys=True), len(snap["active"]))
         if len(self.chip_shapes) < 200 and (not self.chip_shapes or self.chip_shapes[-1].get("_key") != key):
-            self.chip_shapes.append({"_key": key, "case": case.alias, "after_s": round(seconds, 1), "chips": len(rows), "expected": len(expected),
+            self.chip_shapes.append({"_key": key, "case": case.alias, "expected_names": list(expected), "after_s": round(seconds, 1), "chips": len(rows), "expected": len(expected),
                                      "busy": len(snap["active"]), "error": bool(snap["error"]), "send_enabled": snap["sendEnabled"], "rows": rows})
 
     def dump_chips(self, case, snap, expected):
@@ -2826,8 +2828,10 @@ preflight_blocked, submission_uncertain (never resent), cancelled, recovery_requ
 Invariants: at-most-once sending; one tab per case; tabs are brought to the front before work; files attach through the
 "+ -> Upload images and files" menu with the file chooser intercepted; a failed unsent attempt resets the SAME tab to a new chat.
 
-Privacy: everything below passed through the tool's redactor. Real paths, instruction IDs, file names and URLs never appear; cases
-are shown by alias (e.g. case-1a2b3c), files by position (doc#1), URLs by origin + shape. Timestamps are UTC (events) or local
+Privacy: this report is UNREDACTED on purpose (it stays on the VDI and is handed over by the user): real paths, instruction IDs,
+file names, URLs and full error texts appear. Secrets are the one exception: environment variables whose names look like
+credentials are hidden, and no cookie / token / .env content is ever read. The console and events-*.jsonl logs remain redacted
+(case aliases such as case-1a2b3c); the table in section 5 maps every alias to its real instruction ID and folder. Timestamps are UTC (events) or local
 (console). "elapsed"/"seconds" fields are wall-clock seconds. Evidence level of everything here: observed on the VDI in this run.
 """
 
@@ -2853,10 +2857,17 @@ def _shape(name: str) -> dict:
 
 
 def _url_shape(url: str, red) -> str:
-    """origin + path with IDs masked, no query/fragment."""
-    p = urlparse(str(url))
-    path = re.sub(r"[0-9a-fA-F]{8,}(?:-[0-9a-fA-F]{4,}){0,4}|[A-Za-z0-9_-]{22,}", "<id>", p.path)
-    return red.literal(f"{p.scheme}://{p.netloc}{path}" if p.scheme else "<non-http page>")
+    return str(url)
+
+
+class _Raw:
+    """Stand-in for the redactor in the run report, which keeps every real value."""
+    def __call__(self, text):
+        return str(text)
+    literal = __call__
+
+
+SECRET_NAME = re.compile(r"token|secret|passw|pwd|credential|cookie|auth|apikey|api_key|private|session_key|sas|bearer", re.I)
 
 
 def system_facts(cfg, rt, policy) -> dict:
@@ -2867,12 +2878,13 @@ def system_facts(cfg, rt, policy) -> dict:
              "processor": platform.processor(), "cpu_count": os.cpu_count(), "python": sys.version.replace("\n", " "),
              "python_flags": f"isolated={sys.flags.isolated} no_user_site={sys.flags.no_user_site} ignore_environment={sys.flags.ignore_environment} "
                              f"dont_write_bytecode={sys.flags.dont_write_bytecode}",
-             "python_executable_name": os.path.basename(sys.executable), "playwright": playwright_version(), "pid": os.getpid(),
+             "python_executable": sys.executable, "sys_path": list(sys.path), "argv": list(sys.argv), "user": os.environ.get("USERNAME", ""),
+             "computer": os.environ.get("COMPUTERNAME", ""), "domain": os.environ.get("USERDOMAIN", ""),
+             "logon_server": os.environ.get("LOGONSERVER", ""), "client_name": os.environ.get("CLIENTNAME", ""), "playwright": playwright_version(), "pid": os.getpid(),
              "timezone": f"{time.tzname} utc_offset_seconds={-time.timezone}", "locale": str(locale.getlocale()),
              "stdout_encoding": getattr(sys.stdout, "encoding", None), "filesystem_encoding": sys.getfilesystemencoding(),
-             "stdin_is_terminal": bool(getattr(sys.stdin, "isatty", lambda: False)()), "cwd_is_tool_folder": os.path.samefile(os.getcwd(), os.path.dirname(os.path.abspath(__file__))),
-             "env_flags": {k: (k in os.environ) for k in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "PLAYWRIGHT_BROWSERS_PATH",
-                                                          "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD", "SESSIONNAME", "CLIENTNAME")},
+             "stdin_is_terminal": bool(getattr(sys.stdin, "isatty", lambda: False)()), "cwd": os.getcwd(), "script": os.path.abspath(__file__),
+             "environment": {k: ("<hidden: looks like a credential>" if SECRET_NAME.search(k) else v) for k, v in sorted(os.environ.items())},
              "session_name": os.environ.get("SESSIONNAME", ""), "is_remote_session": os.environ.get("SESSIONNAME", "").upper().startswith("RDP")}
     try:
         class MEM(ctypes.Structure):
@@ -2934,7 +2946,8 @@ async def browser_facts(browser, runner) -> dict:
 
 def _case_section(c, rec, journal_events, results, runner, red) -> list:
     """Everything known about one case, from the journal events of this run."""
-    lines = [f"### {c.alias}", f"- final state: {results.get(c.key, (rec.get('state', 'queued'), rec.get('reason', c.blocked)))[0]}"
+    lines = [f"### {c.alias}  (instruction ID: {c.id or '?'} | folder: {c.name} | path: {c.path})",
+             f"- final state: {results.get(c.key, (rec.get('state', 'queued'), rec.get('reason', c.blocked)))[0]}"
              f" | reason: {red(results.get(c.key, (None, rec.get('reason', c.blocked)))[1] or '-')}"
              f" | attempts used: {runner.attempts.get(c.key, 0) if runner else 0}"]
     plan = next((e["plan"] for e in reversed(journal_events) if e.get("plan")), None)
@@ -2943,8 +2956,11 @@ def _case_section(c, rec, journal_events, results, runner, red) -> list:
         lines.append(f"- documents planned: {len(plan)} ({dict(exts)}), total {sum(i.get('size', 0) for i in plan)} bytes, "
                      f"largest {max(i.get('size', 0) for i in plan)} bytes, aliased(renamed) {sum(1 for i in plan if i.get('aliased'))}, "
                      f"left out over the limit: {next((e.get('omitted') for e in reversed(journal_events) if 'omitted' in e), 0)}")
-        lines.append("- files (position: size bytes, name shape): " + "; ".join(
-            f"doc#{n}: {i.get('size', 0)}B {json.dumps(_shape(i['name']))}" for n, i in enumerate(plan[:25], 1)))
+        lines.append("- files (position: uploaded name | source path | size | shape):")
+        lines += [f"    doc#{n}: {i['name']} | {i['src']} | {i.get('size', 0)}B | {json.dumps(_shape(i['name']))}" for n, i in enumerate(plan, 1)]
+        left = next((e.get("left_out") for e in reversed(journal_events) if e.get("left_out")), None)
+        if left:
+            lines.append(f"- left out (over the attachment limit): {json.dumps(left, default=str)[:1500]}")
     prev = None
     for e in journal_events:
         t = datetime.datetime.fromisoformat(e["ts"]) if e.get("ts") else None
@@ -2957,7 +2973,7 @@ def _case_section(c, rec, journal_events, results, runner, red) -> list:
 
 def write_run_report(ctx, journal, cases, runner, bfacts, started, start_seq, code, crash, argv, path=None) -> Path | None:
     """Write RUNTIME_ROOT\\logs\\run-report-<time>.md and return its path.  Never raises: a report must not change a run."""
-    cfg, red, rt = ctx.cfg, ctx.red, ctx.rt
+    cfg, red, rt = ctx.cfg, _Raw(), ctx.rt
     try:
         results = runner.results if runner else {}
         try:
@@ -2988,13 +3004,14 @@ def write_run_report(ctx, journal, cases, runner, bfacts, started, start_seq, co
                    {**(bfacts or {}), "pages": [{**p, "url": _url_shape(p["url"], red)} for p in (bfacts or {}).get("pages", [])]}, red.literal), "```", ""]
         if runner:
             out += [f"- attachments in the review guidance + contract (fixed files): {len(runner.instr)}", f"- sent-ledger entries before the run: {len(runner.sent_ids)}", ""]
-        out += ["## 5. Cases (one block per case; timings are gaps between journal events)"]
+        out += ["## 5. Cases (one block per case; timings are gaps between journal events)",
+                "alias -> instruction ID -> folder: " + "; ".join(f"{c.alias} -> {c.id} -> {c.path}" for c in cases), ""]
         for c in cases:
             out += _case_section(c, journal.cases.get(c.key, {}), by_case.get(c.key, []), results, runner, red) + [""]
         shapes = getattr(runner, "chip_shapes", []) if runner else []
-        out += ["## 6. Attachment chips as the Copilot page showed them (names hidden, shapes only)",
-                "Each row: how many chips vs files, and for every chip whether it matched an expected file (doc#N) or not, with its name shape "
-                "(hash_like=true means a temporary hash-style name while loading).", "```json", redacted_json([{k: v for k, v in x.items() if k != "_key"} for x in shapes[-60:]], red.literal), "```", ""]
+        out += ["## 6. Attachment chips as the Copilot page showed them",
+                "Each entry: how many chips vs files, and for every chip its real label/text/title, whether it matched an expected file (doc#N) "
+                "or not, and its name shape (hash_like=true means a temporary hash-style name while loading).", "```json", redacted_json([{k: v for k, v in x.items() if k != "_key"} for x in shapes[-60:]], red.literal), "```", ""]
         errors = ctx.log.errors
         out += ["## 7. Errors and tracebacks (frames: file:line function)", "```", red("\n\n".join(errors) if errors else "none recorded"), "```", ""]
         evs = ctx.log.events
