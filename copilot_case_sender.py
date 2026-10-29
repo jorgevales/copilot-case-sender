@@ -1305,6 +1305,8 @@ async def front(page) -> None:
 
 
 FRONT_SECONDS = 5
+RACE_GAPS = [4, 8, 12, 20, 30]          # seconds between handshake attempts joining the race (never cancelling one)
+RACE_MAX_ATTEMPTS = 8
 
 
 class progress:
@@ -1318,7 +1320,8 @@ class progress:
         t0 = time.monotonic()
         while True:
             await asyncio.sleep(PROGRESS_SECONDS)
-            say(f"[{datetime.datetime.now():%H:%M:%S}] {'-':<12} {'waiting':<18} still {self.what} ({time.monotonic() - t0:.0f}s)")
+            what = self.what() if callable(self.what) else self.what
+            say(f"[{datetime.datetime.now():%H:%M:%S}] {'-':<12} {'waiting':<18} still {what} ({time.monotonic() - t0:.0f}s)")
 
     async def __aenter__(self):
         self.task = asyncio.ensure_future(self._tick())
@@ -1479,6 +1482,7 @@ class EdgeBrowser:
         self.tabs_prepared, self.loading = False, []    # prepare_tabs ran (its tabs may still be loading: never open more)
         self.want, self.want_tabs = asyncio.Event(), 1  # how many Copilot tabs the run needs (set once the queue is known)
         self.tour_handoff = asyncio.Event()             # set when the Playwright TabTour takes over from http_tour
+        self.phase = "starting"                         # what the connection is doing now (shown by the progress line)
         self.http_ids = []                              # tab ids opened by http_topup
 
     @property
@@ -1560,58 +1564,83 @@ class EdgeBrowser:
                                "profile is already open, close it and run again.")
 
     # -- connect ------------------------------------------------------------------------------
-    async def _try(self, route: str, timeout: float):
-        """One owned connection attempt: cancelled AND awaited if it overruns (never leaked/overlapping)."""
-        task = asyncio.ensure_future(self.pw.chromium.connect_over_cdp(route, timeout=timeout * 1000))
-        done, _ = await asyncio.wait({task}, timeout=timeout + min(3, timeout))
-        if task in done:
-            return task.result()
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
-        raise asyncio.TimeoutError()
-
     async def connect(self, launch: bool = True):
-        budget_end = time.monotonic() + self.cfg.reconnect_budget_seconds
-        last, t0 = "no attempt", time.monotonic()
-        ladder = list(self.cfg.handshake_timeouts)
-        memo = self.rt.state / "handshake-seconds.txt"
-        try:                  # start at the limit that worked last time: the short ones only waste time on a slow machine
-            ladder = [t for t in ladder if t >= float(memo.read_text().strip())] or ladder[-1:]
-        except (OSError, ValueError):
+        """Racing handshake.  A slow but progressing Playwright handshake is NEVER cancelled to start over (on a busy
+        VDI that restart loop was the long wait): the first attempt starts at once with the whole budget, and while it
+        runs further attempts join at RACE_GAPS (alternating the browser WebSocket and the HTTP discovery route, each
+        with fresh discovery).  A failed attempt makes room for the next one at once.  The first attempt that connects
+        wins; every other one is cancelled, or disconnected if it also finished.  Gives up only at the budget end."""
+        t0 = time.monotonic()
+        budget_end = t0 + self.cfg.reconnect_budget_seconds
+        port, last, started, next_at, pending = self.cfg.cdp_port, "no attempt", 0, t0, set()
+        winner = None
+        memo = self.rt.state / "connect-route.txt"     # the route that won last time goes first (it worked here)
+        try:
+            first_http = memo.read_text().strip() == "http"
+        except OSError:
+            first_http = False
+        try:
+            while winner is None:
+                self.stop.check()
+                now = time.monotonic()
+                if now >= budget_end:
+                    break
+                if now >= next_at and started < RACE_MAX_ATTEMPTS:
+                    payload = await self.ensure_running(launch)          # refreshed discovery for every attempt
+                    if payload is None:
+                        if not pending:
+                            raise ConnectionLost("Edge is not running")
+                    else:
+                        use_ws = (started % 2 == 0) != first_http
+                        route = endpoint_valid(payload, port) if use_ws else f"http://127.0.0.1:{port}"
+                        task = asyncio.ensure_future(self.pw.chromium.connect_over_cdp(
+                            route, timeout=max(1.0, budget_end - time.monotonic()) * 1000))
+                        task.route_name, task.number = ("websocket" if use_ws else "http"), started + 1
+                        pending.add(task)
+                        started += 1
+                        self.phase = f"handshake with Edge ({len(pending)} attempt(s) running)"
+                    next_at = now + RACE_GAPS[min(started - 1, len(RACE_GAPS) - 1)] if started else now + 0.5
+                wait = max(0.05, min(next_at, budget_end) - time.monotonic())
+                if not pending:
+                    await self.stop.sleep(wait)
+                    continue
+                done, pending = await asyncio.wait(pending, timeout=wait, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    if task.exception() is not None:
+                        last = f"{type(task.exception()).__name__} ({task.route_name})"
+                        next_at = min(next_at, time.monotonic() + 0.5)     # a failure makes room for a fresh attempt now
+                        continue
+                    browser = task.result()
+                    if winner is None and browser.contexts:
+                        winner = (browser, task.route_name, task.number)
+                    else:
+                        last = last if browser.contexts else "browser exposed no context"
+                        await self._close_quietly(browser)
+        finally:
+            for task in pending:                        # losers: cancelled; one that connected anyway is disconnected
+                task.cancel()
+            for res in await asyncio.gather(*pending, return_exceptions=True):
+                if not isinstance(res, BaseException) and res is not None:
+                    await self._close_quietly(res)
+        if winner is None:
+            raise RecoveryRequired(f"could not connect within the reconnect budget (last: {last})")
+        self.browser, route, number = winner
+        self.context = self.browser.contexts[0]
+        self.generation += 1
+        self.phase = "connected"
+        await self._learn_pid()
+        try:
+            write_atomic(memo, route)
+        except PersistenceError:
             pass
-        for timeout in ladder:
-            self.stop.check()
-            if time.monotonic() > budget_end:
-                break
-            payload = await self.ensure_running(launch)         # refreshed discovery every cycle
-            if payload is None:
-                raise ConnectionLost("Edge is not running")
-            ws = endpoint_valid(payload, self.cfg.cdp_port)
-            # A responsive /json/version does NOT prove the Playwright handshake works: try the browser
-            # WebSocket first, then the HTTP discovery URL - strictly one after the other.
-            for route in (ws, f"http://127.0.0.1:{self.cfg.cdp_port}"):
-                try:
-                    self.browser = await self._try(route, timeout)
-                except Exception as exc:
-                    last = f"{type(exc).__name__} (handshake {timeout}s)"
-                    continue
-                self.context = self.browser.contexts[0] if self.browser.contexts else None
-                if self.context is None:
-                    last = "browser exposed no context"
-                    await self._drop()
-                    continue
-                self.generation += 1
-                await self._learn_pid()
-                took = time.monotonic() - t0
-                self.log("connect", note=f"connected to Edge in {took:.1f}s (handshake limit {timeout}s)")
-                if took > 1:        # a quick connect needs no memo; a slow one teaches the next start where to begin
-                    try:
-                        write_atomic(memo, str(timeout))
-                    except PersistenceError:
-                        pass
-                return
-            self.log("connect", note=f"retrying: {last}")
-        raise RecoveryRequired(f"could not connect within the reconnect budget (last: {last})")
+        self.log("connect", note=f"connected to Edge in {time.monotonic() - t0:.1f}s - WINNER: attempt {number} of {started}, "
+                                 f"{route} route (tried first next time)")
+
+    async def _close_quietly(self, browser):
+        try:
+            await asyncio.wait_for(browser.close(), 5)      # for a CDP attach this only disconnects; Edge stays open
+        except Exception:
+            pass
 
     async def _learn_pid(self):
         """The Edge browser process id, so the focus guard recognises exactly our Edge windows (best effort)."""
@@ -1644,9 +1673,11 @@ class EdgeBrowser:
             t0 = time.monotonic()
 
             async def driver():
+                self.phase = "starting the Playwright driver"
                 self.api = await asyncio.to_thread(load_playwright)
                 self.pw = await self.api[0]().start()
                 self.log("connect", note=f"Playwright driver started in {time.monotonic() - t0:.1f}s")
+                self.phase = "handshake with Edge"
             boot = asyncio.ensure_future(driver())
             try:
                 await self.ensure_running(launch)
@@ -3953,7 +3984,7 @@ async def run_async(ctx, journal, ledger, listed, message) -> int:
         resumable = cfg.completion_mode == "json_result" and any(
             r.get("contract") and r.get("state") in ("submitted", "fixup_sent") and k in by_key for k, r in journal.cases.items())
         if early:
-            async with progress("connecting to Edge (Playwright)"):
+            async with progress(lambda: f"connecting to Edge: {browser.phase}"):
                 await early
         elif (todo or resumable) and browser.context is None:
             await browser.start(launch=True)

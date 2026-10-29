@@ -36,8 +36,10 @@ by a safe alias (`other-xxxxxx`); two folders with the same ID are both blocked 
    count is known, **all needed tabs are prepared at once** – `min(warm_tabs, cases to send)`, default up to 8, in
    every scenario (Edge launched or joined): Copilot tabs already open are used first, blank new-tab pages are turned
    into Copilot tabs, then new tabs are opened. Tabs showing any other site, and Copilot tabs beyond the needed number,
-   are never touched. A slow connection is remembered (`state\handshake-seconds.txt`) so the next start skips the
-   handshake limits that were too short. `Run.cmd` prints `Starting...` before Python even loads. While the cursor
+   are never touched. The connection to Edge is a race: one patient attempt starts at once, more join every few
+   seconds on the other route, the first to connect wins and is printed (`WINNER: attempt n of m, websocket|http route`);
+   that route is remembered (`state\connect-route.txt`) and tried first next time. A slow attempt is never restarted.
+   `Run.cmd` prints `Starting...` before Python even loads. While the cursor
    question (and later the model question) is on screen **nothing else is printed**: lines made meanwhile appear right
    after your answer. To make tabs load sooner: a launched Edge gets every needed tab on its command line, a joined Edge
    gets the missing ones over its plain loopback HTTP endpoint (`PUT /json/new`) before Playwright is connected, the

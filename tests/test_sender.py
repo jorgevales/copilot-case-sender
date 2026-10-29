@@ -931,23 +931,36 @@ def test_redactor_covers_exceptions_paths_ids_and_urls(env):
 # ------------------------------------------------------------------ connection
 
 class FakePW:
+    """Scripted handshakes: 'ok' at once, 'fail' at once, 'slow' = connects after 0.3 s, 'hang' = never answers."""
+
     def __init__(self, script):
-        self.script, self.calls = list(script), []
+        self.script, self.calls, self.closed, self.cancelled = list(script), [], 0, 0
         self.chromium = self
 
     async def connect_over_cdp(self, route, timeout=0):
         self.calls.append((route.split(":")[0], timeout))
         step = self.script.pop(0) if self.script else "fail"
-        if step == "hang":
-            await asyncio.sleep(60)
+        try:
+            if step == "hang":
+                await asyncio.sleep(60)
+            if step == "slow":
+                await asyncio.sleep(0.3)
+        except asyncio.CancelledError:
+            self.cancelled += 1
+            raise
         if step == "fail":
             raise RuntimeError("handshake failed")
-        return types.SimpleNamespace(contexts=[object()], close=lambda: asyncio.sleep(0))
+        pw = self
+
+        async def close():
+            pw.closed += 1
+        return types.SimpleNamespace(contexts=[object()], close=close)
 
 
 def edge_for(env, script, monkeypatch, **cfg):
     for k, v in cfg.items():
         setattr(env.cfg, k, v)
+    monkeypatch.setattr(S, "RACE_GAPS", [0.1, 0.1, 0.1])
     b = S.EdgeBrowser(env.cfg, env.rt, env.policy, env.log, env.stop)
     b.pw = FakePW(script)
     payload = {"webSocketDebuggerUrl": f"ws://127.0.0.1:{env.cfg.cdp_port}/devtools/browser/abc"}
@@ -958,18 +971,25 @@ def edge_for(env, script, monkeypatch, **cfg):
     return b
 
 
-def test_responsive_endpoint_but_failed_handshake_falls_back_then_recovers(env, monkeypatch):
-    b = edge_for(env, ["fail", "ok"], monkeypatch, handshake_timeouts=[0.05, 0.1])
+def test_a_failed_handshake_makes_room_for_the_other_route_at_once(env, monkeypatch):
+    b = edge_for(env, ["fail", "ok"], monkeypatch)
     run(b.connect())
-    assert [c[0] for c in b.pw.calls] == ["ws", "http"] and b.context is not None      # ws first, then HTTP, sequentially
+    assert [c[0] for c in b.pw.calls] == ["ws", "http"] and b.context is not None      # ws first, then HTTP
 
 
-def test_handshake_hang_is_cancelled_and_budget_exhaustion_is_durable(env, monkeypatch):
-    b = edge_for(env, ["hang"] * 10, monkeypatch, handshake_timeouts=[0.05, 0.05], reconnect_budget_seconds=5)
+def test_a_slow_handshake_is_never_cancelled_to_start_over_the_race_waits_for_it(env, monkeypatch):
+    b = edge_for(env, ["slow", "hang", "hang"], monkeypatch)
+    run(b.connect())
+    assert b.context is not None and len(b.pw.calls) >= 2                              # others joined meanwhile...
+    assert b.pw.cancelled == len(b.pw.calls) - 1                                       # ...and were cancelled when it won
+
+
+def test_every_attempt_gets_the_whole_remaining_budget_and_exhaustion_is_durable(env, monkeypatch):
+    b = edge_for(env, ["hang"] * 10, monkeypatch, reconnect_budget_seconds=0.5)
     with pytest.raises(S.RecoveryRequired):
         run(b.connect())
-    assert len(b.pw.calls) == 4                                                       # every route tried once, none overlapping
-    b2 = edge_for(env, ["fail"] * 10, monkeypatch, handshake_timeouts=[0.05] * 50, reconnect_budget_seconds=0)
+    assert all(c[1] >= 1000 for c in b.pw.calls) and b.pw.cancelled == len(b.pw.calls)  # no short limits; nothing leaked
+    b2 = edge_for(env, ["fail"] * 10, monkeypatch, reconnect_budget_seconds=0)
     with pytest.raises(S.RecoveryRequired):
         run(b2.connect())
 

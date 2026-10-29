@@ -64,7 +64,7 @@ usually means updating `FakeTab` too. Full graph: `graphify-out/` in this folder
 
 - Git repo on `main`, in sync with `origin/main`, last commit `9e8e0f2` "V2: result contract, plain-text JSON answers, background collection, fix-ups". No remote pushes without the user's say-so.
 - Live-tested on a personal Microsoft 365 Copilot profile with synthetic files (about 7–15 s per case, V2 verdicts read back). Still **needs confirmation on the real VDI**: real `WNetGetUniversalNameW` on `S:`, embedded `._pth` + wheels, replace/lock on the share, unresponsive-renderer path, `.crdownload` location.
-- Carry-over from the old project (see memory `automatic-daily-review-project`): the Edge debug endpoint not answering in 60 s on the VDI, and the plan to later run on any environment, not only `S:`. Whether this rewrite fixes it is unconfirmed; the handshake ladder (3/6/12/20/30 s, WebSocket then HTTP, UNC-spelling retry) is the relevant code.
+- Carry-over from the old project (see memory `automatic-daily-review-project`): the Edge debug endpoint not answering in 60 s on the VDI, and the plan to later run on any environment, not only `S:`. Whether this rewrite fixes it is unconfirmed; `EdgeBrowser.connect` is now a racing handshake (no restarts; attempts join at `RACE_GAPS`, alternating WebSocket/HTTP, first to connect wins, winner route remembered in `state\connect-route.txt` and printed as `WINNER: ...`); the old 3/6/12/20/30 s ladder is gone (`handshake_timeouts` is no longer read).
 
 ## Working rules for this project
 
