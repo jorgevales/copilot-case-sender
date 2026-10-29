@@ -1220,6 +1220,8 @@ class FocusGuard:
     def __init__(self):
         self.until, self.pids, self.user, self.started, self.names = 0.0, set(), None, False, {}
         self.on = os.name == "nt"
+        self.failed = 0               # times Windows refused to give the keyboard back (then tabs are never selected)
+        self.elsewhere = False        # you are in another app right now (not Edge)
 
     def start(self) -> None:
         if self.on and not self.started:
@@ -1228,6 +1230,11 @@ class FocusGuard:
 
     def mark(self, seconds: float = 0.8) -> None:
         self.until = max(self.until, time.monotonic() + seconds)
+
+    def skip_front(self) -> bool:
+        """Quiet mode: handing focus back failed on this machine and you are in another app - so the tool does not
+        select tabs at all (Copilot works in unselected tabs too, a little slower) instead of taking your keyboard."""
+        return self.failed > 0 and self.elsewhere
 
     def add_pid(self, pid) -> None:
         if pid:
@@ -1260,6 +1267,8 @@ class FocusGuard:
             u32.BringWindowToTop(window)
         finally:
             u32.AttachThreadInput(t_me, t_cur, False)
+        if u32.GetForegroundWindow() != window:
+            self.failed += 1          # Windows (or the remote session) refused: switch to quiet mode
 
     def _watch(self) -> None:
         try:
@@ -1270,7 +1279,8 @@ class FocusGuard:
                 if h:
                     pid = wintypes.DWORD()
                     u32.GetWindowThreadProcessId(h, ctypes.byref(pid))
-                    if not self._is_edge(pid.value):
+                    self.elsewhere = not self._is_edge(pid.value)
+                    if self.elsewhere:
                         self.user = h                                    # your window (kept up to date)
                     elif time.monotonic() < self.until and self.user and u32.IsWindow(self.user):
                         self._give_back(u32, k32, self.user)
@@ -1283,7 +1293,10 @@ FOCUS = FocusGuard()
 
 
 async def front(page) -> None:
-    """Select this tab in its Edge window (it renders at full speed) without keeping the keyboard from your app."""
+    """Select this tab in its Edge window (it renders at full speed) without keeping the keyboard from your app.
+    In quiet mode (focus could not be handed back here) the tab is left unselected and works in the background."""
+    if FOCUS.skip_front():
+        return
     FOCUS.mark()
     await page.bring_to_front()
 
@@ -1610,7 +1623,7 @@ class EdgeBrowser:
             pick = parked[0] if parked else (ours[nxt] if ours else None)
             last = pick["id"] if pick is not None else last
             t0 = time.monotonic()
-            if pick is not None:
+            if pick is not None and not FOCUS.skip_front():
                 FOCUS.mark()                       # selecting a tab may raise the Edge window: focus is handed back
                 await asyncio.to_thread(cdp_text, port, f"/json/activate/{pick['id']}")
             left = VISIT_SECONDS - (time.monotonic() - t0)
@@ -1846,12 +1859,23 @@ class CopilotTab:
         """Bring this tab to the front and wait until the page reports itself visible.  A background tab is
         throttled by the browser: talking to it can time out and a send can silently not happen."""
         await self.cursor.switch(self.page, lambda: front(self.page))
+        if FOCUS.skip_front():               # quiet mode: the tab works unselected, told it has focus (Locally verified)
+            await self._emulate_focus()
+            return
         deadline = time.monotonic() + self.cfg.op_timeout
         while time.monotonic() < deadline:
             if await self._ev("() => document.visibilityState === 'visible'"):
                 return
             await asyncio.sleep(0.05)
         raise UiError("the tab could not be brought to the front")
+
+    async def _emulate_focus(self):
+        """Once per tab: the page behaves as focused (menus, typing) even though Edge is not the active window."""
+        if getattr(self.page, "_focus_emulated", False):
+            return
+        session = await self.page.context.new_cdp_session(self.page)
+        await session.send("Emulation.setFocusEmulationEnabled", {"enabled": True})
+        self.page._focus_emulated = True
 
     @guarded
     async def adopt(self):

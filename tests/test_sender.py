@@ -1923,3 +1923,19 @@ def test_every_tab_selection_and_new_tab_is_marked_for_the_focus_guard(monkeypat
     assert fronted == [1] and guard.until > t0                            # marked: a focus grab right now is handed back
     guard.mark(0.01)
     assert guard.until > t0                                                # a shorter mark never shortens a running one
+
+
+def test_quiet_mode_never_selects_a_tab_once_focus_could_not_be_handed_back(monkeypatch):
+    guard = S.FocusGuard()
+    monkeypatch.setattr(S, "FOCUS", guard)
+    fronted = []
+    page = types.SimpleNamespace(bring_to_front=lambda: asyncio.sleep(0, fronted.append(1)))
+    guard.elsewhere = True
+    run(S.front(page))
+    assert fronted == [1]                                   # normal: the tab is selected, focus is handed back after
+    guard.failed = 1                                        # Windows refused to hand focus back on this machine
+    run(S.front(page))
+    assert fronted == [1] and guard.skip_front()            # quiet mode: no tab selection while you work elsewhere
+    guard.elsewhere = False                                 # you are looking at Edge yourself: selecting is fine again
+    run(S.front(page))
+    assert fronted == [1, 1]
