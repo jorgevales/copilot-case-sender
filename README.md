@@ -39,6 +39,10 @@ by a safe alias (`other-xxxxxx`); two folders with the same ID are both blocked 
    are never touched. The connection to Edge is a race: one patient attempt starts at once, more join every few
    seconds on the other route, the first to connect wins and is printed (`WINNER: attempt n of m, websocket|http route`);
    that route is remembered (`state\connect-route.txt`) and tried first next time. A slow attempt is never restarted.
+   **Fast driver start:** Playwright's driver (node.exe + package, ~100 MB) is copied once to
+   `%LOCALAPPDATA%\CopilotCaseSender\playwright-driver` - the only thing ever written outside S: - and used only while
+   it matches the original on S: (checked every run, including a checksum). The first run (or after an update) starts
+   from S: and makes the copy in the background; later runs start the driver in seconds instead of ~2 minutes.
    `Run.cmd` prints `Starting...` before Python even loads. While the cursor
    question (and later the model question) is on screen **nothing else is printed**: lines made meanwhile appear right
    after your answer. To make tabs load sooner: a launched Edge gets every needed tab on its command line, a joined Edge

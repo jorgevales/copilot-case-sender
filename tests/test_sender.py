@@ -2004,3 +2004,26 @@ def test_a_slow_startup_step_says_what_it_is_still_doing_instead_of_looking_hung
     run(slow_step())
     lines = [l for l in capsys.readouterr().out.splitlines() if "still reading the Copilot model list" in l]
     assert 2 <= len(lines) <= 4
+
+
+def test_the_local_driver_copy_is_used_only_while_it_matches_the_original_on_s(env, monkeypatch):
+    if os.name != "nt":
+        pytest.skip("Windows only")
+    src = env.base / "deps-driver"
+    (src / "package" / "lib").mkdir(parents=True)
+    (src / "node.exe").write_bytes(b"node" * 1000)
+    (src / "package" / "cli.js").write_text("cli", "utf-8")
+    (src / "package" / "lib" / "a.js").write_text("a", "utf-8")
+    monkeypatch.setattr(S, "DRIVER_CACHE_ROOT", env.base / "local-driver")
+    notes = []
+    cache = S.DriverCache(lambda phase, alias="", **f: notes.append(f.get("note", "")))
+    cache.src, cache.root = src, env.base / "local-driver" / "1.64.1"
+    assert cache.ready() is False                                   # nothing copied yet: start from S:
+    cache.refresh()
+    assert cache.ready() is True and "copied" in notes[-1]          # verified copy: start from the local disk
+    (cache.root / "node.exe").write_bytes(b"evil" * 1000)            # same size, different content
+    assert cache.ready() is False                                    # checksum catches it
+    cache.refresh()
+    time.sleep(0.01)
+    (src / "package" / "lib" / "a.js").write_text("a2", "utf-8")    # driver on S: updated
+    assert cache.ready() is False                                    # outdated copy is never used

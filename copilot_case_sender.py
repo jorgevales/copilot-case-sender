@@ -593,6 +593,12 @@ def _write_guard_hook(event, args):
     for one in (path if isinstance(path, tuple) else (path,)):
         if isinstance(one, int) or str(one).lower() in ("nul", os.devnull):
             continue
+        try:                                   # the single permitted exception: the local Playwright driver copy
+            here = os.path.normcase(os.path.abspath(os.fsdecode(one)))
+            if any(here == e or here.startswith(e + os.sep) for e in WRITE_GUARD.get("extra", ())):
+                continue
+        except Exception:
+            pass
         try:
             inside = WRITE_GUARD["policy"].inside(os.path.abspath(os.fsdecode(one)))
         except Exception:
@@ -626,7 +632,8 @@ def bootstrap_storage(cfg, policy: PathPolicy) -> Runtime:
         raise StorageError("temporary-file redirection did not take effect")
     if str(rt.deps) not in sys.path:  # embedded Python ignores PYTHONPATH, so add it explicitly
         sys.path.insert(0, str(rt.deps))
-    WRITE_GUARD.update(roots=policy.approved, policy=policy)
+    WRITE_GUARD.update(roots=policy.approved, policy=policy,
+                       extra=[os.path.normcase(os.path.abspath(DRIVER_CACHE_ROOT))])   # local driver copy only
     return rt
 
 
@@ -1176,6 +1183,93 @@ def load_playwright():
     return async_playwright, PWError, PWTimeout
 
 
+# The Playwright driver is node.exe (~90 MB) + its JavaScript package (~13 MB).  Started from S: it is read over the
+# network on EVERY run (measured on the VDI: 135.6 s).  A verified copy on this computer's local disk starts in seconds.
+# This folder is the ONE place outside approved storage the tool writes to (user decision, 2026-10-29): only this
+# public driver copy - never case data, logs or state.
+DRIVER_CACHE_ROOT = Path(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")) / "CopilotCaseSender" / "playwright-driver"
+
+
+class DriverCache:
+    """Local copy of the Playwright driver, checked against the original on S: every run before it is used."""
+
+    def __init__(self, log):
+        import importlib.util
+        spec = importlib.util.find_spec("playwright")
+        self.src = Path(spec.origin).parent / "driver" if spec and spec.origin else None
+        self.root = DRIVER_CACHE_ROOT / (playwright_version() or "unknown")
+        self.log = log
+
+    def _files(self) -> dict:
+        """rel path -> [size, mtime_ns] for node.exe + every package file on S: (stat only, no reading)."""
+        out = {"node.exe": None}
+        for base, _dirs, names in os.walk(self.src / "package"):
+            for n in names:
+                out[os.path.relpath(os.path.join(base, n), self.src).replace("\\", "/")] = None
+        for rel in out:
+            st = os.stat(self.src / rel)
+            out[rel] = [st.st_size, st.st_mtime_ns]
+        return out
+
+    @staticmethod
+    def _sha(path: Path) -> str:
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def ready(self) -> bool:
+        """True only if the local copy matches the S: original (same files, sizes, dates) and node.exe is intact."""
+        try:
+            if os.name != "nt" or self.src is None:
+                return False
+            man = json.loads((self.root / "manifest.json").read_text("utf-8"))
+            if man.get("files") != self._files():
+                return False
+            for rel, (size, _m) in man["files"].items():
+                if os.path.getsize(self.root / rel) != size:
+                    return False
+            return self._sha(self.root / "node.exe") == man.get("node_sha256")
+        except (OSError, ValueError, KeyError, TypeError):
+            return False
+
+    def use(self) -> None:
+        """Point Playwright at the local copy (its own driver lookup is replaced for this process only)."""
+        import playwright._impl._transport as transport
+        node, cli = str(self.root / "node.exe"), str(self.root / "package" / "cli.js")
+        transport.compute_driver_executable = lambda: (node, cli)
+
+    def refresh(self) -> None:
+        """Copy the driver from S: to the local disk (background, after the driver has started), verify, publish.
+        A copy cut short (run ended) is left as a temporary folder and cleared next time."""
+        try:
+            before = self._files()
+            self.root.parent.mkdir(parents=True, exist_ok=True)
+            for old in self.root.parent.glob(".tmp-*"):
+                shutil.rmtree(old, ignore_errors=True)
+            tmp = self.root.parent / f".tmp-{uuid.uuid4().hex[:8]}"
+            for rel in before:
+                dest = tmp / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(self.src / rel, dest)
+            if self._files() != before:
+                raise OSError("driver on S: changed during the copy")
+            for rel, (size, _m) in before.items():
+                if os.path.getsize(tmp / rel) != size:
+                    raise OSError("copy size mismatch")
+            src_sha, tmp_sha = self._sha(self.src / "node.exe"), self._sha(tmp / "node.exe")
+            if src_sha != tmp_sha:
+                raise OSError("copy checksum mismatch")
+            (tmp / "manifest.json").write_text(json.dumps({"files": before, "node_sha256": tmp_sha}), "utf-8")
+            if self.root.exists():
+                shutil.rmtree(self.root, ignore_errors=True)
+            os.replace(tmp, self.root)
+            self.log("dependencies", note="Playwright driver copied to this computer's local disk: the next start will be fast")
+        except Exception as exc:                  # an optimisation only: the run is never affected
+            self.log("dependencies", note=f"local driver copy not made ({type(exc).__name__}); next run starts from S: again")
+
+
 # --------------------------------------------------------------------------------------------
 # 8. BROWSER: Edge + CDP, and the Copilot page adapter
 # --------------------------------------------------------------------------------------------
@@ -1675,8 +1769,16 @@ class EdgeBrowser:
             async def driver():
                 self.phase = "starting the Playwright driver"
                 self.api = await asyncio.to_thread(load_playwright)
+                cache = DriverCache(self.log)
+                local = not self.cfg.node_executable and await asyncio.to_thread(cache.ready)
+                if local:
+                    cache.use()
+                self.phase = "starting the Playwright driver" + (" (local copy)" if local else " (from S:, first time)")
                 self.pw = await self.api[0]().start()
-                self.log("connect", note=f"Playwright driver started in {time.monotonic() - t0:.1f}s")
+                self.log("connect", note=f"Playwright driver started in {time.monotonic() - t0:.1f}s "
+                                         + ("from the local copy" if local else "from S: (a local copy is being made for next time)"))
+                if not local and not self.cfg.node_executable:
+                    threading.Thread(target=cache.refresh, daemon=True).start()
                 self.phase = "handshake with Edge"
             boot = asyncio.ensure_future(driver())
             try:
