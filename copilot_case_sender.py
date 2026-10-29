@@ -1314,6 +1314,67 @@ def cdp_http(port: int, path: str, timeout: float = 1.5, method: str = "GET"):
         return None
 
 
+def cdp_page_eval(ws_url: str, port: int, expression: str, timeout: float = 3.0):
+    """Evaluate one expression in a page over its own DevTools WebSocket (stdlib only: a minimal RFC 6455 client).
+    Used before Playwright is connected, to know which tabs are ready.  Loopback + our port only.  None on any failure."""
+    import base64
+    import socket
+    import struct
+    u = urlparse(ws_url)
+    if u.scheme != "ws" or u.hostname not in ("127.0.0.1", "localhost") or u.port != port or not u.path.startswith("/devtools/page/"):
+        return None
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            key = base64.b64encode(os.urandom(16)).decode()
+            sock.sendall((f"GET {u.path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                          f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+            head = b""
+            while b"\r\n\r\n" not in head:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    return None
+                head += chunk
+            if b" 101 " not in head.split(b"\r\n", 1)[0]:
+                return None
+            buf = head.split(b"\r\n\r\n", 1)[1]
+            body = json.dumps({"id": 1, "method": "Runtime.evaluate",
+                               "params": {"expression": expression, "returnByValue": True}}).encode()
+            mask = os.urandom(4)
+            size = len(body)
+            frame = bytes([0x81]) + (bytes([0x80 | size]) if size < 126 else
+                                     bytes([0x80 | 126]) + struct.pack(">H", size) if size < 65536 else
+                                     bytes([0x80 | 127]) + struct.pack(">Q", size))
+            sock.sendall(frame + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(body)))
+
+            def take(n):
+                nonlocal buf
+                while len(buf) < n:
+                    chunk = sock.recv(65536)
+                    if not chunk:
+                        raise OSError("closed")
+                    buf += chunk
+                out, buf = buf[:n], buf[n:]
+                return out
+            message = b""
+            while True:
+                b0, b1 = take(2)
+                n = b1 & 0x7F
+                n = struct.unpack(">H", take(2))[0] if n == 126 else struct.unpack(">Q", take(8))[0] if n == 127 else n
+                payload = take(n)
+                if (b0 & 0x0F) in (0x1, 0x0):
+                    message += payload
+                    if b0 & 0x80:
+                        reply = json.loads(message)
+                        if reply.get("id") == 1:
+                            return reply.get("result", {}).get("result", {}).get("value")
+                        message = b""
+                elif (b0 & 0x0F) == 0x8:
+                    return None
+    except Exception:
+        return None
+
+
 def cdp_text(port: int, path: str, timeout: float = 1.5) -> str:
     """Like cdp_http for endpoints that answer plain text (e.g. /json/activate).  '' on any failure."""
     try:
@@ -1597,7 +1658,11 @@ class EdgeBrowser:
         """Tab tour BEFORE Playwright is connected (connecting waits on every busy, loading tab, which can take long).
         Over the plain HTTP endpoint each Copilot tab is brought forward in turn (GET /json/activate/<id>, at most
         VISIT_SECONDS each) from the moment it exists.  A tab on the sign-in page is kept in front and not left.
-        Stops when `tour_handoff` is set (the full TabTour takes over) or when cancelled.  Best effort, never raises."""
+        Each tab's readiness (composer + model button) is read over its own DevTools socket: ready tabs are no longer
+        visited, and the tour STOPS once every needed tab is ready - it never runs on just because Playwright is
+        still connecting.  Also stops when `tour_handoff` is set or when cancelled.  Best effort, never raises."""
+        ready_expr = "(" + READY_JS + ")()"
+        ready = set()
         port, last = self.cfg.cdp_port, None
         origin = "{0.scheme}://{0.netloc}".format(urlparse(self.cfg.copilot_url))
         while not starting.done() and not endpoint_valid(await cdp_version(port), port):
@@ -1610,6 +1675,15 @@ class EdgeBrowser:
                 order.setdefault(p["id"], len(order))
             ours = sorted((p for p in pages if str(p.get("url", "")).startswith(origin) or p["id"] in self.http_ids),
                           key=lambda p: order[p["id"]])[:max(1, count)]
+            for p in ours:                         # which tabs already show the composer + model button
+                if p["id"] not in ready and p.get("webSocketDebuggerUrl") and await asyncio.to_thread(
+                        cdp_page_eval, p["webSocketDebuggerUrl"], port, ready_expr, 2.0):
+                    ready.add(p["id"])
+            listed = {p["id"] for p in pages}
+            if ours and all(p["id"] in ready for p in ours) and (len(ours) >= count or all(i in listed for i in self.http_ids)):
+                self.log("session", note=f"all {len(ours)} Copilot tab(s) ready - tab tour finished")
+                return                             # every needed tab is ready: no more travelling
+            ours = [p for p in ours if p["id"] not in ready]
             now_ = time.monotonic()
             for p in pages:
                 if is_signin_url(str(p.get("url", "")), origin):

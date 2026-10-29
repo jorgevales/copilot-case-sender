@@ -1939,3 +1939,36 @@ def test_quiet_mode_never_selects_a_tab_once_focus_could_not_be_handed_back(monk
     guard.elsewhere = False                                 # you are looking at Edge yourself: selecting is fine again
     run(S.front(page))
     assert fronted == [1, 1]
+
+
+def test_the_http_tour_stops_by_itself_once_every_tab_is_ready_even_while_playwright_still_connects(env, monkeypatch):
+    monkeypatch.setattr(S, "VISIT_SECONDS", 0.01)
+    port = env.cfg.cdp_port
+    tabs = [{"type": "page", "id": i, "url": "https://m365.cloud.microsoft/chat",
+             "webSocketDebuggerUrl": f"ws://127.0.0.1:{port}/devtools/page/{i}"} for i in ("A", "B", "C")]
+    checks, visits = {"n": 0}, []
+
+    async def fake_version(p, timeout=1.5):
+        return {"webSocketDebuggerUrl": f"ws://127.0.0.1:{port}/devtools/browser/x"}
+
+    def fake_eval(ws, p, expr, timeout=3.0):                 # tabs become ready one after another
+        checks["n"] += 1
+        return checks["n"] > 4 or ws.endswith("/A")
+    monkeypatch.setattr(S, "cdp_version", fake_version)
+    monkeypatch.setattr(S, "cdp_http", lambda p, path, timeout=1.5, method="GET": list(tabs))
+    monkeypatch.setattr(S, "cdp_text", lambda p, path, timeout=1.5: visits.append(path[-1]) or "ok")
+    monkeypatch.setattr(S, "cdp_page_eval", fake_eval)
+    b = S.EdgeBrowser(env.cfg, env.rt, env.policy, env.log, env.stop)
+
+    async def go():
+        starting = asyncio.get_running_loop().create_future()   # Playwright never finishes connecting in this test
+        await asyncio.wait_for(b.http_tour(3, starting), 5)     # ...yet the tour ends by itself
+        return starting.done()
+    assert run(go()) is False
+    assert "A" not in visits and visits                          # a ready tab is never visited; loading ones were
+
+
+def test_page_eval_refuses_anything_but_our_loopback_page_socket():
+    assert S.cdp_page_eval("ws://10.0.0.5:9333/devtools/page/X", 9333, "1") is None
+    assert S.cdp_page_eval("ws://127.0.0.1:9334/devtools/page/X", 9333, "1") is None
+    assert S.cdp_page_eval("ws://127.0.0.1:9333/devtools/browser/X", 9333, "1") is None
