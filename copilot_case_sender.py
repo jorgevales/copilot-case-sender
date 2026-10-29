@@ -1298,7 +1298,39 @@ async def front(page) -> None:
     if FOCUS.skip_front():
         return
     FOCUS.mark()
-    await page.bring_to_front()
+    try:                                   # never waits on a busy Edge: a slow selection just moves on
+        await asyncio.wait_for(page.bring_to_front(), FRONT_SECONDS)
+    except asyncio.TimeoutError:
+        pass
+
+
+FRONT_SECONDS = 5
+
+
+class progress:
+    """`async with progress("reading the model list"):` prints "... still <what> (Ns)" every PROGRESS_SECONDS while the
+    step runs, so a slow step on the VDI is visible (and named) instead of looking like a hang."""
+
+    def __init__(self, what: str):
+        self.what, self.task = what, None
+
+    async def _tick(self):
+        t0 = time.monotonic()
+        while True:
+            await asyncio.sleep(PROGRESS_SECONDS)
+            say(f"[{datetime.datetime.now():%H:%M:%S}] {'-':<12} {'waiting':<18} still {self.what} ({time.monotonic() - t0:.0f}s)")
+
+    async def __aenter__(self):
+        self.task = asyncio.ensure_future(self._tick())
+        return self
+
+    async def __aexit__(self, *exc):
+        self.task.cancel()
+        await asyncio.gather(self.task, return_exceptions=True)
+        return False
+
+
+PROGRESS_SECONDS = 15
 
 
 LOOPBACK = urllib.request.build_opener(urllib.request.ProxyHandler({}))   # 127.0.0.1 never goes through a system/corporate proxy
@@ -3921,7 +3953,8 @@ async def run_async(ctx, journal, ledger, listed, message) -> int:
         resumable = cfg.completion_mode == "json_result" and any(
             r.get("contract") and r.get("state") in ("submitted", "fixup_sent") and k in by_key for k, r in journal.cases.items())
         if early:
-            await early
+            async with progress("connecting to Edge (Playwright)"):
+                await early
         elif (todo or resumable) and browser.context is None:
             await browser.start(launch=True)
         if topup:
@@ -4169,14 +4202,16 @@ async def prepare_session(runner, browser, cfg, log, todo, asking=None):
     touring = asyncio.ensure_future(tour.run())
     gate = None
     try:
-        first = await wait_for_login(browser, stdin, log)
+        async with progress("checking that Copilot is signed in (a tab showing the model button)"):
+            first = await wait_for_login(browser, stdin, log)
         tour.finished(first)
         log("login", note="Copilot is signed in")
         gate = asyncio.ensure_future(ready_tabs(browser, cfg, [t for t in tabs if t.page is not first.page][:count - 1], log, tour))
         await tour.pause()                         # the model menu is read in the FRONT tab: the tour waits meanwhile
         await CopilotTab.cursor.switch(first.page, lambda: front(first.page))
         try:
-            first, entries = await discover_models_anywhere(browser, first, runner.redact, log)
+            async with progress("reading the Copilot model list"):
+                first, entries = await discover_models_anywhere(browser, first, runner.redact, log)
         finally:
             tour.finished(first)
             tour.go.set()
@@ -4190,7 +4225,8 @@ async def prepare_session(runner, browser, cfg, log, todo, asking=None):
         finally:
             if held:
                 log.release()
-        others = [t for t in await gate if t.page is not first.page]
+        async with progress("waiting for every Copilot tab to be ready"):
+            others = [t for t in await gate if t.page is not first.page]
     finally:
         for task in (touring, gate, cursor_on):
             if task and not task.done():

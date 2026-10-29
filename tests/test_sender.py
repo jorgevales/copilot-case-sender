@@ -1972,3 +1972,15 @@ def test_page_eval_refuses_anything_but_our_loopback_page_socket():
     assert S.cdp_page_eval("ws://10.0.0.5:9333/devtools/page/X", 9333, "1") is None
     assert S.cdp_page_eval("ws://127.0.0.1:9334/devtools/page/X", 9333, "1") is None
     assert S.cdp_page_eval("ws://127.0.0.1:9333/devtools/browser/X", 9333, "1") is None
+
+
+def test_a_slow_startup_step_says_what_it_is_still_doing_instead_of_looking_hung(monkeypatch, capsys):
+    monkeypatch.setattr(S, "PROGRESS_SECONDS", 0.05)
+
+    async def slow_step():
+        async with S.progress("reading the Copilot model list"):
+            await asyncio.sleep(0.18)
+        await asyncio.sleep(0.12)                                   # after the step: no more progress lines
+    run(slow_step())
+    lines = [l for l in capsys.readouterr().out.splitlines() if "still reading the Copilot model list" in l]
+    assert 2 <= len(lines) <= 4
