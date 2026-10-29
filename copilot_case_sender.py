@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import collections
+import concurrent.futures
 import csv
 import ctypes
 import datetime
@@ -920,11 +921,15 @@ def discover(cfg, policy: PathPolicy, salt: str, red: Redactor):
         red.add(case.id, case.alias)
         red.ids[case.alias] = case.id
         red.add(case.ref, case.alias + "-ref")
+        cases.append(case)
+    def check_one(case):                  # link/junction lookups are network round trips on S:: do them side by side
         try:
-            policy.check(entry.path, "case folder")
+            policy.check(case.path, "case folder")
         except PathError as exc:
             case.blocked = str(exc)
-        cases.append(case)
+    if cases:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(cases))) as pool:
+            list(pool.map(check_one, cases))
     by_id = collections.defaultdict(list)
     for c in cases:
         by_id[c.id].append(c)
@@ -1096,6 +1101,8 @@ def ensure_dependencies(cfg, rt: Runtime, log) -> None:
     """Install the pinned Playwright into the private dependency folder when missing.
     Uses the configured interpreter; every cache/target/temp stays under RUNTIME_ROOT."""
     want = REQUIREMENTS[0].split("==")[1]
+    if (rt.deps / f"playwright-{want}.dist-info").is_dir():       # fast path: one lookup instead of scanning every sys.path folder
+        return
     if playwright_version() == want:
         return
     log("dependencies", note="first launch: installing pinned packages into the private dependency folder")
@@ -1288,7 +1295,7 @@ class EdgeBrowser:
             self.launched = True
             deadline = time.monotonic() + self.cfg.endpoint_wait_seconds
             while time.monotonic() < deadline:
-                await self.stop.sleep(0.4)
+                await self.stop.sleep(0.2)
                 payload = await cdp_version(port)
                 if payload and endpoint_valid(payload, port) and port_owned_by_profile(self.rt.profile, payload):
                     write_atomic(self.rt.state / "edge-variant.txt", variant)
@@ -1396,13 +1403,10 @@ class EdgeBrowser:
         """Every Copilot page of this browser that already shows the chat composer + model button (tabs sign in
         and load at different speeds, so this can grow from one poll to the next)."""
         origin = "{0.scheme}://{0.netloc}".format(urlparse(self.cfg.copilot_url))
-        seen, ready = False, []
-        for page in list(self.context.pages):
-            if page.url.startswith(origin):
-                seen = True
-                tab = CopilotTab(page, self.cfg, self.stop)
-                if await tab.is_ready():
-                    ready.append(tab)
+        tabs = [CopilotTab(page, self.cfg, self.stop) for page in list(self.context.pages) if page.url.startswith(origin)]
+        seen = bool(tabs)
+        flags = await asyncio.gather(*(t.is_ready() for t in tabs))      # all tabs checked at once, order kept
+        ready = [t for t, ok in zip(tabs, flags) if ok]
         if not seen:  # nothing on Copilot yet (e.g. all tabs closed): open one so sign-in can be seen
             page = await self.context.new_page()
             await page.goto(self.cfg.copilot_url, wait_until="domcontentloaded", timeout=60000)
@@ -3433,9 +3437,13 @@ async def run_async(ctx, journal, ledger, listed, cases, todo, instr, message) -
             await reconcile_open_intents(runner, journal, by_key, log)
         resumable = cfg.completion_mode == "json_result" and any(
             r.get("contract") and r.get("state") in ("submitted", "fixup_sent") and k in by_key for k, r in journal.cases.items())
+        asking = ask_cursor(cfg) if todo else None     # the question is answered in a thread while Edge starts/connects below
         if (todo or resumable) and browser.context is None:
             await browser.start(launch=True)
         todo = [c for c in todo if runner.sent_ids.get(c.id) is None]
+        if asking:
+            CopilotTab.cursor = VisualCursor(cfg.visual_cursor_options, await asking)
+            log("session", note="moving cursor " + ("on" if CopilotTab.cursor.enabled else "off"))
         if todo:
             await prepare_session(runner, browser, cfg, log, todo)
         if resumable:
@@ -3510,17 +3518,15 @@ async def existing_tabs(browser, first, wanted, log) -> list:
     """Up to `wanted` more signed-in Copilot tabs that were already open in a joined Edge (no tab is opened)."""
     if wanted < 1 or not browser.reused:
         return []
-    tabs = []
-    for tab in await browser.find_ready_tabs():
-        if len(tabs) >= wanted:
-            break
-        if tab.page is first.page:
-            continue
+    chosen = [t for t in await browser.find_ready_tabs() if t.page is not first.page][:wanted]
+
+    async def take(tab):
         try:
             await tab.adopt()           # same tab, fresh chat if it was not already one
+            return tab
         except SenderError:
-            continue
-        tabs.append(tab)
+            return None
+    tabs = [t for t in await asyncio.gather(*(take(t) for t in chosen)) if t]      # in parallel, order kept
     log("session", note=f"using {len(tabs) + 1} Copilot tab(s) that were already open")
     return tabs
 
@@ -3533,10 +3539,12 @@ async def prepare_session(runner, browser, cfg, log, todo):
     first, entries = await discover_models_anywhere(browser, first, runner.redact, log)
     count = max(1, min(int(cfg.warm_tabs), len(todo)))
     # Joined an already-open Edge: its prepared tabs are the pool, nothing is opened.  Otherwise warm tabs while you choose.
-    warm = asyncio.ensure_future(browser.open_tabs(count - 1)) if count > 1 and not browser.reused else None
+    # Either way the other tabs are prepared while you choose the model (choosing never blocks the preparation).
+    warm = asyncio.ensure_future(browser.open_tabs(count - 1) if not browser.reused else existing_tabs(browser, first, count - 1, log)) \
+        if count > 1 else None
     try:
         runner.model = await choose_model(entries, pick_default(entries), cfg, stdin, log)
-        tabs = [first] + (await warm if warm else await existing_tabs(browser, first, count - 1, log))
+        tabs = [first] + (await warm if warm else [])
     except BaseException:
         if warm:
             warm.cancel()
@@ -3587,12 +3595,34 @@ def choose_visual_cursor(cfg) -> bool:
         print("  Please press Enter for Yes, or type N for No.")
 
 
+def ask_cursor(cfg) -> "asyncio.Future":
+    """Ask the moving-cursor question in a daemon thread so Edge can start and connect meanwhile (Ctrl+C never waits for it)."""
+    loop, fut = asyncio.get_running_loop(), asyncio.get_running_loop().create_future()
+
+    def work():
+        try:
+            result = choose_visual_cursor(cfg)
+        except BaseException as exc:                       # noqa: BLE001 - handed to the awaiting side
+            loop.call_soon_threadsafe(lambda: fut.done() or fut.set_exception(exc))
+            return
+        loop.call_soon_threadsafe(lambda: fut.done() or fut.set_result(result))
+    threading.Thread(target=work, daemon=True).start()
+    return fut
+
+
 def run_command(args) -> int:
+    print("Starting...", flush=True)
     cfg = load_config()
     if getattr(args, "detail", None):
         cfg.console_detail = args.detail
     ctx = context(cfg)
     ensure_dependencies(cfg, ctx.rt, ctx.log)           # first launch only; never inside the case loop
+    def preload():
+        try:
+            load_playwright()
+        except Exception:
+            pass                                          # the real import reports any problem
+    threading.Thread(target=preload, daemon=True).start()     # import cost overlaps the scans below
     message = load_message(Path(cfg.base_message_path))
     journal = Journal(ctx.rt, cfg.persist_retries)
     try:
@@ -3608,9 +3638,6 @@ def run_command(args) -> int:
                 journal.record(c.key, "preflight_blocked", alias=c.alias, instruction_id=c.id, reason=c.blocked)
         ctx.log("queue", note=f"{len(todo)} instruction(s) queued; {len(done)} already sent, {excluded} excluded, "
                               f"{len(other)} unrecognised, {sum(1 for c in cases if c.blocked)} blocked")
-        if todo:
-            CopilotTab.cursor = VisualCursor(cfg.visual_cursor_options, choose_visual_cursor(cfg))
-            ctx.log("session", note="moving cursor " + ("on" if CopilotTab.cursor.enabled else "off"))
         return asyncio.run(run_async(ctx, journal, ledger, listed, cases, todo, instr, message))
     except BaseException as exc:
         if not getattr(ctx, "reported", None):       # failed before/outside the run loop: still leave a report
