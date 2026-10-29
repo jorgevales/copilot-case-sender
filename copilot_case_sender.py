@@ -1206,6 +1206,88 @@ def guarded(fn):
     return wrapper
 
 
+class FocusGuard:
+    """Keeps Edge from taking the keyboard away from the app you are working in (the terminal, Excel ...).
+
+    Selecting a tab (bring_to_front, /json/activate) or starting Edge can make Windows bring the Edge window to the
+    foreground.  Every such call of ours first calls `mark()`; a watcher thread remembers your last non-Edge window
+    and, if Edge takes the foreground inside a marked moment, hands it straight back (AttachThreadInput +
+    SetForegroundWindow, ~25 ms).  If you click Edge yourself (no mark), nothing is undone.  Windows only; a no-op
+    elsewhere and if anything fails."""
+
+    POLL = 0.025
+
+    def __init__(self):
+        self.until, self.pids, self.user, self.started, self.names = 0.0, set(), None, False, {}
+        self.on = os.name == "nt"
+
+    def start(self) -> None:
+        if self.on and not self.started:
+            self.started = True
+            threading.Thread(target=self._watch, daemon=True).start()
+
+    def mark(self, seconds: float = 0.8) -> None:
+        self.until = max(self.until, time.monotonic() + seconds)
+
+    def add_pid(self, pid) -> None:
+        if pid:
+            self.pids.add(int(pid))
+
+    def _is_edge(self, pid: int) -> bool:
+        if self.pids:
+            return pid in self.pids
+        if pid not in self.names:              # before our Edge's process id is known: any msedge.exe window
+            name = ""
+            try:
+                k32 = ctypes.windll.kernel32
+                h = k32.OpenProcess(0x1000, False, pid)          # PROCESS_QUERY_LIMITED_INFORMATION
+                if h:
+                    buf, size = ctypes.create_unicode_buffer(520), ctypes.c_ulong(520)
+                    if k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                        name = os.path.basename(buf.value).lower()
+                    k32.CloseHandle(h)
+            except Exception:
+                pass
+            self.names[pid] = name == "msedge.exe"
+        return self.names[pid]
+
+    def _give_back(self, u32, k32, window) -> None:
+        cur = u32.GetForegroundWindow()
+        t_cur, t_me = u32.GetWindowThreadProcessId(cur, None), k32.GetCurrentThreadId()
+        u32.AttachThreadInput(t_me, t_cur, True)
+        try:
+            u32.SetForegroundWindow(window)
+            u32.BringWindowToTop(window)
+        finally:
+            u32.AttachThreadInput(t_me, t_cur, False)
+
+    def _watch(self) -> None:
+        try:
+            from ctypes import wintypes
+            u32, k32 = ctypes.windll.user32, ctypes.windll.kernel32
+            while True:
+                h = u32.GetForegroundWindow()
+                if h:
+                    pid = wintypes.DWORD()
+                    u32.GetWindowThreadProcessId(h, ctypes.byref(pid))
+                    if not self._is_edge(pid.value):
+                        self.user = h                                    # your window (kept up to date)
+                    elif time.monotonic() < self.until and self.user and u32.IsWindow(self.user):
+                        self._give_back(u32, k32, self.user)
+                time.sleep(self.POLL)
+        except Exception:
+            pass                                                         # the guard never affects the run
+
+
+FOCUS = FocusGuard()
+
+
+async def front(page) -> None:
+    """Select this tab in its Edge window (it renders at full speed) without keeping the keyboard from your app."""
+    FOCUS.mark()
+    await page.bring_to_front()
+
+
 LOOPBACK = urllib.request.build_opener(urllib.request.ProxyHandler({}))   # 127.0.0.1 never goes through a system/corporate proxy
 
 
@@ -1327,9 +1409,17 @@ class EdgeBrowser:
                  "--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding",
                  *[self.cfg.copilot_url] * (max(1, int(self.want_tabs)) if self.generation == 0 else 1)]   # first start: every needed tab loads with Edge
         err = open(self.rt.logs / "edge-stderr.log", "ab")
-        return subprocess.Popen(flags, env=dict(os.environ), cwd=str(self.rt.work), stdin=subprocess.DEVNULL,
-                                stdout=err, stderr=err,
+        quiet_start = None
+        if os.name == "nt":                # shown without taking the keyboard from your app (SW_SHOWNOACTIVATE)
+            quiet_start = subprocess.STARTUPINFO()
+            quiet_start.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            quiet_start.wShowWindow = 4
+        FOCUS.mark(20)                     # Edge's first window may still grab the foreground: it is handed back
+        proc = subprocess.Popen(flags, env=dict(os.environ), cwd=str(self.rt.work), stdin=subprocess.DEVNULL,
+                                stdout=err, stderr=err, startupinfo=quiet_start,
                                 creationflags=getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+        FOCUS.add_pid(proc.pid)
+        return proc
 
     async def ensure_running(self, launch: bool = True):
         port = self.cfg.cdp_port
@@ -1405,6 +1495,7 @@ class EdgeBrowser:
                     await self._drop()
                     continue
                 self.generation += 1
+                await self._learn_pid()
                 took = time.monotonic() - t0
                 self.log("connect", note=f"connected to Edge in {took:.1f}s (handshake limit {timeout}s)")
                 if took > 1:        # a quick connect needs no memo; a slow one teaches the next start where to begin
@@ -1415,6 +1506,22 @@ class EdgeBrowser:
                 return
             self.log("connect", note=f"retrying: {last}")
         raise RecoveryRequired(f"could not connect within the reconnect budget (last: {last})")
+
+    async def _learn_pid(self):
+        """The Edge browser process id, so the focus guard recognises exactly our Edge windows (best effort)."""
+        try:
+            session = await self.browser.new_browser_cdp_session()
+            info = await asyncio.wait_for(session.send("SystemInfo.getProcessInfo"), 5)
+            for p in info.get("processInfo", []):
+                if p.get("type") == "browser":
+                    FOCUS.add_pid(p.get("id"))
+            await session.detach()
+        except Exception:
+            pass
+
+    async def _new_page(self):
+        FOCUS.mark(2)                      # a new tab is selected in the Edge window: focus is handed back
+        return await self.context.new_page()
 
     async def _drop(self):
         if self.browser:
@@ -1465,6 +1572,7 @@ class EdgeBrowser:
         missing = max(0, count - min(count, copilot) - min(max(0, count - copilot), blank))
         target = quote(self.cfg.copilot_url, safe="")
         for _ in range(missing):
+            FOCUS.mark(2)
             made = await asyncio.to_thread(cdp_http, port, f"/json/new?{target}", 5, "PUT")
             if isinstance(made, dict) and made.get("id"):
                 self.http_ids.append(made["id"])      # toured even while their address is still blank or a redirect
@@ -1503,6 +1611,7 @@ class EdgeBrowser:
             last = pick["id"] if pick is not None else last
             t0 = time.monotonic()
             if pick is not None:
+                FOCUS.mark()                       # selecting a tab may raise the Edge window: focus is handed back
                 await asyncio.to_thread(cdp_text, port, f"/json/activate/{pick['id']}")
             left = VISIT_SECONDS - (time.monotonic() - t0)
             try:
@@ -1527,7 +1636,7 @@ class EdgeBrowser:
 
     # -- tabs ---------------------------------------------------------------------------------
     async def open_tab(self):
-        page = await self.context.new_page()
+        page = await self._new_page()
         tab = CopilotTab(page, self.cfg, self.stop)
         await tab.start()
         return tab
@@ -1535,7 +1644,7 @@ class EdgeBrowser:
     async def open_tabs(self, count: int) -> list:
         """Warm-up: open `count` Copilot tabs at once, then walk through them one by one like a person
         (forward, pointer over the composer) so Copilot fully wakes each of them."""
-        tabs = [CopilotTab(await self.context.new_page(), self.cfg, self.stop) for _ in range(count)]
+        tabs = [CopilotTab(await self._new_page(), self.cfg, self.stop) for _ in range(count)]
         await asyncio.gather(*(t.navigate() for t in tabs))
         for t in tabs:
             await t.activate()
@@ -1549,7 +1658,7 @@ class EdgeBrowser:
         pages = list(self.context.pages)
         copilot = [p for p in pages if p.url.startswith(origin)][:count]
         blank = [p for p in pages if p.url in ("", "about:blank") or p.url.startswith(BLANK_PAGES)][:count - len(copilot)]
-        new = [await self.context.new_page() for _ in range(count - len(copilot) - len(blank))]
+        new = [await self._new_page() for _ in range(count - len(copilot) - len(blank))]
         tabs = [CopilotTab(p, self.cfg, self.stop) for p in copilot + blank + new]
         self.loading = [asyncio.ensure_future(quiet(t.navigate())) for t in tabs[len(copilot):]]
         self.tabs_prepared = True
@@ -1559,7 +1668,7 @@ class EdgeBrowser:
 
     async def open_url_tab(self, url: str):
         """Read-only tab on a saved conversation (collecting an answer after a restart)."""
-        page = await self.context.new_page()
+        page = await self._new_page()
         tab = CopilotTab(page, self.cfg, self.stop)
         tab.target_id = await asyncio.wait_for(page_target_id(page), self.cfg.op_timeout)
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
@@ -1574,7 +1683,7 @@ class EdgeBrowser:
         flags = await asyncio.gather(*(t.is_ready() for t in tabs))      # all tabs checked at once, order kept
         ready = [t for t, ok in zip(tabs, flags) if ok]
         if not seen and not self.tabs_prepared:  # nothing on Copilot yet (e.g. all tabs closed): open one so sign-in can be seen
-            page = await self.context.new_page()
+            page = await self._new_page()
             await page.goto(self.cfg.copilot_url, wait_until="domcontentloaded", timeout=60000)
         return ready
 
@@ -1736,7 +1845,7 @@ class CopilotTab:
     async def foreground(self):
         """Bring this tab to the front and wait until the page reports itself visible.  A background tab is
         throttled by the browser: talking to it can time out and a send can silently not happen."""
-        await self.cursor.switch(self.page, self.page.bring_to_front)
+        await self.cursor.switch(self.page, lambda: front(self.page))
         deadline = time.monotonic() + self.cfg.op_timeout
         while time.monotonic() < deadline:
             if await self._ev("() => document.visibilityState === 'visible'"):
@@ -1768,7 +1877,7 @@ class CopilotTab:
     async def visit(self):
         """Be present in this tab like a person: bring it forward and move the pointer over the page (a loading Copilot
         tab in front gets ready much sooner than one in the background).  Read-only: nothing is clicked."""
-        await self.cursor.switch(self.page, self.page.bring_to_front)
+        await self.cursor.switch(self.page, lambda: front(self.page))
         size = await asyncio.wait_for(self.page.evaluate("() => [innerWidth, innerHeight]"), 2)
         x, y = size[0] / 2, size[1] * 0.6
         await self.cursor.follow(self.page, x, y)
@@ -1777,7 +1886,7 @@ class CopilotTab:
     @guarded
     async def activate(self):
         """Do what a person would: bring the tab forward, move the pointer over the composer and let Copilot wake up."""
-        await self.cursor.switch(self.page, self.page.bring_to_front)
+        await self.cursor.switch(self.page, lambda: front(self.page))
         await self.wait_composer()
         box = await (await self._editor()).bounding_box()
         if box:
@@ -3692,6 +3801,7 @@ async def run_async(ctx, journal, ledger, listed, message) -> int:
     intents = any(r.get("state") == "send_intent" for r in journal.cases.values())
     # Everything that does not depend on the queue starts at once: the cursor question, Edge (launch or join) + connection.
     CONSOLE["log"] = log
+    FOCUS.start()                                   # from now on Edge never keeps the keyboard from your app
     asking = ask_cursor(cfg, log)
     early = None if intents else asyncio.ensure_future(browser.start(launch=True))   # reconcile must look before any launch
     topup = pretour = None
@@ -3914,14 +4024,46 @@ async def quiet(coro):
         pass
 
 
+async def apply_cursor(cfg, asking) -> None:
+    """Switch the moving cursor on/off as soon as the launch question is answered (Edge work does not wait for it)."""
+    try:
+        enabled = await asking
+    except Exception:
+        return                                     # question failed: the cursor simply stays off
+    CopilotTab.cursor = VisualCursor(cfg.visual_cursor_options, enabled)
+
+
+class DeferredStdin:
+    """The terminal reader for the run, started only once the cursor question has its answer (one reader of the
+    keyboard at a time).  Until then `line()` just waits, so an Enter typed for that question never counts twice."""
+
+    def __init__(self, asking=None):
+        self.asking, self.real = asking, None
+
+    async def line(self):
+        if self.asking is not None:
+            try:
+                await asyncio.shield(self.asking)
+            except Exception:
+                pass
+        if self.real is None:
+            self.real = StdinLines()
+        return await self.real.line()
+
+    def drain(self):
+        if self.real is not None:
+            self.real.drain()
+
+
 async def prepare_session(runner, browser, cfg, log, todo, asking=None):
     """All needed tabs open at once -> sign-in -> model list (asked as soon as ONE tab shows it) while every other tab
     gets ready -> nothing is sent until all tabs are ready.  The model is set in each tab as part of its own send."""
     count = max(1, min(int(cfg.warm_tabs), len(todo)))
     tabs = await browser.prepare_tabs(count)       # existing Copilot tabs + blank tabs + new ones, all loading together
-    if asking:                                     # answered at launch (its console line is printed with the answer)
-        CopilotTab.cursor = VisualCursor(cfg.visual_cursor_options, await asking)
-    stdin = StdinLines()
+    # Edge work never waits for the cursor question: sign-in, tour and readiness run now; the cursor turns on/off the
+    # moment you answer, and only the terminal (Enter fallback, model question) waits for that answer.
+    cursor_on = asyncio.ensure_future(apply_cursor(cfg, asking)) if asking else None
+    stdin = DeferredStdin(asking)
     tour = TabTour(browser, cfg, tabs)             # visits every still-loading tab (<= 1 s each) until all are ready
     handoff = getattr(browser, "tour_handoff", None)
     if handoff is not None:
@@ -3934,12 +4076,14 @@ async def prepare_session(runner, browser, cfg, log, todo, asking=None):
         log("login", note="Copilot is signed in")
         gate = asyncio.ensure_future(ready_tabs(browser, cfg, [t for t in tabs if t.page is not first.page][:count - 1], log, tour))
         await tour.pause()                         # the model menu is read in the FRONT tab: the tour waits meanwhile
-        await CopilotTab.cursor.switch(first.page, first.page.bring_to_front)
+        await CopilotTab.cursor.switch(first.page, lambda: front(first.page))
         try:
             first, entries = await discover_models_anywhere(browser, first, runner.redact, log)
         finally:
             tour.finished(first)
             tour.go.set()
+        if cursor_on:                              # the terminal is still showing the cursor question: answer it first
+            await cursor_on
         held = getattr(log, "hold", None)          # the model question stays the last thing on screen until you answer
         if held:
             held()
@@ -3950,13 +4094,13 @@ async def prepare_session(runner, browser, cfg, log, todo, asking=None):
                 log.release()
         others = [t for t in await gate if t.page is not first.page]
     finally:
-        for task in (touring, gate):
+        for task in (touring, gate, cursor_on):
             if task and not task.done():
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
     tabs = [first] + others[:count - 1]
     runner.pool.extend((t, browser.generation) for t in tabs)
-    await CopilotTab.cursor.switch(first.page, first.page.bring_to_front)
+    await CopilotTab.cursor.switch(first.page, lambda: front(first.page))
     log("session", note=f"{len(tabs)} tab(s) ready" + (f", model: {runner.model['label']}" if runner.model else ""))
 
 

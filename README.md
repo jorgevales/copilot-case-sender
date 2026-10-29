@@ -47,6 +47,11 @@ by a safe alias (`other-xxxxxx`); two folders with the same ID are both blocked 
    forward, pointer over the page, at most 1 s per tab) because a Copilot tab in front gets ready much sooner; it
    pauses while the model list is read and never leaves a tab showing the sign-in page. It stops by itself once all
    tabs are ready.
+   **Edge stays out of your way:** you can keep working (typing in the terminal or any other app) while the run works
+   in Edge. Every Copilot tab stays in ONE Edge window; whenever the tool selects a tab (or Edge starts), a small focus
+   guard gives the keyboard straight back to the app you were in (about 25 ms). Clicking Edge yourself is never undone.
+   Sign-in, the tab tour and readiness do not wait for the moving-cursor answer; the tour stops as soon as every tab
+   shows the model button. Only the model question waits until you have answered the cursor question.
 1. **Sign-in detection.** Edge opens; the tool keeps checking (every 0.25 s, no overall limit) until a Copilot tab shows
    both the chat composer and the model button, then continues **by itself**. If you are already signed in nothing is
    asked. After 1 s of waiting it tells you to sign in in the Edge window; pressing **Enter** in the terminal is only a

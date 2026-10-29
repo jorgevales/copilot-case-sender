@@ -1879,3 +1879,47 @@ def test_the_http_tour_visits_every_tab_in_a_fixed_order_even_though_edge_lists_
         await asyncio.wait_for(b.http_tour(4, starting), 5)
     run(go())
     assert set(visits[:4]) == {"A", "B", "C", "D"} and visits[4:8] == visits[:4]        # every tab, same fixed round
+
+
+def test_edge_work_never_waits_for_the_cursor_question_only_the_model_question_does(env, monkeypatch):
+    for n in range(1, 4):
+        env.make_case(n)
+    cases, _, _ = env.cases()
+    r = env.runner()
+    monkeypatch.setattr(S.CopilotTab, "cursor", S.VisualCursor())
+    cfg = types.SimpleNamespace(**{**vars(env.cfg), "warm_tabs": 8, "requested_model": "GPT-6.1 Sol"})
+    order = []
+
+    async def go():
+        asking = asyncio.get_running_loop().create_future()            # the user has NOT answered yet
+        real_gate = S.ready_tabs
+
+        async def gate(*a, **k):
+            out = await real_gate(*a, **k)
+            order.append(("all tabs ready", asking.done()))
+            return out
+        monkeypatch.setattr(S, "ready_tabs", gate)
+        session = asyncio.ensure_future(S.prepare_session(r, r.browser, cfg, env.log, cases, asking))
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if order:
+                break
+        order.append(("session waiting for the answer", not session.done()))
+        asking.set_result(True)
+        await asyncio.wait_for(session, 5)
+        return S.CopilotTab.cursor
+    cursor = run(go())
+    assert order == [("all tabs ready", False), ("session waiting for the answer", True)]
+    assert cursor.enabled and len(r.pool) == 3 and r.model["label"] == "GPT-6.1 Sol"
+
+
+def test_every_tab_selection_and_new_tab_is_marked_for_the_focus_guard(monkeypatch):
+    guard = S.FocusGuard()
+    monkeypatch.setattr(S, "FOCUS", guard)
+    fronted = []
+    page = types.SimpleNamespace(bring_to_front=lambda: asyncio.sleep(0, fronted.append(1)))
+    t0 = time.monotonic()
+    run(S.front(page))
+    assert fronted == [1] and guard.until > t0                            # marked: a focus grab right now is handed back
+    guard.mark(0.01)
+    assert guard.until > t0                                                # a shorter mark never shortens a running one
