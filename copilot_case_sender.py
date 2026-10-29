@@ -1219,6 +1219,15 @@ def cdp_http(port: int, path: str, timeout: float = 1.5, method: str = "GET"):
         return None
 
 
+def cdp_text(port: int, path: str, timeout: float = 1.5) -> str:
+    """Like cdp_http for endpoints that answer plain text (e.g. /json/activate).  '' on any failure."""
+    try:
+        with LOOPBACK.open(f"http://127.0.0.1:{port}{path}", timeout=timeout) as r:
+            return r.read(200).decode("utf-8", "replace")
+    except Exception:
+        return ""
+
+
 async def cdp_version(port: int, timeout: float = 1.5):
     return await asyncio.to_thread(cdp_http, port, "/json/version", timeout)
 
@@ -1281,6 +1290,7 @@ class EdgeBrowser:
         self.launched = self.attach_logged = False     # launched: this run started Edge itself (else we joined an open one)
         self.tabs_prepared, self.loading = False, []    # prepare_tabs ran (its tabs may still be loading: never open more)
         self.want, self.want_tabs = asyncio.Event(), 1  # how many Copilot tabs the run needs (set once the queue is known)
+        self.tour_handoff = asyncio.Event()             # set when the Playwright TabTour takes over from http_tour
 
     @property
     def reused(self) -> bool:
@@ -1459,6 +1469,31 @@ class EdgeBrowser:
             self.log("session", note=f"opening {missing} more Copilot tab(s) right away")
         return missing
 
+    async def http_tour(self, count: int, starting) -> None:
+        """Tab tour BEFORE Playwright is connected (connecting waits on every busy, loading tab, which can take long).
+        Over the plain HTTP endpoint each Copilot tab is brought forward in turn (GET /json/activate/<id>, at most
+        VISIT_SECONDS each) from the moment it exists.  A tab on the sign-in page is kept in front and not left.
+        Stops when `tour_handoff` is set (the full TabTour takes over) or when cancelled.  Best effort, never raises."""
+        port, turn = self.cfg.cdp_port, 0
+        origin = "{0.scheme}://{0.netloc}".format(urlparse(self.cfg.copilot_url))
+        while not starting.done() and not endpoint_valid(await cdp_version(port), port):
+            await asyncio.sleep(0.2)
+        while not self.tour_handoff.is_set():
+            pages = await asyncio.to_thread(cdp_http, port, "/json/list")
+            pages = [p for p in pages or [] if p.get("type") == "page" and p.get("id")]
+            signin = [p for p in pages if is_signin_url(str(p.get("url", "")), origin)]
+            ours = [p for p in pages if str(p.get("url", "")).startswith(origin)][:max(1, count)]
+            pick = signin[0] if signin else (ours[turn % len(ours)] if ours else None)
+            turn += 1
+            t0 = time.monotonic()
+            if pick is not None:
+                await asyncio.to_thread(cdp_text, port, f"/json/activate/{pick['id']}")
+            left = VISIT_SECONDS - (time.monotonic() - t0)
+            try:
+                await asyncio.wait_for(self.tour_handoff.wait(), max(0.05, left))
+            except asyncio.TimeoutError:
+                pass
+
     async def reconnect(self):
         self.log("reconnect", note="re-establishing the browser connection")
         await self._drop()
@@ -1560,6 +1595,7 @@ ASSISTANT_MSG = ('[data-testid="copilot-message-reply-div"] [data-testid="markdo
 UPLOAD_ITEM = re.compile(r"upload", re.I)          # menu entry "Upload images and files" under the + button
 FILE_INPUT = "input[type='file']#upload-file-button"   # Copilot's own (hidden, multi-file) input behind that menu entry
 DIRECT_SIGN_SECONDS = 6                              # how long the direct route may take to show its first chip
+MENU_RETRY_SECONDS = 2.5                             # model button clicked again if its menu has not opened by then
 READY_JS = ("() => { const vis = e => !!(e && (e.offsetWidth || e.offsetHeight)); const q = s => document.querySelector(s);"
             " return vis(q(" + json.dumps(", ".join(EDITORS)) + ")) && vis(q(\"button[aria-label*='model selector' i], #gptModeSwitcher\")); }")
 # First visible menu = modes + provider entries (aria-haspopup); a provider's models open as the 2nd menu.
@@ -1892,12 +1928,30 @@ class CopilotTab:
             await asyncio.sleep(0.05)
         raise UiError("the model menu did not open")
 
+    async def _open_model_menu(self, switcher) -> list:
+        """Click the model button until its menu shows (items of the top menu).  A tab that just became ready can show
+        the button before it reacts to clicks: one click would then wait the whole op_timeout for nothing, so the
+        button is clicked again every MENU_RETRY_SECONDS (a half-open state is closed first), within op_timeout."""
+        deadline = time.monotonic() + self.cfg.op_timeout
+        while True:
+            await self.cursor.click(switcher, timeout=10000)
+            until = min(deadline, time.monotonic() + MENU_RETRY_SECONDS)
+            while time.monotonic() < until:
+                items = await self._ev(MENU_JS, 0)
+                if items:
+                    return items
+                await asyncio.sleep(0.05)
+            if time.monotonic() >= deadline:
+                raise UiError("the model menu did not open")
+            if await switcher.get_attribute("aria-expanded") == "true":
+                await self.page.keyboard.press("Escape")       # expanded but no menu drawn: reset before clicking again
+                await asyncio.sleep(0.1)
+
     @guarded
     async def discover_models(self) -> list:
         """List what the picker offers: [{'group', 'label', 'text'}].  Modes are plain entries; each provider
         entry (Claude, GPT ...) is hovered to read its models.  The picker is closed again afterwards."""
-        await self.cursor.click(self.page.locator(MODEL_SWITCHER).first, timeout=10000)
-        top = await self._menu(0)
+        top = await self._open_model_menu(self.page.locator(MODEL_SWITCHER).first)
         found = [{"group": "Modes", "label": m["title"], "text": m["text"], "disabled": m["disabled"]} for m in top if not m["popup"]]
         previous = ()
         for provider in [m for m in top if m["popup"]]:
@@ -1930,8 +1984,7 @@ class CopilotTab:
                 pass                         # drawing only
             return
         await self._close_menus()                 # a menu left open would make the next click close it
-        await self.cursor.click(switcher, timeout=10000)
-        await self._menu(0)
+        await self._open_model_menu(switcher)
         index = 0
         if entry["group"] != "Modes":
             await self.cursor.hover(self.page.locator("[role=menuitem][aria-haspopup]", has_text=entry["group"]).first)
@@ -3625,7 +3678,7 @@ async def run_async(ctx, journal, ledger, listed, message) -> int:
     CONSOLE["log"] = log
     asking = ask_cursor(cfg, log)
     early = None if intents else asyncio.ensure_future(browser.start(launch=True))   # reconcile must look before any launch
-    topup = None
+    topup = pretour = None
     try:
         cases, todo, runner.instr = await asyncio.to_thread(scan_queue, ctx, journal, listed)
         by_key = {c.key: c for c in cases}
@@ -3634,6 +3687,7 @@ async def run_async(ctx, journal, ledger, listed, message) -> int:
         browser.want.set()
         if early and todo:      # missing Copilot tabs start loading over the plain HTTP endpoint, before Playwright is connected
             topup = asyncio.ensure_future(browser.http_topup(wanted, early))
+            pretour = asyncio.ensure_future(browser.http_tour(wanted, early))   # ... and are visited from that moment on
         if intents:
             try:  # look at the existing browser only; never start a new one just to reconcile
                 await browser.start(launch=False)
@@ -3670,7 +3724,7 @@ async def run_async(ctx, journal, ledger, listed, message) -> int:
         code = code or 1
         raise
     finally:
-        for task in (early, topup):                     # failed before the connection finished: never leave it running
+        for task in (early, topup, pretour):            # failed before the connection finished: never leave it running
             if task and not task.done():
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
@@ -3845,6 +3899,9 @@ async def prepare_session(runner, browser, cfg, log, todo, asking=None):
         CopilotTab.cursor = VisualCursor(cfg.visual_cursor_options, await asking)
     stdin = StdinLines()
     tour = TabTour(browser, cfg, tabs)             # visits every still-loading tab (<= 1 s each) until all are ready
+    handoff = getattr(browser, "tour_handoff", None)
+    if handoff is not None:
+        handoff.set()                              # the HTTP tour (running since the tabs were opened) stops here
     touring = asyncio.ensure_future(tour.run())
     gate = None
     try:

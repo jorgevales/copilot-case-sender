@@ -1821,3 +1821,28 @@ def test_model_step_is_shown_by_the_cursor_even_when_the_tab_already_shows_that_
         assert page.ops == [("pretend", [240, 615])]                           # pretend click on the model button, no real click
     finally:
         S.CopilotTab.cursor = S.VisualCursor()
+
+
+def test_a_model_button_that_ignores_the_first_click_is_clicked_again_not_waited_on_for_20_s(monkeypatch):
+    monkeypatch.setattr(S, "MENU_RETRY_SECONDS", 0.1)
+    cfg = types.SimpleNamespace(op_timeout=5)
+    page = CursorPage()
+    clicks = {"n": 0}
+
+    class Button:
+        async def click(self, **kw):
+            clicks["n"] += 1
+
+        async def get_attribute(self, name):
+            return "false"
+    real = page.evaluate
+
+    async def evaluate(script, arg=None):
+        if script is S.MENU_JS:
+            return [{"text": "Auto", "title": "Auto", "popup": "", "disabled": False}] if clicks["n"] >= 2 else None
+        return await real(script, arg)
+    page.evaluate = evaluate
+    tab = S.CopilotTab(page, cfg, FakeStop())
+    t0 = time.monotonic()
+    items = run(tab._open_model_menu(Button()))
+    assert items and clicks["n"] == 2 and time.monotonic() - t0 < 2       # second click opened it, no long wait

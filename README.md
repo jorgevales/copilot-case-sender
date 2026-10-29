@@ -42,7 +42,8 @@ by a safe alias (`other-xxxxxx`); two folders with the same ID are both blocked 
    after your answer. To make tabs load sooner: a launched Edge gets every needed tab on its command line, a joined Edge
    gets the missing ones over its plain loopback HTTP endpoint (`PUT /json/new`) before Playwright is connected, the
    Playwright driver boots while Edge starts, and loopback calls never go through a system proxy.
-   **Tab tour:** until every tab shows the model button, the tool visits each still-loading tab in turn (brought
+   **Tab tour:** it starts the moment the tabs are opened (over the loopback HTTP endpoint, before Playwright has
+   connected, since connecting waits on busy loading tabs), then Playwright takes over. Until every tab shows the model button, the tool visits each still-loading tab in turn (brought
    forward, pointer over the page, at most 1 s per tab) because a Copilot tab in front gets ready much sooner; it
    pauses while the model list is read and never leaves a tab showing the sign-in page. It stops by itself once all
    tabs are ready.
@@ -63,7 +64,8 @@ by a safe alias (`other-xxxxxx`); two folders with the same ID are both blocked 
    sign-in page is reloaded once as soon as sign-in is detected; a tab still not ready is reloaded silently every 30 s,
    and after 3 reloads it is left out of the run with a warning (it is never sent into).
 5. **The model is set per case, not in advance:** each tab selects the chosen model as the first step of its own send
-   (model -> files -> message -> Send), then the next tab does the same. If the tab already shows that model, nothing is
+   (model -> files -> message -> Send), then the next tab does the same. A tab that has only just become ready may ignore
+   the first click on the model button: it is clicked again every 2.5 s instead of waiting 20 s for a menu. If the tab already shows that model, nothing is
    clicked, but the moving cursor still shows a pretend click on the model button.
 
 ### Per case, strictly one at a time
