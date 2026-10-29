@@ -1715,8 +1715,9 @@ def test_the_startup_tour_visits_each_loading_tab_in_turn_and_ends_when_all_are_
     assert seen == [one, two, two, two]
 
 
-def test_the_tour_stays_on_a_sign_in_page_and_never_leaves_it_for_another_tab(env, monkeypatch):
+def test_the_tour_stays_on_a_sign_in_page_that_stays_but_not_on_a_redirect_flashing_by(env, monkeypatch):
     monkeypatch.setattr(S, "VISIT_SECONDS", 0.01)
+    monkeypatch.setattr(S, "SIGNIN_SETTLE_SECONDS", 0.05)
     b = FakeBrowser(env.world)
     loading = _on_copilot(FakeTab(env.world, {}))
     signin = _on_copilot(FakeTab(env.world, {}), "https://login.microsoftonline.com/common/oauth2")
@@ -1726,13 +1727,14 @@ def test_the_tour_stays_on_a_sign_in_page_and_never_leaves_it_for_another_tab(en
     def visitor(tab):
         async def visit():
             seen.append(tab)
-            if len(seen) == 3:              # you finished signing in: both tabs become ready
+            if seen[-3:] == [signin] * 3:   # the tour stayed on the sign-in tab; you finish signing in: both tabs ready
                 tour.finished(signin)
                 tour.finished(loading)
         return visit
     loading.visit, signin.visit = visitor(loading), visitor(signin)
     run(asyncio.wait_for(tour.run(), 5))
-    assert seen == [signin, signin, signin]
+    assert seen[0] is loading                                  # a fresh sign-in address does not stop the tour at once
+    assert seen[-3:] == [signin, signin, signin]               # once it stays, the tour stays on it (it ended there)
 
 
 def test_missing_copilot_tabs_are_opened_over_http_counting_copilot_and_blank_tabs_only(env, monkeypatch):
@@ -1846,3 +1848,34 @@ def test_a_model_button_that_ignores_the_first_click_is_clicked_again_not_waited
     t0 = time.monotonic()
     items = run(tab._open_model_menu(Button()))
     assert items and clicks["n"] == 2 and time.monotonic() - t0 < 2       # second click opened it, no long wait
+
+
+def test_the_http_tour_visits_every_tab_in_a_fixed_order_even_though_edge_lists_the_last_active_first(env, monkeypatch):
+    monkeypatch.setattr(S, "VISIT_SECONDS", 0.01)
+    port = env.cfg.cdp_port
+    tabs = [{"type": "page", "id": i, "url": "https://m365.cloud.microsoft/chat"} for i in ("A", "B", "C")]
+    tabs.append({"type": "page", "id": "D", "url": "about:blank"})            # opened by us, still loading
+    visits = []
+
+    async def fake_version(p, timeout=1.5):
+        return {"webSocketDebuggerUrl": f"ws://127.0.0.1:{port}/devtools/browser/x"}
+
+    def fake_http(p, path, timeout=1.5, method="GET"):
+        return sorted(tabs, key=lambda t: -visits[::-1].index(t["id"]) if t["id"] in visits else -99)   # last active first
+
+    def fake_text(p, path, timeout=1.5):
+        visits.append(path.rsplit("/", 1)[1])
+        if len(visits) >= 8:
+            b.tour_handoff.set()
+        return "Target activated"
+    monkeypatch.setattr(S, "cdp_version", fake_version)
+    monkeypatch.setattr(S, "cdp_http", fake_http)
+    monkeypatch.setattr(S, "cdp_text", fake_text)
+    b = S.EdgeBrowser(env.cfg, env.rt, env.policy, env.log, env.stop)
+    b.http_ids.append("D")
+
+    async def go():
+        starting = asyncio.get_running_loop().create_future()
+        await asyncio.wait_for(b.http_tour(4, starting), 5)
+    run(go())
+    assert set(visits[:4]) == {"A", "B", "C", "D"} and visits[4:8] == visits[:4]        # every tab, same fixed round

@@ -1291,6 +1291,7 @@ class EdgeBrowser:
         self.tabs_prepared, self.loading = False, []    # prepare_tabs ran (its tabs may still be loading: never open more)
         self.want, self.want_tabs = asyncio.Event(), 1  # how many Copilot tabs the run needs (set once the queue is known)
         self.tour_handoff = asyncio.Event()             # set when the Playwright TabTour takes over from http_tour
+        self.http_ids = []                              # tab ids opened by http_topup
 
     @property
     def reused(self) -> bool:
@@ -1464,7 +1465,9 @@ class EdgeBrowser:
         missing = max(0, count - min(count, copilot) - min(max(0, count - copilot), blank))
         target = quote(self.cfg.copilot_url, safe="")
         for _ in range(missing):
-            await asyncio.to_thread(cdp_http, port, f"/json/new?{target}", 5, "PUT")
+            made = await asyncio.to_thread(cdp_http, port, f"/json/new?{target}", 5, "PUT")
+            if isinstance(made, dict) and made.get("id"):
+                self.http_ids.append(made["id"])      # toured even while their address is still blank or a redirect
         if missing:
             self.log("session", note=f"opening {missing} more Copilot tab(s) right away")
         return missing
@@ -1474,17 +1477,30 @@ class EdgeBrowser:
         Over the plain HTTP endpoint each Copilot tab is brought forward in turn (GET /json/activate/<id>, at most
         VISIT_SECONDS each) from the moment it exists.  A tab on the sign-in page is kept in front and not left.
         Stops when `tour_handoff` is set (the full TabTour takes over) or when cancelled.  Best effort, never raises."""
-        port, turn = self.cfg.cdp_port, 0
+        port, last = self.cfg.cdp_port, None
         origin = "{0.scheme}://{0.netloc}".format(urlparse(self.cfg.copilot_url))
         while not starting.done() and not endpoint_valid(await cdp_version(port), port):
             await asyncio.sleep(0.2)
+        seen_signin, order = {}, {}                # tab id -> first seen on a sign-in address / fixed tour position
         while not self.tour_handoff.is_set():
             pages = await asyncio.to_thread(cdp_http, port, "/json/list")
             pages = [p for p in pages or [] if p.get("type") == "page" and p.get("id")]
-            signin = [p for p in pages if is_signin_url(str(p.get("url", "")), origin)]
-            ours = [p for p in pages if str(p.get("url", "")).startswith(origin)][:max(1, count)]
-            pick = signin[0] if signin else (ours[turn % len(ours)] if ours else None)
-            turn += 1
+            for p in pages:                        # /json/list puts the last activated tab first: keep our own fixed order
+                order.setdefault(p["id"], len(order))
+            ours = sorted((p for p in pages if str(p.get("url", "")).startswith(origin) or p["id"] in self.http_ids),
+                          key=lambda p: order[p["id"]])[:max(1, count)]
+            now_ = time.monotonic()
+            for p in pages:
+                if is_signin_url(str(p.get("url", "")), origin):
+                    seen_signin.setdefault(p["id"], now_)
+                else:
+                    seen_signin.pop(p["id"], None)
+            # a sign-in page that STAYS (you are typing there) keeps the front; a redirect flashing by while loading does not
+            parked = [p for p in pages if now_ - seen_signin.get(p["id"], now_) >= SIGNIN_SETTLE_SECONDS]
+            ids = [p["id"] for p in ours]          # next tab after the one visited last (the list can grow between rounds)
+            nxt = (ids.index(last) + 1) % len(ids) if last in ids else 0
+            pick = parked[0] if parked else (ours[nxt] if ours else None)
+            last = pick["id"] if pick is not None else last
             t0 = time.monotonic()
             if pick is not None:
                 await asyncio.to_thread(cdp_text, port, f"/json/activate/{pick['id']}")
@@ -3780,6 +3796,7 @@ async def discover_models_anywhere(browser, first, redact, log):
 
 READY_RELOAD_SECONDS, READY_RELOADS = 30, 3      # a tab not ready is reloaded every 30 s; after 3 reloads it leaves the run
 VISIT_SECONDS = 1.0                               # the tour stays at most this long in each tab that is still loading
+SIGNIN_SETTLE_SECONDS = 3.0                       # a sign-in page shown this long is you signing in (the tour stays there)
 
 
 def is_signin_url(url: str, origin: str) -> bool:
@@ -3797,6 +3814,7 @@ class TabTour:
         self.origin = "{0.scheme}://{0.netloc}".format(urlparse(cfg.copilot_url))
         self.go, self.busy = asyncio.Event(), asyncio.Lock()     # busy: held during one tab switch (pause waits for it)
         self.go.set()
+        self.signin_since = {}                # page -> when it was first seen on the sign-in page
 
     def finished(self, tab) -> None:          # by page: several CopilotTab objects may wrap the same browser tab
         self.done.add(id(tab.page))
@@ -3810,10 +3828,16 @@ class TabTour:
             pass
 
     async def _signin(self, tab) -> bool:
+        """On the sign-in page for SIGNIN_SETTLE_SECONDS or more (you are signing in), not a redirect flashing by."""
         try:
-            return is_signin_url(await tab.url(), self.origin)
+            on = is_signin_url(await tab.url(), self.origin)
         except Exception:
+            on = False
+        key = id(tab.page)
+        if not on:
+            self.signin_since.pop(key, None)
             return False
+        return time.monotonic() - self.signin_since.setdefault(key, time.monotonic()) >= SIGNIN_SETTLE_SECONDS
 
     async def run(self) -> None:
         turn = 0
