@@ -25,6 +25,8 @@ if not exist "%SENDER_PY%" (echo That file was not found. & set "SENDER_PY=" & g
 >"%~dp0local_python.cmd" echo set "SENDER_PY=%SENDER_PY%"
 
 :havepython
+rem Shown at once: loading Python and the script from S: takes a few seconds before the script can print anything.
+echo Starting...
 rem -B no bytecode files, -E ignore PYTHON* variables, -s no user site packages (embedded Python rules).
 "%SENDER_PY%" -B -E -s "%~dp0copilot_case_sender.py" %*
 set "SENDER_EXIT=%ERRORLEVEL%"

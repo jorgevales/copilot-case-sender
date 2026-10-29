@@ -196,6 +196,9 @@ class FakeTab:
     async def navigate(self):
         self.w.reloads.append(self.target_id)
 
+    async def visit(self):                       # the startup tour bringing this tab forward
+        self.w.events.append(("visit", self.target_id))
+
     async def foreground(self):
         self._alive()
         self.w.events.append(("foreground", self.target_id))
@@ -1665,3 +1668,156 @@ def test_teardown_removes_the_drawing_from_every_page_and_turns_it_off():
     one.ops.clear()
     run(vc.click(loc))
     assert one.ops == [] and loc.calls                                          # off again: real action only
+
+
+# ------------------------------------------------------------------ startup: held console, tab tour, HTTP top-up, direct attach
+
+def test_console_lines_wait_while_a_question_is_open_and_the_answer_line_comes_first(capsys):
+    log = S.Log(None, S.Redactor(), "full")
+    log.hold()
+    log("queue", note="3 instruction(s) queued")
+    S.CONSOLE["log"] = log
+    try:
+        S.say("Waiting for Copilot sign-in")
+    finally:
+        S.CONSOLE["log"] = None
+    assert capsys.readouterr().out == ""                                       # nothing printed under the question
+    log("session", note="moving cursor on")
+    log.release(answer_first=True)
+    lines = capsys.readouterr().out.splitlines()
+    assert "moving cursor on" in lines[0] and "queued" in lines[1] and "sign-in" in lines[2]
+    log("queue", note="later")
+    assert "later" in capsys.readouterr().out                                  # released: printed at once again
+
+
+def _on_copilot(tab, url="https://m365.cloud.microsoft/chat"):
+    async def where():
+        return url
+    tab.url = where
+    return tab
+
+
+def test_the_startup_tour_visits_each_loading_tab_in_turn_and_ends_when_all_are_ready(env, monkeypatch):
+    monkeypatch.setattr(S, "VISIT_SECONDS", 0.01)
+    b = FakeBrowser(env.world)
+    one, two = _on_copilot(FakeTab(env.world, {})), _on_copilot(FakeTab(env.world, {}))
+    tour = S.TabTour(b, env.cfg, [one, two])
+    seen = []
+
+    def visitor(tab, ready_after):
+        async def visit():
+            seen.append(tab)
+            if seen.count(tab) >= ready_after:
+                tour.finished(tab)
+        return visit
+    one.visit, two.visit = visitor(one, 1), visitor(two, 3)
+    run(asyncio.wait_for(tour.run(), 5))                                       # ends by itself: every tab is ready
+    assert seen == [one, two, two, two]
+
+
+def test_the_tour_stays_on_a_sign_in_page_and_never_leaves_it_for_another_tab(env, monkeypatch):
+    monkeypatch.setattr(S, "VISIT_SECONDS", 0.01)
+    b = FakeBrowser(env.world)
+    loading = _on_copilot(FakeTab(env.world, {}))
+    signin = _on_copilot(FakeTab(env.world, {}), "https://login.microsoftonline.com/common/oauth2")
+    tour = S.TabTour(b, env.cfg, [loading, signin])
+    seen = []
+
+    def visitor(tab):
+        async def visit():
+            seen.append(tab)
+            if len(seen) == 3:              # you finished signing in: both tabs become ready
+                tour.finished(signin)
+                tour.finished(loading)
+        return visit
+    loading.visit, signin.visit = visitor(loading), visitor(signin)
+    run(asyncio.wait_for(tour.run(), 5))
+    assert seen == [signin, signin, signin]
+
+
+def test_missing_copilot_tabs_are_opened_over_http_counting_copilot_and_blank_tabs_only(env, monkeypatch):
+    port = env.cfg.cdp_port
+    payload = {"webSocketDebuggerUrl": f"ws://127.0.0.1:{port}/devtools/browser/abc"}
+    calls = []
+
+    async def fake_version(p, timeout=1.5):
+        return payload
+
+    def fake_http(p, path, timeout=1.5, method="GET"):
+        calls.append((method, path))
+        if path == "/json/list":
+            return [{"type": "page", "url": "https://m365.cloud.microsoft/chat"}, {"type": "page", "url": "edge://newtab/"},
+                    {"type": "page", "url": "https://example.com/other-site"}, {"type": "service_worker", "url": ""}]
+        return {"id": "new"}
+    monkeypatch.setattr(S, "cdp_version", fake_version)
+    monkeypatch.setattr(S, "cdp_http", fake_http)
+    b = S.EdgeBrowser(env.cfg, env.rt, env.policy, env.log, env.stop)
+
+    async def go():
+        starting = asyncio.get_running_loop().create_future()
+        return await b.http_topup(4, starting)
+    assert run(go()) == 2                                                     # 4 needed - 1 Copilot - 1 blank (reused later)
+    puts = [c for c in calls if c[0] == "PUT"]
+    assert len(puts) == 2 and all(p[1].startswith("/json/new?https%3A%2F%2Fm365.cloud.microsoft") for p in puts)
+
+
+class DirectPage(CursorPage):
+    """Fake Copilot page for the direct upload route: `chips_after` = snapshots before the first chip shows."""
+
+    def __init__(self, has_input=True, chips_after=1):
+        super().__init__()
+        self.has_input, self.chips_after, self.given, self.snaps = has_input, chips_after, [], 0
+        page = self
+
+        class Input:
+            async def count(self):
+                return 1 if page.has_input else 0
+
+            async def set_input_files(self, paths, timeout=None):
+                page.given.append(list(paths))
+
+        class Nothing:
+            async def count(self):
+                return 0
+        self._input, self._nothing = Input(), Nothing()
+
+    def locator(self, sel, **kw):
+        return types.SimpleNamespace(first=self._input if sel == S.FILE_INPUT else self._nothing)
+
+    async def evaluate(self, script, arg=None):
+        if script is S.SNAPSHOT_JS:
+            self.snaps += 1
+            shown = bool(self.given) and self.chips_after is not None and self.snaps > self.chips_after
+            return {"chips": [{"label": "a.pdf", "text": "", "title": ""}] if shown else [], "active": [], "error": ""}
+        return await super().evaluate(script, arg)
+
+
+def test_files_go_straight_onto_copilots_input_and_a_silent_page_falls_back_to_the_menu(env, monkeypatch):
+    monkeypatch.setattr(S, "DIRECT_SIGN_SECONDS", 0.3)
+    cfg = types.SimpleNamespace(op_timeout=2)
+    page = DirectPage()
+    tab = S.CopilotTab(page, cfg, FakeStop())
+    assert run(tab._direct(["C:/x/a.pdf", "C:/x/b.pdf"])) is True and page.given == [["C:/x/a.pdf", "C:/x/b.pdf"]]  # one bulk hand-over
+    silent = DirectPage(chips_after=None)
+    assert run(S.CopilotTab(silent, cfg, FakeStop())._direct(["C:/x/a.pdf"])) is False                           # nothing happened
+    assert run(S.CopilotTab(DirectPage(has_input=False), cfg, FakeStop())._direct(["C:/x/a.pdf"])) is False       # no input on this page
+
+
+def test_model_step_is_shown_by_the_cursor_even_when_the_tab_already_shows_that_model():
+    cfg = types.SimpleNamespace(op_timeout=2)
+    page = CursorPage()
+
+    class Switcher:
+        async def text_content(self):
+            return "GPT-6.1 Sol"
+
+        async def bounding_box(self, timeout=None):
+            return {"x": 200, "y": 600, "width": 80, "height": 30}
+    page.locator = lambda sel, **kw: types.SimpleNamespace(first=Switcher())
+    tab = S.CopilotTab(page, cfg, FakeStop())
+    S.CopilotTab.cursor = S.VisualCursor({"cap_ms": 50}, enabled=True)
+    try:
+        run(tab.select_model({"group": "GPT", "label": "GPT-6.1 Sol", "text": "GPT-6.1 Sol"}))
+        assert page.ops == [("pretend", [240, 615])]                           # pretend click on the model button, no real click
+    finally:
+        S.CopilotTab.cursor = S.VisualCursor()

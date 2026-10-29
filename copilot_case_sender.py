@@ -45,7 +45,7 @@ import unicodedata
 import urllib.request
 import uuid
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 # --------------------------------------------------------------------------------------------
 # 1. BASICS
@@ -700,6 +700,7 @@ class Log:
     def __init__(self, rt: Runtime | None, redact: Redactor, detail: str = "full", show_ids: bool = False):
         self.redact, self.file, self.detail, self.show_ids = redact, None, detail, show_ids
         self.events, self.errors, self.console = [], [], []        # in-memory copies for the run report: REAL values, never printed or filed
+        self.held, self._lock = None, threading.Lock()              # held: console lines kept back while a question waits for you
         if rt:
             self.file = rt.logs / f"events-{datetime.datetime.now():%Y%m%d-%H%M%S}.jsonl"
 
@@ -720,7 +721,7 @@ class Log:
         if shade and use_colour():
             text = f"\x1b[{shade}m {text} \x1b[0m"
         if self.detail == "full" or phase in MINIMAL_PHASES:
-            print(text, flush=True)
+            self.say(text)
         if self.file:
             try:
                 with open(self.file, "a", encoding="utf-8") as fh:
@@ -729,10 +730,42 @@ class Log:
                 pass  # logging must never decide whether a case is sent; the journal is what matters
 
 
+    def say(self, text: str) -> None:
+        """Print a console line now, or keep it back while a question is on screen (shown in order afterwards)."""
+        with self._lock:
+            if self.held is not None:
+                self.held.append(text)
+                return
+        print(text, flush=True)
+
+    def hold(self) -> None:
+        with self._lock:
+            if self.held is None:
+                self.held = []
+
+    def release(self, answer_first: bool = False) -> None:
+        with self._lock:                  # printed under the lock so newer lines cannot overtake the kept ones
+            lines, self.held = self.held or [], None
+            if answer_first and lines:
+                lines.insert(0, lines.pop())
+            for text in lines:
+                print(text, flush=True)
+
     def trace(self, exc: BaseException, where: str = "") -> None:
         """Remember an error with its call frames (file:line function) for the run report."""
         full = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
         self.errors.append(f"[{now()}] {where} {type(exc).__name__}: {exc}\n{full}")
+
+
+CONSOLE = {"log": None}      # the run's Log, so plain progress lines also wait while a question is on screen
+
+
+def say(text: str) -> None:
+    log = CONSOLE["log"]
+    if log is not None:
+        log.say(text)
+    else:
+        print(text, flush=True)
 
 
 def register_redactions(red: Redactor, cfg, policy: PathPolicy | None) -> None:
@@ -1173,14 +1206,21 @@ def guarded(fn):
     return wrapper
 
 
+LOOPBACK = urllib.request.build_opener(urllib.request.ProxyHandler({}))   # 127.0.0.1 never goes through a system/corporate proxy
+
+
+def cdp_http(port: int, path: str, timeout: float = 1.5, method: str = "GET"):
+    """One call to Edge's plain HTTP debugging endpoint (loopback, our port only).  None on any failure."""
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method=method)
+        with LOOPBACK.open(req, timeout=timeout) as r:
+            return json.load(r)
+    except Exception:
+        return None
+
+
 async def cdp_version(port: int, timeout: float = 1.5):
-    def fetch():
-        try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=timeout) as r:
-                return json.load(r)
-        except Exception:
-            return None
-    return await asyncio.to_thread(fetch)
+    return await asyncio.to_thread(cdp_http, port, "/json/version", timeout)
 
 
 def endpoint_valid(payload, port: int) -> str:
@@ -1240,6 +1280,7 @@ class EdgeBrowser:
         self.api = None
         self.launched = self.attach_logged = False     # launched: this run started Edge itself (else we joined an open one)
         self.tabs_prepared, self.loading = False, []    # prepare_tabs ran (its tabs may still be loading: never open more)
+        self.want, self.want_tabs = asyncio.Event(), 1  # how many Copilot tabs the run needs (set once the queue is known)
 
     @property
     def reused(self) -> bool:
@@ -1272,7 +1313,8 @@ class EdgeBrowser:
                  f"--disk-cache-dir={self._spell(self.rt.cache, variant)}",
                  f"--crash-dumps-dir={self._spell(self.rt.crashes, variant)}",
                  "--no-first-run", "--no-default-browser-check", "--disable-background-timer-throttling",
-                 "--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding", self.cfg.copilot_url]
+                 "--disable-backgrounding-occluded-windows", "--disable-renderer-backgrounding",
+                 *[self.cfg.copilot_url] * (max(1, int(self.want_tabs)) if self.generation == 0 else 1)]   # first start: every needed tab loads with Edge
         err = open(self.rt.logs / "edge-stderr.log", "ab")
         return subprocess.Popen(flags, env=dict(os.environ), cwd=str(self.rt.work), stdin=subprocess.DEVNULL,
                                 stdout=err, stderr=err,
@@ -1291,6 +1333,10 @@ class EdgeBrowser:
             return payload
         if not launch:
             return None
+        try:                       # the queue scan normally finishes first: then Edge opens with all needed tabs at once
+            await asyncio.wait_for(self.want.wait(), 5)
+        except asyncio.TimeoutError:
+            pass
         for variant in self._variants():
             self.log("edge-launch", variant=variant)
             proc = self._launch(variant)
@@ -1370,12 +1416,48 @@ class EdgeBrowser:
     async def start(self, launch: bool = True):
         if not self.lock.fh:
             self.lock.acquire()
-        if not self.pw:
+        if not self.pw:            # the driver boots while Edge is found or launched (both take seconds; neither needs the other)
             t0 = time.monotonic()
-            self.api = load_playwright()
-            self.pw = await self.api[0]().start()
-            self.log("connect", note=f"Playwright driver started in {time.monotonic() - t0:.1f}s")
+
+            async def driver():
+                self.api = await asyncio.to_thread(load_playwright)
+                self.pw = await self.api[0]().start()
+                self.log("connect", note=f"Playwright driver started in {time.monotonic() - t0:.1f}s")
+            boot = asyncio.ensure_future(driver())
+            try:
+                await self.ensure_running(launch)
+                await boot
+            except BaseException:
+                boot.cancel()
+                await asyncio.gather(boot, return_exceptions=True)
+                raise
         await self.connect(launch)
+
+    async def http_topup(self, count: int, starting) -> int:
+        """Open the missing Copilot tabs over Edge's plain HTTP endpoint (PUT /json/new), so they load while Playwright is
+        still connecting.  Counts what is open now: Copilot tabs, then blank tabs (navigated later by prepare_tabs); other
+        sites are never touched.  Best effort: prepare_tabs opens whatever is still missing.  Returns how many it opened."""
+        port = self.cfg.cdp_port
+        while not starting.done():                 # the endpoint appears once Edge is up (joined at once, or after a launch)
+            if endpoint_valid(await cdp_version(port), port):
+                break
+            await self.stop.sleep(0.2)
+        if self.launched:          # this run started Edge with every needed tab on its command line: nothing to add
+            return 0
+        pages = await asyncio.to_thread(cdp_http, port, "/json/list")
+        if not isinstance(pages, list):
+            return 0
+        origin = "{0.scheme}://{0.netloc}".format(urlparse(self.cfg.copilot_url))
+        urls = [str(p.get("url", "")) for p in pages if p.get("type") == "page"]
+        copilot = sum(1 for u in urls if u.startswith(origin))
+        blank = sum(1 for u in urls if u in ("", "about:blank") or u.startswith(BLANK_PAGES))
+        missing = max(0, count - min(count, copilot) - min(max(0, count - copilot), blank))
+        target = quote(self.cfg.copilot_url, safe="")
+        for _ in range(missing):
+            await asyncio.to_thread(cdp_http, port, f"/json/new?{target}", 5, "PUT")
+        if missing:
+            self.log("session", note=f"opening {missing} more Copilot tab(s) right away")
+        return missing
 
     async def reconnect(self):
         self.log("reconnect", note="re-establishing the browser connection")
@@ -1476,6 +1558,8 @@ USER_MSG = '[data-testid="chatQuestion"],.fai-UserMessage,[aria-labelledby^="use
 ASSISTANT_MSG = ('[data-testid="copilot-message-reply-div"] [data-testid="markdown-reply"],'
                  '[data-testid="copilot-message-div"] [data-testid="markdown-reply"],.fai-CopilotMessage__content')
 UPLOAD_ITEM = re.compile(r"upload", re.I)          # menu entry "Upload images and files" under the + button
+FILE_INPUT = "input[type='file']#upload-file-button"   # Copilot's own (hidden, multi-file) input behind that menu entry
+DIRECT_SIGN_SECONDS = 6                              # how long the direct route may take to show its first chip
 READY_JS = ("() => { const vis = e => !!(e && (e.offsetWidth || e.offsetHeight)); const q = s => document.querySelector(s);"
             " return vis(q(" + json.dumps(", ".join(EDITORS)) + ")) && vis(q(\"button[aria-label*='model selector' i], #gptModeSwitcher\")); }")
 # First visible menu = modes + provider entries (aria-haspopup); a provider's models open as the 2nd menu.
@@ -1629,6 +1713,16 @@ class CopilotTab:
         await self.page.goto(self.cfg.copilot_url, wait_until="domcontentloaded", timeout=60000)
 
     @guarded
+    async def visit(self):
+        """Be present in this tab like a person: bring it forward and move the pointer over the page (a loading Copilot
+        tab in front gets ready much sooner than one in the background).  Read-only: nothing is clicked."""
+        await self.cursor.switch(self.page, self.page.bring_to_front)
+        size = await asyncio.wait_for(self.page.evaluate("() => [innerWidth, innerHeight]"), 2)
+        x, y = size[0] / 2, size[1] * 0.6
+        await self.cursor.follow(self.page, x, y)
+        await asyncio.wait_for(self.page.mouse.move(x, y, steps=4), 2)
+
+    @guarded
     async def activate(self):
         """Do what a person would: bring the tab forward, move the pointer over the composer and let Copilot wake up."""
         await self.cursor.switch(self.page, self.page.bring_to_front)
@@ -1648,7 +1742,7 @@ class CopilotTab:
             if await self._editor() is not None:
                 return
             if not hinted and time.monotonic() > deadline - self.cfg.login_wait_seconds + 8:
-                print("Waiting for the Copilot composer - sign in manually in the dedicated Edge window if asked.", flush=True)
+                say("Waiting for the Copilot composer - sign in manually in the dedicated Edge window if asked.")
                 hinted = True
             await self.stop.sleep(0.4)
         raise UiError("the Copilot composer never appeared (not signed in?)")
@@ -1687,11 +1781,54 @@ class CopilotTab:
     async def snapshot(self) -> dict:
         return await self._ev(SNAPSHOT_JS)
 
+    direct_ok = None      # shared: None = not tried yet, True = Copilot takes files on its own input, False = menu route only
+
+    async def _direct(self, paths: list) -> bool:
+        """Hand the files straight to Copilot's own upload input (the one behind "Upload images and files"), so the + menu
+        never has to open.  The cursor only pretends a click in the composer meanwhile.  True = Copilot started taking
+        them (a chip, a busy chip or an upload error appeared); False = nothing happened, use the menu route."""
+        inp = self.page.locator(FILE_INPUT).first
+        if not await asyncio.wait_for(inp.count(), self.cfg.op_timeout):
+            return False
+        before = len((await self._ev(SNAPSHOT_JS))["chips"])
+
+        async def show():                  # drawing only: it never decides whether the files go in
+            try:
+                ed = await self._editor()
+                box = await ed.bounding_box() if ed is not None else None
+                if box:
+                    await self.cursor.pretend(self.page, box["x"] + min(60, box["width"] / 2), box["y"] + box["height"] / 2)
+            except Exception:
+                pass
+        await asyncio.gather(show(), inp.set_input_files(paths, timeout=self.cfg.op_timeout * 1000))
+        deadline = time.monotonic() + DIRECT_SIGN_SECONDS
+        while time.monotonic() < deadline:
+            snap = await self._ev(SNAPSHOT_JS)
+            if len(snap["chips"]) > before or snap["active"] or snap["error"]:
+                return True
+            await self.stop.sleep(0.15)
+        return False
+
     async def _assign(self, files: list):
-        """Bulk-attach through the + menu -> "Upload images and files" -> intercepted file chooser.
+        """Attach the list in ONE assignment: straight onto Copilot's upload input when that works on this page, else
+        through the + menu -> "Upload images and files" -> intercepted file chooser.
         Only that one menu entry is ever clicked; nothing else on the page (quick-action buttons, other
         menu items) can open Windows' file dialog because the chooser is intercepted anyway."""
         paths = [os.path.abspath(f) for f in files]
+        if CopilotTab.direct_ok is not False:
+            took = False
+            try:
+                took = await self._direct(paths)
+            except (asyncio.TimeoutError, UiError):
+                took = False
+            except Exception as exc:
+                if is_loss(exc):
+                    raise
+            if took:
+                CopilotTab.direct_ok = True
+                return
+            if CopilotTab.direct_ok is None:       # never worked on this page: the menu route for the rest of the run
+                CopilotTab.direct_ok = False
         self._chooser = asyncio.get_running_loop().create_future()
         plus = self.page.locator(PLUS_BTN).first
         try:   # early in a page load only a look-alike placeholder "Add" button exists; the real one appears a few seconds later
@@ -1712,7 +1849,7 @@ class CopilotTab:
     @guarded
     async def attach(self, paths: list, route: str):
         """route 'bulk': whole list in ONE assignment.  route 'sequential': one file at a time, waiting for
-        each chip.  (The reference's Playwright set_input_files route stays quarantined.)"""
+        each chip (the fallback after a real upload failure).  Each assignment tries Copilot's own input first."""
         if route == "bulk":
             return await self._assign(paths)
         for i, p in enumerate(paths, 1):
@@ -1784,6 +1921,13 @@ class CopilotTab:
     async def select_model(self, entry: dict):
         switcher = self.page.locator(MODEL_SWITCHER).first
         if label_matches(await switcher.text_content(), entry):
+            # already showing it: no real click (it would only open the menu), but the cursor still shows the step
+            try:
+                box = await asyncio.wait_for(switcher.bounding_box(), self.cfg.op_timeout)
+                if box:
+                    await self.cursor.pretend(self.page, box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+            except Exception:
+                pass                         # drawing only
             return
         await self._close_menus()                 # a menu left open would make the next click close it
         await self.cursor.click(switcher, timeout=10000)
@@ -3178,8 +3322,8 @@ async def wait_for_login(browser, stdin, log):
             if enter.done():
                 enter = asyncio.ensure_future(asyncio.sleep(3600))   # no terminal input available: auto-detect only
             if not announced and time.monotonic() - t0 > 1.0:
-                print("Waiting for Copilot sign-in: sign in in the Edge window - I continue by myself as soon as the chat "
-                      "appears (or press Enter here to continue manually).", flush=True)
+                say("Waiting for Copilot sign-in: sign in in the Edge window - I continue by myself as soon as the chat "
+                      "appears (or press Enter here to continue manually).")
                 announced = True
             await asyncio.sleep(0.25)
     finally:
@@ -3478,11 +3622,18 @@ async def run_async(ctx, journal, ledger, listed, message) -> int:
     code, results, crash, started, start_seq, bfacts = 0, {}, None, time.monotonic(), journal.seq, None
     intents = any(r.get("state") == "send_intent" for r in journal.cases.values())
     # Everything that does not depend on the queue starts at once: the cursor question, Edge (launch or join) + connection.
-    asking = ask_cursor(cfg)
+    CONSOLE["log"] = log
+    asking = ask_cursor(cfg, log)
     early = None if intents else asyncio.ensure_future(browser.start(launch=True))   # reconcile must look before any launch
+    topup = None
     try:
         cases, todo, runner.instr = await asyncio.to_thread(scan_queue, ctx, journal, listed)
         by_key = {c.key: c for c in cases}
+        wanted = max(1, min(int(cfg.warm_tabs), len([c for c in todo if runner.sent_ids.get(c.id) is None]) or 1))
+        browser.want_tabs = wanted
+        browser.want.set()
+        if early and todo:      # missing Copilot tabs start loading over the plain HTTP endpoint, before Playwright is connected
+            topup = asyncio.ensure_future(browser.http_topup(wanted, early))
         if intents:
             try:  # look at the existing browser only; never start a new one just to reconcile
                 await browser.start(launch=False)
@@ -3495,6 +3646,8 @@ async def run_async(ctx, journal, ledger, listed, message) -> int:
             await early
         elif (todo or resumable) and browser.context is None:
             await browser.start(launch=True)
+        if topup:
+            await asyncio.gather(topup, return_exceptions=True)   # an optimisation only: prepare_tabs opens whatever is still missing
         todo = [c for c in todo if runner.sent_ids.get(c.id) is None]
         if todo:
             await prepare_session(runner, browser, cfg, log, todo, asking)
@@ -3517,9 +3670,11 @@ async def run_async(ctx, journal, ledger, listed, message) -> int:
         code = code or 1
         raise
     finally:
-        if early and not early.done():                  # failed before the connection finished: never leave it running
-            early.cancel()
-            await asyncio.gather(early, return_exceptions=True)
+        for task in (early, topup):                     # failed before the connection finished: never leave it running
+            if task and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        log.release()
         await CopilotTab.cursor.teardown()              # drawings removed from every tab; Edge itself stays open
         try:
             bfacts = await asyncio.wait_for(browser_facts(browser, runner), 20)   # before the connection is closed
@@ -3562,23 +3717,87 @@ async def discover_models_anywhere(browser, first, redact, log):
                     log("model", note=note)
                     tried_note = note
         if not announced:
-            print("Waiting for the Copilot model list - trying every signed-in Copilot tab until one shows it "
-                  "(Ctrl+C to stop).", flush=True)
+            say("Waiting for the Copilot model list - trying every signed-in Copilot tab until one shows it "
+                  "(Ctrl+C to stop).")
             announced = True
         await browser.stop.sleep(1.0)
         candidates = [first] + [t for t in await browser.find_ready_tabs() if t.page is not first.page]   # others may be ready now
 
 
 READY_RELOAD_SECONDS, READY_RELOADS = 30, 3      # a tab not ready is reloaded every 30 s; after 3 reloads it leaves the run
+VISIT_SECONDS = 1.0                               # the tour stays at most this long in each tab that is still loading
 
 
-async def ready_tabs(browser, cfg, tabs, log) -> list:
+def is_signin_url(url: str, origin: str) -> bool:
+    """A page that is neither Copilot nor a blank tab: the Microsoft sign-in (or an error) page."""
+    return bool(url) and not url.startswith(origin) and not url.startswith(("about:", "edge:", "chrome:"))
+
+
+class TabTour:
+    """While tabs load, visit each one that is not ready yet in turn (at most VISIT_SECONDS each), because a Copilot tab
+    in front gets ready far sooner.  Ready (or dropped) tabs leave the tour; it ends by itself once none is left.
+    A tab on the sign-in page is NOT left while it shows it (you may be typing there).  `go` pauses it (model reading)."""
+
+    def __init__(self, browser, cfg, tabs):
+        self.browser, self.tabs, self.done = browser, list(tabs), set()
+        self.origin = "{0.scheme}://{0.netloc}".format(urlparse(cfg.copilot_url))
+        self.go, self.busy = asyncio.Event(), asyncio.Lock()     # busy: held during one tab switch (pause waits for it)
+        self.go.set()
+
+    def finished(self, tab) -> None:          # by page: several CopilotTab objects may wrap the same browser tab
+        self.done.add(id(tab.page))
+
+    def left(self) -> list:
+        return [t for t in self.tabs if id(t.page) not in self.done]
+
+    async def pause(self) -> None:
+        self.go.clear()
+        async with self.busy:                 # a switch already under way finishes first, so it cannot land after ours
+            pass
+
+    async def _signin(self, tab) -> bool:
+        try:
+            return is_signin_url(await tab.url(), self.origin)
+        except Exception:
+            return False
+
+    async def run(self) -> None:
+        turn = 0
+        while self.left():
+            self.browser.stop.check()
+            await self.go.wait()
+            todo = self.left()
+            if not todo:
+                return
+            parked = [t for t in todo if await self._signin(t)]
+            tab = parked[0] if parked else todo[turn % len(todo)]
+            turn += 1
+            end = time.monotonic() + VISIT_SECONDS          # the switch and pointer move count toward the 1 s
+            async with self.busy:
+                if not self.go.is_set():
+                    continue
+                try:
+                    await asyncio.wait_for(quiet(tab.visit()), VISIT_SECONDS)
+                except asyncio.TimeoutError:
+                    pass
+            while time.monotonic() < end - 0.02 and id(tab.page) not in self.done and self.go.is_set():
+                await self.browser.stop.sleep(min(0.1, end - time.monotonic() - 0.02))   # never past the 1 s
+
+
+async def ready_tabs(browser, cfg, tabs, log, tour=None) -> list:
     """Wait until EVERY tab shows the composer + model button (no case is sent into a tab still loading or on a sign-in
     page).  A tab left on a sign-in page is reloaded at once (you signed in elsewhere); a tab still not ready is reloaded
-    every READY_RELOAD_SECONDS, and after READY_RELOADS reloads it is dropped with a warning.  Order is kept."""
+    silently every READY_RELOAD_SECONDS, and after READY_RELOADS reloads it is dropped with a warning.  Order is kept."""
     origin = "{0.scheme}://{0.netloc}".format(urlparse(cfg.copilot_url))
 
     async def one(n, tab):
+        try:
+            return await wait_one(n, tab)
+        finally:
+            if tour:
+                tour.finished(tab)
+
+    async def wait_one(n, tab):
         reloads, since, kicked = 0, time.monotonic(), False
         while True:
             browser.stop.check()
@@ -3594,15 +3813,14 @@ async def ready_tabs(browser, cfg, tabs, log) -> list:
                     url = await tab.url()
                 except Exception:
                     url = ""
-                if url and not url.startswith(origin) and not url.startswith(("about:", "edge:", "chrome:")):
+                if is_signin_url(url, origin):
                     await quiet(tab.navigate())
                     since = time.monotonic()
             if time.monotonic() - since >= READY_RELOAD_SECONDS:
                 if reloads >= READY_RELOADS:
                     log("WARNING", note=f"tab {n} never became ready after {READY_RELOADS} reloads - left out of this run")
                     return None
-                reloads += 1
-                log("session", note=f"tab {n} is not ready yet - reloading it ({reloads}/{READY_RELOADS})")
+                reloads += 1                     # silent: only the journal-free event log keeps track
                 await quiet(tab.navigate())
                 since = time.monotonic()
             await browser.stop.sleep(0.5)
@@ -3623,21 +3841,38 @@ async def prepare_session(runner, browser, cfg, log, todo, asking=None):
     gets ready -> nothing is sent until all tabs are ready.  The model is set in each tab as part of its own send."""
     count = max(1, min(int(cfg.warm_tabs), len(todo)))
     tabs = await browser.prepare_tabs(count)       # existing Copilot tabs + blank tabs + new ones, all loading together
-    if asking:                                     # answered at launch; only clicks in a tab need it
+    if asking:                                     # answered at launch (its console line is printed with the answer)
         CopilotTab.cursor = VisualCursor(cfg.visual_cursor_options, await asking)
-        log("session", note="moving cursor " + ("on" if CopilotTab.cursor.enabled else "off"))
     stdin = StdinLines()
-    first = await wait_for_login(browser, stdin, log)
-    log("login", note="Copilot is signed in")
-    gate = asyncio.ensure_future(ready_tabs(browser, cfg, [t for t in tabs if t.page is not first.page][:count - 1], log))
+    tour = TabTour(browser, cfg, tabs)             # visits every still-loading tab (<= 1 s each) until all are ready
+    touring = asyncio.ensure_future(tour.run())
+    gate = None
     try:
-        first, entries = await discover_models_anywhere(browser, first, runner.redact, log)
-        runner.model = await choose_model(entries, pick_default(entries), cfg, stdin, log)
+        first = await wait_for_login(browser, stdin, log)
+        tour.finished(first)
+        log("login", note="Copilot is signed in")
+        gate = asyncio.ensure_future(ready_tabs(browser, cfg, [t for t in tabs if t.page is not first.page][:count - 1], log, tour))
+        await tour.pause()                         # the model menu is read in the FRONT tab: the tour waits meanwhile
+        await CopilotTab.cursor.switch(first.page, first.page.bring_to_front)
+        try:
+            first, entries = await discover_models_anywhere(browser, first, runner.redact, log)
+        finally:
+            tour.finished(first)
+            tour.go.set()
+        held = getattr(log, "hold", None)          # the model question stays the last thing on screen until you answer
+        if held:
+            held()
+        try:
+            runner.model = await choose_model(entries, pick_default(entries), cfg, stdin, log)
+        finally:
+            if held:
+                log.release()
         others = [t for t in await gate if t.page is not first.page]
-    except BaseException:
-        gate.cancel()
-        await asyncio.gather(gate, return_exceptions=True)
-        raise
+    finally:
+        for task in (touring, gate):
+            if task and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
     tabs = [first] + others[:count - 1]
     runner.pool.extend((t, browser.generation) for t in tabs)
     await CopilotTab.cursor.switch(first.page, first.page.bring_to_front)
@@ -3683,23 +3918,28 @@ def choose_visual_cursor(cfg) -> bool:
         print("  Please press Enter for Yes, or type N for No.")
 
 
-def ask_cursor(cfg) -> "asyncio.Future":
-    """Ask the moving-cursor question in a daemon thread so Edge can start and connect meanwhile (Ctrl+C never waits for it)."""
+def ask_cursor(cfg, log) -> "asyncio.Future":
+    """Ask the moving-cursor question in a daemon thread so Edge can start and connect meanwhile (Ctrl+C never waits for it).
+    Every console line made meanwhile is kept back until you answer, so the question stays the last thing on screen."""
     loop, fut = asyncio.get_running_loop(), asyncio.get_running_loop().create_future()
+    if str(cfg.visual_cursor).lower() not in ("on", "off"):
+        log.hold()
 
     def work():
         try:
             result = choose_visual_cursor(cfg)
         except BaseException as exc:                       # noqa: BLE001 - handed to the awaiting side
-            loop.call_soon_threadsafe(lambda: fut.done() or fut.set_exception(exc))
+            log.release()
+            loop.call_soon_threadsafe(lambda err=exc: fut.done() or fut.set_exception(err))   # bound now: `exc` is cleared after except
             return
+        log("session", note="moving cursor " + ("on" if result else "off"))
+        log.release(answer_first=True)        # the answer's line first, then everything that happened meanwhile
         loop.call_soon_threadsafe(lambda: fut.done() or fut.set_result(result))
     threading.Thread(target=work, daemon=True).start()
     return fut
 
 
 def run_command(args) -> int:
-    print("Starting...", flush=True)
     cfg = load_config()
     if getattr(args, "detail", None):
         cfg.console_detail = args.detail

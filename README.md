@@ -37,7 +37,15 @@ by a safe alias (`other-xxxxxx`); two folders with the same ID are both blocked 
    every scenario (Edge launched or joined): Copilot tabs already open are used first, blank new-tab pages are turned
    into Copilot tabs, then new tabs are opened. Tabs showing any other site, and Copilot tabs beyond the needed number,
    are never touched. A slow connection is remembered (`state\handshake-seconds.txt`) so the next start skips the
-   handshake limits that were too short.
+   handshake limits that were too short. `Run.cmd` prints `Starting...` before Python even loads. While the cursor
+   question (and later the model question) is on screen **nothing else is printed**: lines made meanwhile appear right
+   after your answer. To make tabs load sooner: a launched Edge gets every needed tab on its command line, a joined Edge
+   gets the missing ones over its plain loopback HTTP endpoint (`PUT /json/new`) before Playwright is connected, the
+   Playwright driver boots while Edge starts, and loopback calls never go through a system proxy.
+   **Tab tour:** until every tab shows the model button, the tool visits each still-loading tab in turn (brought
+   forward, pointer over the page, at most 1 s per tab) because a Copilot tab in front gets ready much sooner; it
+   pauses while the model list is read and never leaves a tab showing the sign-in page. It stops by itself once all
+   tabs are ready.
 1. **Sign-in detection.** Edge opens; the tool keeps checking (every 0.25 s, no overall limit) until a Copilot tab shows
    both the chat composer and the model button, then continues **by itself**. If you are already signed in nothing is
    asked. After 1 s of waiting it tells you to sign in in the Edge window; pressing **Enter** in the terminal is only a
@@ -52,10 +60,11 @@ by a safe alias (`other-xxxxxx`); two folders with the same ID are both blocked 
    with the default.
 4. **Every tab ready before the first send (in parallel with steps 2-3):** the model is asked as soon as ONE tab shows
    the list, but nothing is sent until every prepared tab shows the composer and the model button. A tab left on a
-   sign-in page is reloaded once as soon as sign-in is detected; a tab still not ready is reloaded every 30 s, and after
-   3 reloads it is left out of the run with a warning (it is never sent into).
+   sign-in page is reloaded once as soon as sign-in is detected; a tab still not ready is reloaded silently every 30 s,
+   and after 3 reloads it is left out of the run with a warning (it is never sent into).
 5. **The model is set per case, not in advance:** each tab selects the chosen model as the first step of its own send
-   (model -> files -> message -> Send), then the next tab does the same.
+   (model -> files -> message -> Send), then the next tab does the same. If the tab already shows that model, nothing is
+   clicked, but the moving cursor still shows a pretend click on the model button.
 
 ### Per case, strictly one at a time
 **Foreground rule.** Every tab is brought to the front (and confirmed visible) when a case starts working in it, again
@@ -82,10 +91,16 @@ files** fails at once ("unexpected attachment present"); the chip names are then
 (local only).
 demand (V1 is meant for a handful of controlled cases; recycling answered tabs is a later version).
 
-**How files are attached (no Windows file window).** The `+` button's "Upload images and files" entry normally opens
+**How files are attached (no Windows file window, normally no menu).** First choice: the whole file list is handed in
+one call straight to Copilot's own hidden multi-file input (`#upload-file-button`, the input behind "Upload images and
+files"), so the `+` menu never opens; the moving cursor only shows a pretend click in the composer meanwhile. If
+Copilot shows no chip, busy chip or upload error within 6 s, that page does not take files this way and the run uses the
+menu route below for the rest of the run (*Locally verified*: the input exists on a personal Microsoft 365 Copilot
+profile; the VDI tenant is to re-confirm). Menu route: the `+` button's "Upload images and files" entry normally opens
 Windows' own file dialog, which broke sends on the VDI. The tool registers a Playwright *file-chooser listener* on every
 tab, which intercepts the chooser: the dialog never appears and the full file list is handed to the page in one call
 (`set_files`). Only that one menu entry is ever clicked; the quick-action buttons under the composer are never touched.
+After a real upload failure the sequential route (one file at a time) is the fallback, as before.
 A simulated drag-and-drop was tried and **does not work** in this Copilot (the page receives the drop, ignores it).
 
 **Failures:** if Copilot shows a real upload error with its own *Try again* button, that button is clicked (max 2
@@ -288,8 +303,8 @@ Needs `pytest`; refuses to run without `SENDER_TEST_ROOT` (never uses system Tem
 
 Reused ideas (re-written, not imported): dedicated-profile Edge launch with loopback debugging; `/json/version`
 polling and endpoint validation; browser-WebSocket-then-HTTP `connect_over_cdp` with the 3-6-12-20-30 s ladder;
-exact target-ID rebinding; the composer/attachment/Send/Stop selectors; bulk file assignment (originally `DOM.setFileInputFiles`, now through an intercepted file chooser; the
-quarantined `playwright_bulk` route is **not** restored); Send-versus-Stop guarding; first-launch private install.
+exact target-ID rebinding; the composer/attachment/Send/Stop selectors; bulk file assignment (originally `DOM.setFileInputFiles`; now first straight onto Copilot's own `#upload-file-button`
+input, verified by a chip appearing, else through an intercepted file chooser); Send-versus-Stop guarding; first-launch private install.
 Dropped: the old audit workflow (CSV/allow-lists, merge-status JSON, merged PDFs, case-size categories, multi-case
 packing, audit prompt/response contract/result parser), indefinite reconnect loops, permissive Edge flags, Temp
 deletion routines, and the thousands of lines of diagnostics/override layers.
