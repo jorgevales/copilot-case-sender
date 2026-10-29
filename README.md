@@ -63,7 +63,9 @@ by a safe alias (`other-xxxxxx`); two folders with the same ID are both blocked 
    asked. After 1 s of waiting it tells you to sign in in the Edge window; pressing **Enter** in the terminal is only a
    manual fallback (ignored when the terminal is redirected).
 2. **Model discovery** (~3 s): the model button's menu is read – modes (Auto, Quick response, Think deeper) and every
-   provider submenu (Claude, GPT …); nothing is hard-coded, so added or removed models just appear.
+   provider submenu (Claude, GPT …); nothing is hard-coded, so added or removed models just appear. A submenu opens
+   when the cursor hovers its entry; if the hover does not take (busy or background tab), the keyboard opens it
+   (Right arrow) within ~2.5 s instead of failing the attempt after 20 s.
    Copilot tabs sign in and load at different speeds, so if the first tab's picker is not ready the script keeps trying
    it and every other signed-in Copilot tab (re-scanned each second) until one shows the list. There is no fallback
    such as sending with Copilot's current model: you always get the list and always choose. Only Ctrl+C ends the wait.

@@ -597,6 +597,8 @@ def _write_guard_hook(event, args):
             here = os.path.normcase(os.path.abspath(os.fsdecode(one)))
             if any(here == e or here.startswith(e + os.sep) for e in WRITE_GUARD.get("extra", ())):
                 continue
+            if event == "os.mkdir" and any(e.startswith(here + os.sep) for e in WRITE_GUARD.get("extra", ())):
+                continue                       # the empty folders leading to it (the first copy creates them)
         except Exception:
             pass
         try:
@@ -1267,7 +1269,7 @@ class DriverCache:
             os.replace(tmp, self.root)
             self.log("dependencies", note="Playwright driver copied to this computer's local disk: the next start will be fast")
         except Exception as exc:                  # an optimisation only: the run is never affected
-            self.log("dependencies", note=f"local driver copy not made ({type(exc).__name__}); next run starts from S: again")
+            self.log("dependencies", note=f"local driver copy not made ({type(exc).__name__}: {exc}); next run starts from S: again")
 
 
 # --------------------------------------------------------------------------------------------
@@ -1984,6 +1986,8 @@ MENU_JS = r"""idx => {
     const span = [...e.querySelectorAll('span')].find(x => norm(x.textContent) && ![...x.querySelectorAll('span')].some(y => norm(y.textContent)));   // first leaf span = the name
     return {text: norm(e.textContent), title: norm(span ? span.textContent : e.textContent), popup: e.getAttribute('aria-haspopup') || '',
             disabled: e.getAttribute('aria-disabled') === 'true' || e.disabled === true}; }); }"""
+SUBMENU_OPEN_JS = ("t => [...document.querySelectorAll('[role=menuitem][aria-haspopup][aria-expanded=true]')]"
+                   ".some(e => e.textContent.includes(t)) && document.querySelectorAll('[role=menu]').length > 1")
 MODEL_SWITCHER = ("#gptModeSwitcher, [data-testid*='gptModeSwitcher' i], button[aria-label*='response mode' i], "
                   "button[aria-label*='model selector' i], button[aria-label*='mode selector' i]")
 
@@ -2300,21 +2304,46 @@ class CopilotTab:
             return ""
         return await ed.evaluate("e => ('value' in e) ? e.value : (e.innerText || e.textContent || '')")
 
-    async def _menu(self, index: int, expect_open: str = "", not_these=()) -> list:
+    async def _menu(self, index: int, expect_open: str = "", not_these=(), seconds: float = 0) -> list:
         """Items of the index-th open menu.  With expect_open, wait until that provider entry is expanded; with
         not_these, ignore a submenu still showing the previous provider's models (it is replaced a moment later)."""
-        if expect_open:
-            await self.page.wait_for_function(
-                "t => [...document.querySelectorAll('[role=menuitem][aria-haspopup][aria-expanded=true]')]"
-                ".some(e => e.textContent.includes(t)) && document.querySelectorAll('[role=menu]').length > 1",
-                arg=expect_open, timeout=self.cfg.op_timeout * 1000, polling=50)
-        deadline = time.monotonic() + self.cfg.op_timeout
+        deadline = time.monotonic() + (seconds or self.cfg.op_timeout)
         while time.monotonic() < deadline:
-            items = await self._ev(MENU_JS, index)
-            if items and {m["text"] for m in items} != set(not_these):
-                return items
+            if not expect_open or await self._ev(SUBMENU_OPEN_JS, expect_open):
+                items = await self._ev(MENU_JS, index)
+                if items and {m["text"] for m in items} != set(not_these):
+                    return items
             await asyncio.sleep(0.05)
         raise UiError("the model menu did not open")
+
+    async def _open_submenu(self, title: str, not_these=()) -> list:
+        """Open a provider's models (Claude, GPT ...: the 2nd menu).  The cursor hovers the entry; a hover that does not
+        take (busy or hidden tab, menu still settling - measured on the VDI: never within 20 s) is followed by the
+        keyboard route, focus + Right arrow, which opens it at once and never closes an open one; repeated every
+        MENU_RETRY_SECONDS within op_timeout.  Unlike a hover, the keyboard leaves another provider's models open (they
+        would be read instead): Left arrow inside them closes them first."""
+        item = self.page.locator("[role=menuitem][aria-haspopup]", has_text=title).first
+        deadline = time.monotonic() + self.cfg.op_timeout
+        try:
+            await self.cursor.hover(item, timeout=5000)
+        except Exception as exc:
+            if is_loss(exc):
+                raise
+        while True:
+            try:
+                return await self._menu(1, title, not_these, seconds=max(0.05, min(MENU_RETRY_SECONDS, deadline - time.monotonic())))
+            except UiError:
+                if time.monotonic() >= deadline:
+                    raise
+            menus = self.page.locator("[role=menu]")
+            for _ in range(3):
+                if await menus.count() < 2:
+                    break
+                await menus.last.locator("[role=menuitem],[role=menuitemradio]").first.focus(timeout=5000)
+                await self.page.keyboard.press("ArrowLeft")
+                await asyncio.sleep(0.1)
+            await item.focus(timeout=5000)
+            await self.page.keyboard.press("ArrowRight")
 
     async def _open_model_menu(self, switcher) -> list:
         """Click the model button until its menu shows (items of the top menu).  A tab that just became ready can show
@@ -2343,8 +2372,7 @@ class CopilotTab:
         found = [{"group": "Modes", "label": m["title"], "text": m["text"], "disabled": m["disabled"]} for m in top if not m["popup"]]
         previous = ()
         for provider in [m for m in top if m["popup"]]:
-            await self.cursor.hover(self.page.locator("[role=menuitem][aria-haspopup]", has_text=provider["title"]).first)
-            models = await self._menu(1, provider["title"], previous)
+            models = await self._open_submenu(provider["title"], previous)
             previous = {m["text"] for m in models}
             found += [{"group": provider["title"], "label": m["text"], "text": m["text"], "disabled": m["disabled"]} for m in models]
         await self._close_menus()
@@ -2375,8 +2403,7 @@ class CopilotTab:
         await self._open_model_menu(switcher)
         index = 0
         if entry["group"] != "Modes":
-            await self.cursor.hover(self.page.locator("[role=menuitem][aria-haspopup]", has_text=entry["group"]).first)
-            await self._menu(1, entry["group"])
+            await self._open_submenu(entry["group"])
             index = 1
         pattern = re.compile("^" + re.escape(entry["text"]) + "$")
         item = self.page.locator("[role=menu]").nth(index).locator("[role=menuitem],[role=menuitemradio]", has_text=pattern).first
@@ -3508,6 +3535,7 @@ class Runner:
                     try:
                         async with self.fg_lock:                  # the sender owns the front tab for the whole attempt
                             outcome = await self.attempt(case, prep, n, route, nxt)
+                        reason = ""                               # an earlier failed attempt is not this outcome's reason
                         break
                     except AttemptFailed as exc:
                         reason = self.redact(str(exc))
@@ -4371,6 +4399,9 @@ async def prepare_session(runner, browser, cfg, log, todo, asking=None):
     log("session", note=f"{len(tabs)} tab(s) ready" + (f", model: {runner.model['label']}" if runner.model else ""))
 
 
+DONE_STATES = ("submitted", "skipped_already_sent", "result_correct", "result_incorrect", "result_inconclusive")
+
+
 def summarise(ctx, journal, cases, listed, results):
     rows, counts = [], collections.Counter()
     for c in cases:
@@ -4379,12 +4410,14 @@ def summarise(ctx, journal, cases, listed, results):
         reason = rec.get("reason", c.blocked)
         if c.key in results:  # this run's outcome wins over anything older in the journal
             state, reason = results[c.key]
+        if state in ("submitted", "skipped_already_sent"):
+            reason = ""        # an earlier attempt's error (kept in the journal) is not the reason for a success
         counts[state] += 1
         rows.append({"case": c.alias, "state": state, "reason": ctx.red(reason)})
     summary = {"finished": now(), "counts": dict(counts), "cases": rows}
     print("\nSUMMARY  " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
     for r in rows:
-        if r["state"] not in ("submitted", "skipped_already_sent", "result_correct", "result_incorrect", "result_inconclusive"):
+        if r["state"] not in DONE_STATES:
             print(f"  {r['case']}  {r['state']}  {r['reason']}")
     try:
         write_atomic(ctx.rt.logs / f"summary-{datetime.datetime.now():%Y%m%d-%H%M%S}.json", json.dumps(summary, indent=1))

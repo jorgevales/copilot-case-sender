@@ -724,7 +724,7 @@ def test_partial_upload_refreshes_the_same_tab_then_retries_sequentially(env):
     env.make_case(1)
     cases, _, _ = env.cases()
     results = run(env.runner().run(collections.deque(cases)))
-    assert results[cases[0].key][0] == "submitted"
+    assert results[cases[0].key] == ("submitted", "")                         # attempt 1's error is not the success's reason
     routes = [c[2] for c in env.world.attach_calls]
     assert routes == ["bulk", "sequential"] and env.world.opened == 1          # whole plan re-sent only after a refresh to a NEW chat
     tab = list(env.world.tabs.values())[0]
@@ -1870,6 +1870,44 @@ def test_a_model_button_that_ignores_the_first_click_is_clicked_again_not_waited
     assert items and clicks["n"] == 2 and time.monotonic() - t0 < 2       # second click opened it, no long wait
 
 
+def test_a_provider_submenu_that_ignores_the_hover_is_opened_with_the_keyboard_not_waited_on_for_20_s(monkeypatch):
+    """VDI 2026-10-29: hovering 'Claude' never opened its models; select_model timed out after 20 s."""
+    monkeypatch.setattr(S, "MENU_RETRY_SECONDS", 0.1)
+    cfg = types.SimpleNamespace(op_timeout=5)
+    page = CursorPage()
+    keys, focused, hovers = [], [], []
+
+    class Item:
+        async def focus(self, **kw):
+            focused.append(1)
+
+        async def hover(self, **kw):
+            hovers.append(1)
+
+    class Keyboard:
+        async def press(self, key):
+            keys.append(key)
+
+    async def one_menu():
+        return 1                                    # only the top menu is open: nothing to close first
+    page.locator = lambda *a, **k: types.SimpleNamespace(first=Item(), count=one_menu)
+    page.keyboard = Keyboard()
+    real = page.evaluate
+
+    async def evaluate(script, arg=None):
+        if script is S.SUBMENU_OPEN_JS:
+            return "ArrowRight" in keys
+        if script is S.MENU_JS:
+            return [{"text": "Claude Opus", "title": "Claude Opus", "popup": "", "disabled": False}]
+        return await real(script, arg)
+    page.evaluate = evaluate
+    tab = S.CopilotTab(page, cfg, FakeStop())
+    tab.cursor = S.VisualCursor()
+    t0 = time.monotonic()
+    items = run(tab._open_submenu("Claude"))
+    assert items[0]["text"] == "Claude Opus" and keys == ["ArrowRight"] and focused and time.monotonic() - t0 < 1
+
+
 def test_the_http_tour_visits_every_tab_in_a_fixed_order_even_though_edge_lists_the_last_active_first(env, monkeypatch):
     monkeypatch.setattr(S, "VISIT_SECONDS", 0.01)
     port = env.cfg.cdp_port
@@ -2027,3 +2065,32 @@ def test_the_local_driver_copy_is_used_only_while_it_matches_the_original_on_s(e
     time.sleep(0.01)
     (src / "package" / "lib" / "a.js").write_text("a2", "utf-8")    # driver on S: updated
     assert cache.ready() is False                                    # outdated copy is never used
+
+
+def test_the_first_driver_copy_passes_the_write_guard_and_nothing_else_outside_approved_storage_does(env, monkeypatch):
+    """VDI 2026-10-29: the copy failed with StorageError - the guard blocked creating %LOCALAPPDATA%\\CopilotCaseSender."""
+    if os.name != "nt":
+        pytest.skip("Windows only")
+    src = env.base / "deps-driver"
+    (src / "package").mkdir(parents=True)
+    (src / "node.exe").write_bytes(b"node" * 1000)
+    (src / "package" / "cli.js").write_text("cli", "utf-8")
+    approved, local = env.base / "approved", env.base / "localappdata"   # LOCALAPPDATA exists, our folders do not
+    approved.mkdir()
+    local.mkdir()
+    root = local / "CopilotCaseSender" / "playwright-driver"
+    notes = []
+    cache = S.DriverCache(lambda phase, alias="", **f: notes.append(f.get("note", "")))
+    cache.src, cache.root = src, root / "1.64.1"
+    policy = S.PathPolicy(str(approved), mapper=lambda p: None)
+    S.WRITE_GUARD.update(roots=policy.approved, policy=policy, extra=[os.path.normcase(os.path.abspath(root))])
+    try:
+        cache.refresh()
+        assert "copied" in notes[-1], notes
+        with pytest.raises(S.StorageError):
+            (local / "CopilotCaseSender" / "other.txt").write_text("x", "utf-8")   # only the driver folder itself
+        with pytest.raises(S.StorageError):
+            (local / "elsewhere").mkdir()
+    finally:
+        S.WRITE_GUARD.update(roots=None, extra=[])
+    assert cache.ready() is True
