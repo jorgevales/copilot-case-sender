@@ -1147,6 +1147,7 @@ def load_playwright():
 # 8. BROWSER: Edge + CDP, and the Copilot page adapter
 # --------------------------------------------------------------------------------------------
 
+BLANK_PAGES = ("edge://newtab", "chrome://newtab", "about:newtab", "chrome-search://", "edge://new-tab-page")
 LOSS_MARKERS = ("target closed", "has been closed", "connection closed", "browser has been closed",
                 "disconnected", "target page, context or browser", "session closed", "websocket")
 
@@ -1238,6 +1239,7 @@ class EdgeBrowser:
         self.generation = 0
         self.api = None
         self.launched = self.attach_logged = False     # launched: this run started Edge itself (else we joined an open one)
+        self.tabs_prepared, self.loading = False, []    # prepare_tabs ran (its tabs may still be loading: never open more)
 
     @property
     def reused(self) -> bool:
@@ -1317,8 +1319,14 @@ class EdgeBrowser:
 
     async def connect(self, launch: bool = True):
         budget_end = time.monotonic() + self.cfg.reconnect_budget_seconds
-        last = "no attempt"
-        for timeout in self.cfg.handshake_timeouts:
+        last, t0 = "no attempt", time.monotonic()
+        ladder = list(self.cfg.handshake_timeouts)
+        memo = self.rt.state / "handshake-seconds.txt"
+        try:                  # start at the limit that worked last time: the short ones only waste time on a slow machine
+            ladder = [t for t in ladder if t >= float(memo.read_text().strip())] or ladder[-1:]
+        except (OSError, ValueError):
+            pass
+        for timeout in ladder:
             self.stop.check()
             if time.monotonic() > budget_end:
                 break
@@ -1340,6 +1348,13 @@ class EdgeBrowser:
                     await self._drop()
                     continue
                 self.generation += 1
+                took = time.monotonic() - t0
+                self.log("connect", note=f"connected to Edge in {took:.1f}s (handshake limit {timeout}s)")
+                if took > 1:        # a quick connect needs no memo; a slow one teaches the next start where to begin
+                    try:
+                        write_atomic(memo, str(timeout))
+                    except PersistenceError:
+                        pass
                 return
             self.log("connect", note=f"retrying: {last}")
         raise RecoveryRequired(f"could not connect within the reconnect budget (last: {last})")
@@ -1356,8 +1371,10 @@ class EdgeBrowser:
         if not self.lock.fh:
             self.lock.acquire()
         if not self.pw:
+            t0 = time.monotonic()
             self.api = load_playwright()
             self.pw = await self.api[0]().start()
+            self.log("connect", note=f"Playwright driver started in {time.monotonic() - t0:.1f}s")
         await self.connect(launch)
 
     async def reconnect(self):
@@ -1391,6 +1408,22 @@ class EdgeBrowser:
             await t.activate()
         return tabs
 
+    async def prepare_tabs(self, count: int) -> list:
+        """Exactly `count` Copilot tabs, in every scenario (Edge launched or joined): Copilot tabs already open are used
+        first, then blank new-tab pages are turned into Copilot tabs, then new tabs are opened.  Tabs showing any other
+        site and Copilot tabs beyond `count` are never touched.  Loading starts for all at once and is NOT awaited."""
+        origin = "{0.scheme}://{0.netloc}".format(urlparse(self.cfg.copilot_url))
+        pages = list(self.context.pages)
+        copilot = [p for p in pages if p.url.startswith(origin)][:count]
+        blank = [p for p in pages if p.url in ("", "about:blank") or p.url.startswith(BLANK_PAGES)][:count - len(copilot)]
+        new = [await self.context.new_page() for _ in range(count - len(copilot) - len(blank))]
+        tabs = [CopilotTab(p, self.cfg, self.stop) for p in copilot + blank + new]
+        self.loading = [asyncio.ensure_future(quiet(t.navigate())) for t in tabs[len(copilot):]]
+        self.tabs_prepared = True
+        if blank or new:
+            self.log("session", note=f"{len(copilot)} Copilot tab(s) already open, {len(blank)} blank tab(s) reused, {len(new)} opened")
+        return tabs
+
     async def open_url_tab(self, url: str):
         """Read-only tab on a saved conversation (collecting an answer after a restart)."""
         page = await self.context.new_page()
@@ -1407,7 +1440,7 @@ class EdgeBrowser:
         seen = bool(tabs)
         flags = await asyncio.gather(*(t.is_ready() for t in tabs))      # all tabs checked at once, order kept
         ready = [t for t, ok in zip(tabs, flags) if ok]
-        if not seen:  # nothing on Copilot yet (e.g. all tabs closed): open one so sign-in can be seen
+        if not seen and not self.tabs_prepared:  # nothing on Copilot yet (e.g. all tabs closed): open one so sign-in can be seen
             page = await self.context.new_page()
             await page.goto(self.cfg.copilot_url, wait_until="domcontentloaded", timeout=60000)
         return ready
@@ -2474,10 +2507,8 @@ class Runner:
             tab = usable or self.pool_tab(case.key) or await self.recycled_tab() or await self.browser.open_tab()
             self.rec(case, "preparing", target_id=tab.target_id, url=await tab.url())
             await tab.foreground()                        # every tab is foregrounded before we work in it
-            pending = getattr(tab, "model_task", None)    # background model selection started right after your choice
-            if pending:
-                await asyncio.gather(pending, return_exceptions=True)
-            fresh, _ = await asyncio.gather(tab.fresh(), tab.ensure_model(self.model))
+            await tab.ensure_model(self.model)            # step 1 of this tab's send: the run's model, then files, message, Send
+            fresh = await tab.fresh()
             if not fresh:
                 raise AttemptFailed("conversation was not fresh")
             for recovery in range(int(self.cfg.upload_recoveries) + 1):
@@ -2497,7 +2528,8 @@ class Runner:
                          note=f"upload error - fresh chat in the same tab, attaching again ({recovery + 1}/{self.cfg.upload_recoveries})")
                 await tab.reset()
                 await tab.foreground()
-                fresh, _ = await asyncio.gather(tab.fresh(), tab.ensure_model(self.model))
+                await tab.ensure_model(self.model)
+                fresh = await tab.fresh()
                 if not fresh:
                     raise AttemptFailed("conversation was not fresh")
             await self.pre_send_checks(tab, case, prep.plan)
@@ -3420,16 +3452,38 @@ def write_run_report(ctx, journal, cases, runner, bfacts, started, start_seq, co
         return None
 
 
-async def run_async(ctx, journal, ledger, listed, cases, todo, instr, message) -> int:
+def scan_queue(ctx, journal, listed):
+    """Case discovery -> (cases, todo, instr).  Runs in a thread while Edge starts and the cursor question is open."""
+    cfg = ctx.cfg
+    cases, other, excluded = discover(cfg, ctx.policy, local_salt(ctx.rt), ctx.red)
+    instr = [doc_of(ctx.policy.check(cfg.instructions_path, "review guidance"))]
+    if cfg.completion_mode == "json_result":
+        instr.append(doc_of(ctx.policy.check(cfg.result_contract_path, "result contract")))
+    todo, done = classify([c for c in cases if not c.blocked], ctx, journal, listed)
+    for c in cases:
+        if c.blocked:
+            journal.record(c.key, "preflight_blocked", alias=c.alias, instruction_id=c.id, reason=c.blocked)
+    ctx.log("queue", note=f"{len(todo)} instruction(s) queued; {len(done)} already sent, {excluded} excluded, "
+                          f"{len(other)} unrecognised, {sum(1 for c in cases if c.blocked)} blocked")
+    return cases, todo, instr
+
+
+async def run_async(ctx, journal, ledger, listed, message) -> int:
     cfg, log = ctx.cfg, ctx.log
     stop = Stopper()
     browser = EdgeBrowser(cfg, ctx.rt, ctx.policy, log, stop)
-    runner = Runner(cfg, ctx.rt, ctx.policy, journal, ledger, log, stop, browser, ctx.red, message, instr)
+    runner = Runner(cfg, ctx.rt, ctx.policy, journal, ledger, log, stop, browser, ctx.red, message, [])
     runner.prompt_version = prompt_version(cfg, message)
-    by_key = {c.key: c for c in cases}
+    cases = []
     code, results, crash, started, start_seq, bfacts = 0, {}, None, time.monotonic(), journal.seq, None
+    intents = any(r.get("state") == "send_intent" for r in journal.cases.values())
+    # Everything that does not depend on the queue starts at once: the cursor question, Edge (launch or join) + connection.
+    asking = ask_cursor(cfg)
+    early = None if intents else asyncio.ensure_future(browser.start(launch=True))   # reconcile must look before any launch
     try:
-        if any(r.get("state") == "send_intent" for r in journal.cases.values()):
+        cases, todo, runner.instr = await asyncio.to_thread(scan_queue, ctx, journal, listed)
+        by_key = {c.key: c for c in cases}
+        if intents:
             try:  # look at the existing browser only; never start a new one just to reconcile
                 await browser.start(launch=False)
             except ConnectionLost:
@@ -3437,15 +3491,13 @@ async def run_async(ctx, journal, ledger, listed, cases, todo, instr, message) -
             await reconcile_open_intents(runner, journal, by_key, log)
         resumable = cfg.completion_mode == "json_result" and any(
             r.get("contract") and r.get("state") in ("submitted", "fixup_sent") and k in by_key for k, r in journal.cases.items())
-        asking = ask_cursor(cfg) if todo else None     # the question is answered in a thread while Edge starts/connects below
-        if (todo or resumable) and browser.context is None:
+        if early:
+            await early
+        elif (todo or resumable) and browser.context is None:
             await browser.start(launch=True)
         todo = [c for c in todo if runner.sent_ids.get(c.id) is None]
-        if asking:
-            CopilotTab.cursor = VisualCursor(cfg.visual_cursor_options, await asking)
-            log("session", note="moving cursor " + ("on" if CopilotTab.cursor.enabled else "off"))
         if todo:
-            await prepare_session(runner, browser, cfg, log, todo)
+            await prepare_session(runner, browser, cfg, log, todo, asking)
         if resumable:
             await runner.resume(by_key)
         if todo or runner.pending:
@@ -3465,6 +3517,9 @@ async def run_async(ctx, journal, ledger, listed, cases, todo, instr, message) -
         code = code or 1
         raise
     finally:
+        if early and not early.done():                  # failed before the connection finished: never leave it running
+            early.cancel()
+            await asyncio.gather(early, return_exceptions=True)
         await CopilotTab.cursor.teardown()              # drawings removed from every tab; Edge itself stays open
         try:
             bfacts = await asyncio.wait_for(browser_facts(browser, runner), 20)   # before the connection is closed
@@ -3514,45 +3569,78 @@ async def discover_models_anywhere(browser, first, redact, log):
         candidates = [first] + [t for t in await browser.find_ready_tabs() if t.page is not first.page]   # others may be ready now
 
 
-async def existing_tabs(browser, first, wanted, log) -> list:
-    """Up to `wanted` more signed-in Copilot tabs that were already open in a joined Edge (no tab is opened)."""
-    if wanted < 1 or not browser.reused:
-        return []
-    chosen = [t for t in await browser.find_ready_tabs() if t.page is not first.page][:wanted]
-
-    async def take(tab):
-        try:
-            await tab.adopt()           # same tab, fresh chat if it was not already one
-            return tab
-        except SenderError:
-            return None
-    tabs = [t for t in await asyncio.gather(*(take(t) for t in chosen)) if t]      # in parallel, order kept
-    log("session", note=f"using {len(tabs) + 1} Copilot tab(s) that were already open")
-    return tabs
+READY_RELOAD_SECONDS, READY_RELOADS = 30, 3      # a tab not ready is reloaded every 30 s; after 3 reloads it leaves the run
 
 
-async def prepare_session(runner, browser, cfg, log, todo):
-    """Sign-in -> model list -> (warm-up of up to `warm_tabs` tabs runs while you choose) -> model applied."""
+async def ready_tabs(browser, cfg, tabs, log) -> list:
+    """Wait until EVERY tab shows the composer + model button (no case is sent into a tab still loading or on a sign-in
+    page).  A tab left on a sign-in page is reloaded at once (you signed in elsewhere); a tab still not ready is reloaded
+    every READY_RELOAD_SECONDS, and after READY_RELOADS reloads it is dropped with a warning.  Order is kept."""
+    origin = "{0.scheme}://{0.netloc}".format(urlparse(cfg.copilot_url))
+
+    async def one(n, tab):
+        reloads, since, kicked = 0, time.monotonic(), False
+        while True:
+            browser.stop.check()
+            if await tab.is_ready():
+                try:
+                    await tab.adopt()            # fresh chat, exact target id
+                    return tab
+                except SenderError:
+                    pass
+            if not kicked:                       # sign-in finished in another tab: a tab parked on the sign-in page reloads once
+                kicked = True
+                try:
+                    url = await tab.url()
+                except Exception:
+                    url = ""
+                if url and not url.startswith(origin) and not url.startswith(("about:", "edge:", "chrome:")):
+                    await quiet(tab.navigate())
+                    since = time.monotonic()
+            if time.monotonic() - since >= READY_RELOAD_SECONDS:
+                if reloads >= READY_RELOADS:
+                    log("WARNING", note=f"tab {n} never became ready after {READY_RELOADS} reloads - left out of this run")
+                    return None
+                reloads += 1
+                log("session", note=f"tab {n} is not ready yet - reloading it ({reloads}/{READY_RELOADS})")
+                await quiet(tab.navigate())
+                since = time.monotonic()
+            await browser.stop.sleep(0.5)
+    done = await asyncio.gather(*(one(n, t) for n, t in enumerate(tabs, 2)))
+    return [t for t in done if t]
+
+
+async def quiet(coro):
+    """A best-effort page action whose failure is handled by the caller's next check."""
+    try:
+        await coro
+    except (SenderError, asyncio.TimeoutError):
+        pass
+
+
+async def prepare_session(runner, browser, cfg, log, todo, asking=None):
+    """All needed tabs open at once -> sign-in -> model list (asked as soon as ONE tab shows it) while every other tab
+    gets ready -> nothing is sent until all tabs are ready.  The model is set in each tab as part of its own send."""
+    count = max(1, min(int(cfg.warm_tabs), len(todo)))
+    tabs = await browser.prepare_tabs(count)       # existing Copilot tabs + blank tabs + new ones, all loading together
+    if asking:                                     # answered at launch; only clicks in a tab need it
+        CopilotTab.cursor = VisualCursor(cfg.visual_cursor_options, await asking)
+        log("session", note="moving cursor " + ("on" if CopilotTab.cursor.enabled else "off"))
     stdin = StdinLines()
     first = await wait_for_login(browser, stdin, log)
     log("login", note="Copilot is signed in")
-    first, entries = await discover_models_anywhere(browser, first, runner.redact, log)
-    count = max(1, min(int(cfg.warm_tabs), len(todo)))
-    # Joined an already-open Edge: its prepared tabs are the pool, nothing is opened.  Otherwise warm tabs while you choose.
-    # Either way the other tabs are prepared while you choose the model (choosing never blocks the preparation).
-    warm = asyncio.ensure_future(browser.open_tabs(count - 1) if not browser.reused else existing_tabs(browser, first, count - 1, log)) \
-        if count > 1 else None
+    gate = asyncio.ensure_future(ready_tabs(browser, cfg, [t for t in tabs if t.page is not first.page][:count - 1], log))
     try:
+        first, entries = await discover_models_anywhere(browser, first, runner.redact, log)
         runner.model = await choose_model(entries, pick_default(entries), cfg, stdin, log)
-        tabs = [first] + (await warm if warm else [])
+        others = [t for t in await gate if t.page is not first.page]
     except BaseException:
-        if warm:
-            warm.cancel()
+        gate.cancel()
+        await asyncio.gather(gate, return_exceptions=True)
         raise
+    tabs = [first] + others[:count - 1]
     runner.pool.extend((t, browser.generation) for t in tabs)
     await CopilotTab.cursor.switch(first.page, first.page.bring_to_front)
-    for tab in tabs[1:]:      # every other tab applies the chosen model in the background, in parallel
-        tab.model_task = asyncio.ensure_future(tab.ensure_model(runner.model))
     log("session", note=f"{len(tabs)} tab(s) ready" + (f", model: {runner.model['label']}" if runner.model else ""))
 
 
@@ -3628,21 +3716,11 @@ def run_command(args) -> int:
     try:
         ledger = Ledger(ctx.rt.ledger, cfg.persist_retries)
         listed = sync_ledger(journal, ledger, ctx.log)
-        cases, other, excluded = discover(cfg, ctx.policy, local_salt(ctx.rt), ctx.red)
-        instr = [doc_of(ctx.policy.check(cfg.instructions_path, "review guidance"))]
-        if cfg.completion_mode == "json_result":
-            instr.append(doc_of(ctx.policy.check(cfg.result_contract_path, "result contract")))
-        todo, done = classify([c for c in cases if not c.blocked], ctx, journal, listed)
-        for c in cases:
-            if c.blocked:
-                journal.record(c.key, "preflight_blocked", alias=c.alias, instruction_id=c.id, reason=c.blocked)
-        ctx.log("queue", note=f"{len(todo)} instruction(s) queued; {len(done)} already sent, {excluded} excluded, "
-                              f"{len(other)} unrecognised, {sum(1 for c in cases if c.blocked)} blocked")
-        return asyncio.run(run_async(ctx, journal, ledger, listed, cases, todo, instr, message))
+        return asyncio.run(run_async(ctx, journal, ledger, listed, message))
     except BaseException as exc:
         if not getattr(ctx, "reported", None):       # failed before/outside the run loop: still leave a report
             ctx.log.trace(exc, "startup")
-            path = write_run_report(ctx, journal, locals().get("cases", []), None, None, time.monotonic(), journal.seq, 1, exc, sys.argv[1:])
+            path = write_run_report(ctx, journal, [], None, None, time.monotonic(), journal.seq, 1, exc, sys.argv[1:])
             if path:
                 print(f"Run report (redacted, for review): {path}", flush=True)
         raise

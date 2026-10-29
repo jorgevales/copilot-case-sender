@@ -152,6 +152,7 @@ class World:
         self.events = []                                  # ordered ("foreground"|"send", tab id): proves what came first
         self.generation, self.reconnects, self.reconnect_fail = 1, 0, False
         self.opened = 0
+        self.reloads = []                                 # tab ids navigated/reloaded while getting ready
         self.upload_errors = 0                            # how many page snapshots still show Copilot's upload error
 
 
@@ -184,6 +185,16 @@ class FakeTab:
 
     async def adopt(self):
         pass
+
+    async def is_ready(self):                    # "ready_after": not ready for this many checks (None = never ready)
+        left = self.b.get("ready_after", 0)
+        if left is None:
+            return False
+        self.b["ready_after"] = left - 1
+        return left <= 0
+
+    async def navigate(self):
+        self.w.reloads.append(self.target_id)
 
     async def foreground(self):
         self._alive()
@@ -327,9 +338,16 @@ class FakeBrowser:
     async def open_tabs(self, count):
         return [await self.open_tab() for _ in range(count)]
 
-    async def find_ready_tab(self):
+    async def prepare_tabs(self, count):            # the already-open tabs first, then new ones up to `count`
+        have = list(getattr(self, "already_open", []))[:count]
+        self.prepared = have + [await self.open_tab() for _ in range(count - len(have))]
+        return self.prepared
+
+    async def find_ready_tab(self):                 # sign-in shows up in one of the prepared tabs (like a real page)
         self.ready_after -= 1
-        return FakeTab(self.w, {}) if self.ready_after <= 0 else None
+        if self.ready_after > 0:
+            return None
+        return self.prepared[0] if getattr(self, "prepared", None) else FakeTab(self.w, {})
 
     reused = False
 
@@ -965,26 +983,49 @@ def test_an_edge_already_open_on_the_port_is_joined_even_if_another_process_star
     assert run(b.ensure_running(launch=False)) is payload and b.reused and not b.launched
 
 
-def test_prepared_tabs_of_a_joined_edge_are_the_pool_and_no_tab_is_opened(env):
-    for n in range(1, 4):
+def test_a_joined_edge_with_some_copilot_tabs_is_topped_up_to_the_needed_count_before_the_run(env):
+    for n in range(1, 5):
         env.make_case(n)
     cases, _, _ = env.cases()
     r = env.runner()
     b = r.browser
     b.reused = True
-    ready = [FakeTab(env.world, {}) for _ in range(3)]
-
-    async def ready_tabs():
-        return list(ready)
+    ready = [FakeTab(env.world, {}) for _ in range(2)]          # 2 Copilot tabs already open, 4 cases to send
+    b.already_open = ready
     b.find_ready_tab = lambda: asyncio.sleep(0, ready[0])
-    b.find_ready_tabs = ready_tabs
     cfg = types.SimpleNamespace(**{**vars(env.cfg), "warm_tabs": 8, "requested_model": "GPT-6.1 Sol"})
 
     async def go():
         await S.prepare_session(r, b, cfg, env.log, cases)
         return [t for t, _ in r.pool]
     pool = run(go())
-    assert [t.target_id for t in pool] == [t.target_id for t in ready] and env.world.opened == 0
+    assert [t.target_id for t in pool[:2]] == [t.target_id for t in ready] and len(pool) == 4 and env.world.opened == 2
+
+
+def test_the_cursor_answer_given_at_launch_is_applied_before_any_tab_is_worked_in(env, monkeypatch):
+    env.make_case(1)
+    cases, _, _ = env.cases()
+    r = env.runner()
+    monkeypatch.setattr(S.CopilotTab, "cursor", S.VisualCursor())
+    cfg = types.SimpleNamespace(**{**vars(env.cfg), "requested_model": "GPT-6.1 Sol"})
+
+    async def go():
+        asking = asyncio.get_running_loop().create_future()
+        asking.set_result(False)                                   # the user typed N while Edge was starting
+        await S.prepare_session(r, r.browser, cfg, env.log, cases, asking)
+        return S.CopilotTab.cursor
+    cursor = run(go())
+    assert cursor is not None and cursor.enabled is False and len(r.pool) == 1
+
+
+def test_a_tab_that_never_gets_ready_is_reloaded_then_left_out_and_never_used(env, monkeypatch):
+    monkeypatch.setattr(S, "READY_RELOAD_SECONDS", 0)
+    b = FakeBrowser(env.world)
+    good, slow, stuck = FakeTab(env.world, {}), FakeTab(env.world, {"ready_after": 3}), FakeTab(env.world, {"ready_after": None})
+    tabs = run(S.ready_tabs(b, env.cfg, [good, slow, stuck], env.log))
+    assert tabs == [good, slow]                                   # order kept; the stuck tab is out of the run
+    assert env.world.reloads.count(stuck.target_id) == S.READY_RELOADS + 1      # 1 sign-in-page reload + the timed reloads
+    assert good.target_id not in env.world.reloads                               # a ready tab is never reloaded
 
 
 def test_endpoint_validation_rejects_foreign_hosts_and_ports():
@@ -1181,7 +1222,7 @@ def test_enter_is_only_a_fallback_and_missing_terminal_input_is_ignored(env):
     assert calls["n"] == 4
 
 
-def test_session_warmup_fills_the_pool_and_applies_the_model_in_the_background(env):
+def test_session_opens_every_needed_tab_up_front_and_each_tab_sets_the_model_when_it_sends(env):
     for n in range(1, 4):
         env.make_case(n)
     cases, _, _ = env.cases()
@@ -1193,7 +1234,7 @@ def test_session_warmup_fills_the_pool_and_applies_the_model_in_the_background(e
         assert r.model["label"] == "GPT-6.1 Sol"
         return await r.run(collections.deque(cases))
     results = run(go())
-    assert [v[0] for v in results.values()] == ["submitted"] * 3 and env.world.opened == 2   # first + 2 warmed, none opened ad hoc
+    assert [v[0] for v in results.values()] == ["submitted"] * 3 and env.world.opened == 3   # all 3 opened up front, none ad hoc
     assert all(t.models and t.models[0]["label"] == "GPT-6.1 Sol" for t in env.world.tabs.values())
 
 

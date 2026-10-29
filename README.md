@@ -31,6 +31,13 @@ Queue = immediate child folders of `CASES_ROOT` named `<32 hex instruction ID>[ 
 by a safe alias (`other-xxxxxx`); two folders with the same ID are both blocked and reported, never merged.
 
 ### Start of a run (once)
+0. **Everything starts at launch, in parallel:** the moving-cursor question, the queue scan (ends with the `queue`
+   line) and Edge (joined if already open on `cdp_port`, otherwise launched) plus the connection. As soon as the case
+   count is known, **all needed tabs are prepared at once** – `min(warm_tabs, cases to send)`, default up to 8, in
+   every scenario (Edge launched or joined): Copilot tabs already open are used first, blank new-tab pages are turned
+   into Copilot tabs, then new tabs are opened. Tabs showing any other site, and Copilot tabs beyond the needed number,
+   are never touched. A slow connection is remembered (`state\handshake-seconds.txt`) so the next start skips the
+   handshake limits that were too short.
 1. **Sign-in detection.** Edge opens; the tool keeps checking (every 0.25 s, no overall limit) until a Copilot tab shows
    both the chat composer and the model button, then continues **by itself**. If you are already signed in nothing is
    asked. After 1 s of waiting it tells you to sign in in the Edge window; pressing **Enter** in the terminal is only a
@@ -43,9 +50,12 @@ by a safe alias (`other-xxxxxx`); two folders with the same ID are both blocked 
 3. **You choose** by number, **Enter = default = the last entry listed under GPT** (no version parsing). Setting
    `requested_model` skips the question. `model_prompt_seconds` (default 0 = wait) can make an unattended run continue
    with the default.
-4. **Warm-up in parallel with step 3:** up to `warm_tabs` (default 8, never more than the cases to send) Copilot tabs are
-   opened at once and then walked through one by one like a person would (brought forward, pointer over the composer,
-   a short pause) so Copilot wakes each one. After your answer every tab applies the chosen model in the background.
+4. **Every tab ready before the first send (in parallel with steps 2-3):** the model is asked as soon as ONE tab shows
+   the list, but nothing is sent until every prepared tab shows the composer and the model button. A tab left on a
+   sign-in page is reloaded once as soon as sign-in is detected; a tab still not ready is reloaded every 30 s, and after
+   3 reloads it is left out of the run with a warning (it is never sent into).
+5. **The model is set per case, not in advance:** each tab selects the chosen model as the first step of its own send
+   (model -> files -> message -> Send), then the next tab does the same.
 
 ### Per case, strictly one at a time
 **Foreground rule.** Every tab is brought to the front (and confirmed visible) when a case starts working in it, again
@@ -229,7 +239,7 @@ or the copy bundled in the package is used – `check` shows which.
 
 Dedicated Edge profile under `RUNTIME_ROOT\profile` + `chromium.connect_over_cdp` (no fresh Chromium). One
 controller lock per profile+port; loopback only (`--remote-debugging-address=127.0.0.1`, no wildcard origins); the
-an Edge that is **already open on the configured `cdp_port`** (opened by this tool earlier or by any other process) is joined as it is: its signed-in Copilot tabs are used directly (each reset to a fresh chat if it was not one), the model list is read from them right away, and **no extra tab is opened** (the pool is just the prepared tabs, at most `warm_tabs`/cases). Only when nothing is listening does the tool start its own Edge on the dedicated profile and warm up tabs itself. Other debug sessions on other ports are never touched, so keep `cdp_port` different from them.
+an Edge that is **already open on the configured `cdp_port`** (opened by this tool earlier or by any other process) is joined as it is: its signed-in Copilot tabs are used directly (each reset to a fresh chat if it was not one), the model list is read from them right away, and the pool is **topped up** to `min(warm_tabs, cases)` (blank tabs reused first, then new tabs; other sites never touched). Only when nothing is listening does the tool start its own Edge on the dedicated profile and prepares the same number of tabs. Other debug sessions on other ports are never touched, so keep `cdp_port` different from them.
 Handshake escalation `3, 6, 12, 20, 30 s`, browser WebSocket first then HTTP, **sequentially**, discovery refreshed
 each round, every attempt owned and cancelled/awaited. A bounded `reconnect_budget_seconds` ends in a durable
 `recovery_required` run state (exit code 4) instead of looping. Ctrl+C stops at the next safe point (second press
