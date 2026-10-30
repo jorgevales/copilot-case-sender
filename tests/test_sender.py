@@ -515,7 +515,7 @@ def test_locked_state_file_does_not_lose_transitions(env, monkeypatch):
     real_open, fails = open, {"n": 2}
 
     def flaky(path, mode="r", *a, **k):
-        if str(path).endswith("journal.jsonl") and "a" in mode and fails["n"] > 0:
+        if str(path).endswith("journal.txt") and "a" in mode and fails["n"] > 0:
             fails["n"] -= 1
             raise PermissionError("locked")
         return real_open(path, mode, *a, **k)
@@ -2122,3 +2122,50 @@ def test_a_blocked_or_hung_local_driver_copy_falls_back_to_s_and_says_so(monkeyp
         pw, where, _ = run(S.start_driver(api_for(first), log, False, refresh=False))
         assert pw == "pw" and used == ["local", "s"] and where.startswith("S:")
         assert why in notes[-1] and "from S: instead" in notes[-1]
+
+
+def test_the_driver_copy_never_goes_to_the_system_drive_and_a_short_drive_leaves_nothing_behind(env, monkeypatch):
+    """VDI 2026-10-30: the copy to the system drive hit the per-user quota ([Errno 28] No space left on device)."""
+    if os.name != "nt":
+        pytest.skip("Windows only")
+    system = os.environ.get("SystemDrive", "C:")
+    assert S.drive_class(system + r"\anything") == "system" and S.drive_class(r"\\server\share\x") == "network"
+    cfg = types.SimpleNamespace(**{**vars(env.cfg), "driver_cache_dir": system + "\fast"})
+    assert any("not the system drive" in p for p in S.validate_config(cfg)[1])
+    assert S.DRIVER_CACHE_ROOT is None or S.drive_class(S.DRIVER_CACHE_ROOT) == "fast"   # bootstrap never picks C:
+    src = env.base / "deps-driver"
+    (src / "package").mkdir(parents=True)
+    (src / "node.exe").write_bytes(b"node" * 1000)
+    (src / "package" / "cli.js").write_text("cli", "utf-8")
+    notes = []
+    cache = S.DriverCache(lambda phase, alias="", **f: notes.append(f.get("note", "")))
+    cache.src, cache.root = src, env.base / "fast" / "playwright-driver" / "1.64.1"
+    monkeypatch.setattr(S, "free_for_me", lambda path: 10 * 2**20)             # quota: 10 MB left for this user
+    cache.refresh()
+    assert "not enough space" in notes[-1] and not list((env.base / "fast" / "playwright-driver").iterdir())
+    cache.root = None                                                            # no driver_cache_dir: no copy at all
+    cache.refresh()
+    assert cache.ready() is False and len(notes) == 1
+
+
+def test_the_old_driver_copy_on_the_system_drive_is_removed_and_nothing_else(env, monkeypatch):
+    old = env.base / "legacy" / "CopilotCaseSender"
+    (old / "playwright-driver" / ".tmp-1234").mkdir(parents=True)
+    (old / "playwright-driver" / ".tmp-1234" / "node.exe").write_bytes(b"partial")
+    monkeypatch.setattr(S, "LEGACY_DRIVER_ROOT", old)
+    S.clean_legacy_driver_copy()
+    assert not old.exists()
+    (old / "something-else").mkdir(parents=True)                                 # not only ours: left alone
+    S.clean_legacy_driver_copy()
+    assert (old / "something-else").exists()
+
+
+def test_an_old_journal_jsonl_is_still_replayed_so_nothing_already_sent_is_sent_again(env):
+    """The journal moved to journal.txt (attachable to Copilot); a sent case recorded in journal.jsonl must still count."""
+    (env.rt.state / "journal.jsonl").write_text(json.dumps({"seq": 1, "ts": "t", "case": "C1", "state": "submitted"}) + "\n", "utf-8")
+    j = env.journal
+    j.cases, j.seq = {}, 0
+    j.replay()
+    assert j.cases["C1"]["state"] == "submitted"
+    j.record("C2", "planned")
+    assert (env.rt.state / "journal.txt").exists() and "C2" not in (env.rt.state / "journal.jsonl").read_text("utf-8")

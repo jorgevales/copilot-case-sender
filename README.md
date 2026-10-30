@@ -39,13 +39,15 @@ by a safe alias (`other-xxxxxx`); two folders with the same ID are both blocked 
    are never touched. The connection to Edge is a race: one patient attempt starts at once, more join every few
    seconds on the other route, the first to connect wins and is printed (`WINNER: attempt n of m, websocket|http route`);
    that route is remembered (`state\connect-route.txt`) and tried first next time. A slow attempt is never restarted.
-   **Fast driver start:** Playwright's driver (node.exe + package, ~100 MB) is copied once to
-   `%LOCALAPPDATA%\CopilotCaseSender\playwright-driver` - the only thing ever written outside S: - and used only while
-   it matches the original on S: (checked every run, including a checksum). The first run (or after an update) starts
-   from S: and makes the copy in the background; later runs start the driver in seconds instead of ~2 minutes.
-   If the local copy is refused (e.g. a policy blocking programs in AppData) or does not start within 30 s, the log
-   says `playwright_driver_start: local copy ...` and the driver starts from S: instead. `Run.cmd check` prints how
-   long the driver took and where it started from (`local copy` / `S:`).
+   **Fast driver start:** started from S:, Playwright's driver (node.exe + package, ~100 MB) takes 90-135 s on the VDI.
+   **Nothing is ever written to the system drive** (a per-user quota there gave "No space left on device"). Only if
+   `driver_cache_dir` is set to a folder on a *local disk that is not the system drive* is the driver copied there
+   once (space available to you checked first, a failed copy removed at once) and used only while it matches the
+   original on S: (checked every run, including a checksum); later runs then start the driver in seconds. Not set =
+   no copy, the driver starts from S:. A copy left on the system drive by earlier versions is removed at startup.
+   If the copy is refused (e.g. a policy blocking programs there) or does not start within 30 s, the log says
+   `playwright_driver_start: local copy ...` and the driver starts from S: instead. `Run.cmd check` prints how long
+   the driver took and where from, how long `node.exe` alone takes, and which local non-system disks exist.
    `Run.cmd` prints `Starting...` before Python even loads. While the cursor
    question (and later the model question) is on screen **nothing else is printed**: lines made meanwhile appear right
    after your answer. To make tabs load sooner: a launched Edge gets every needed tab on its command line, a joined Edge
@@ -280,7 +282,7 @@ aborts); Edge is never killed, no cookies or profile data are touched.
 
 ## Diagnostics and sharing
 
-Console + `RUNTIME_ROOT\logs\events-*.jsonl` + `summary-*.json` use aliases and labels only; paths, IDs, URLs and
+Console + `RUNTIME_ROOT\logs\events-*.txt` (one JSON event per line, `.txt` so it can be attached to Copilot) + `summary-*.json` use aliases and labels only; paths, IDs, URLs and
 exception text are redacted. Real paths, case names, target IDs and conversation URLs exist **only** in
 `RUNTIME_ROOT\state\` (local). Screenshots/HTML (`diagnostics_capture`, off by default) are sensitive, local-only and
 never part of shareable output.
@@ -334,4 +336,4 @@ tool works, case states, invariants, what to answer), then the outcome and exit 
 memory, disk, screen, time zone, remote-session hints, the script hash, **every setting**, storage facts, browser facts (launched or
 joined, reconnects, tabs with ready/visible state, model chosen), one block per case (attempts, routes, reasons, gaps between steps,
 document counts / sizes / name *shapes*), how the attachment chips looked when names did not match, errors with call frames, the full
-event timeline and the last console lines. It is deliberately **not redacted**: it contains the real paths, instruction IDs and folders, file names, URLs, chip labels, environment variables and full error tracebacks, so it stays on the VDI and the user hands it over. The only things never included are credentials: environment variables whose names look like secrets are hidden, and no cookie, token or `.env` content is read. The console and `events-*.jsonl` logs stay redacted.
+event timeline and the last console lines. It is deliberately **not redacted**: it contains the real paths, instruction IDs and folders, file names, URLs, chip labels, environment variables and full error tracebacks, so it stays on the VDI and the user hands it over. The only things never included are credentials: environment variables whose names look like secrets are hidden, and no cookie, token or `.env` content is read. The console and `events-*.txt` logs stay redacted.

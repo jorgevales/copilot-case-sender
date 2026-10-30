@@ -328,6 +328,8 @@ DEFAULTS = {
     "recursive_documents": False,
     "completion_mode": "json_result",   # "json_result" = collect + validate Copilot's JSON answer; "submission_only" = V1 (send only)
     "node_executable": "", "dependency_directory": "", "approved_root": "", "approved_unc_root": "",
+    "driver_cache_dir": "",           # folder on a LOCAL disk that is NOT the system drive for a fast Playwright driver
+                                      # copy; "" = no copy (the driver starts from S:; nothing is written to C:)
     "max_attachments": 20,            # a reference-program setting, NOT proof of your tenant's limit
     "over_limit_mode": "send_partial",  # more files than the limit: "send_partial" (instructions + first files, loud
                                         # warning, left-out count) or "block" (send nothing for that case)
@@ -359,7 +361,8 @@ DEFAULTS = {
 }
 REQUIRED = ["cases_root", "instructions_path", "base_message_path", "python_executable",
             "edge_executable", "runtime_root"]
-PATH_KEYS = REQUIRED + ["result_contract_path", "node_executable", "dependency_directory", "approved_root", "approved_unc_root"]
+PATH_KEYS = REQUIRED + ["result_contract_path", "node_executable", "dependency_directory", "approved_root", "approved_unc_root",
+                        "driver_cache_dir"]
 HERE = Path(__file__).resolve().parent
 
 
@@ -460,6 +463,10 @@ def setup_command() -> int:
     node = next((str(p) for p in exe_candidates("node") if p.is_file()), "")
     value = ask("Node.js node.exe (optional; Enter = use the copy bundled with Playwright)", cur.get("node_executable") or node, True)
     cur["node_executable"] = str(resolve_file(value, "node.exe") or "") if value else ""
+    fast = fast_drives()
+    value = ask("Folder for a fast Playwright driver copy, on a local disk that is NOT the system drive "
+                f"(local disks found: {', '.join(fast) or 'none'}; Enter = no copy)", cur.get("driver_cache_dir", ""), True)
+    cur["driver_cache_dir"] = value
     detail = ask("Console output: 1 = minimal (queue total, ID being sent, attachments, result), 2 = full detail",
                  "2" if cur.get("console_detail") == "full" else "1")
     cur["console_detail"] = "full" if detail.strip() == "2" else "minimal"
@@ -512,6 +519,8 @@ def validate_config(cfg):
         value = getattr(cfg, key)
         if value and not Path(value).is_file():  # executables are read/execute only: any drive is fine
             problems.append(f"{key} was not found")
+    if getattr(cfg, "driver_cache_dir", "") and (kind := drive_class(cfg.driver_cache_dir)) != "fast":
+        problems.append(f"driver_cache_dir must be on a local disk that is not the system drive (it is: {kind})")
     try:  # runtime must never live inside the case parent (every child folder there is a case)
         if policy.inside(cfg.runtime_root, policy.parts(cfg.cases_root)):
             problems.append("runtime_root must be outside CASES_ROOT")
@@ -634,8 +643,12 @@ def bootstrap_storage(cfg, policy: PathPolicy) -> Runtime:
         raise StorageError("temporary-file redirection did not take effect")
     if str(rt.deps) not in sys.path:  # embedded Python ignores PYTHONPATH, so add it explicitly
         sys.path.insert(0, str(rt.deps))
-    WRITE_GUARD.update(roots=policy.approved, policy=policy,
-                       extra=[os.path.normcase(os.path.abspath(DRIVER_CACHE_ROOT))])   # local driver copy only
+    global DRIVER_CACHE_ROOT
+    DRIVER_CACHE_ROOT = Path(cfg.driver_cache_dir) / "playwright-driver" \
+        if getattr(cfg, "driver_cache_dir", "") and drive_class(cfg.driver_cache_dir) == "fast" else None
+    clean_legacy_driver_copy()                 # before the guard is armed: it is a removal of our own leftovers
+    WRITE_GUARD.update(roots=policy.approved, policy=policy,       # the driver copy (if any) is the one extra place
+                       extra=[os.path.normcase(os.path.abspath(DRIVER_CACHE_ROOT))] if DRIVER_CACHE_ROOT else [])
     return rt
 
 
@@ -711,7 +724,7 @@ class Log:
         self.events, self.errors, self.console = [], [], []        # in-memory copies for the run report: REAL values, never printed or filed
         self.held, self._lock = None, threading.Lock()              # held: console lines kept back while a question waits for you
         if rt:
-            self.file = rt.logs / f"events-{datetime.datetime.now():%Y%m%d-%H%M%S}.jsonl"
+            self.file = rt.logs / f"events-{datetime.datetime.now():%Y%m%d-%H%M%S}.txt"   # one JSON event per line; .txt so Copilot accepts it as an attachment
 
     def __call__(self, phase: str, alias: str = "", **fields) -> None:
         raw = {k: (v if isinstance(v, (str, int, float, bool, type(None))) else str(v)) for k, v in fields.items()}
@@ -782,7 +795,7 @@ def register_redactions(red: Redactor, cfg, policy: PathPolicy | None) -> None:
               "base_message_path": "BASE_MESSAGE_FILE", "python_executable": "PYTHON_EXECUTABLE",
               "edge_executable": "EDGE_EXECUTABLE", "node_executable": "NODE_EXECUTABLE",
               "dependency_directory": "DEPENDENCY_DIR", "approved_root": "APPROVED_ROOT",
-              "approved_unc_root": "APPROVED_UNC_ROOT"}
+              "approved_unc_root": "APPROVED_UNC_ROOT", "driver_cache_dir": "DRIVER_CACHE_DIR"}
     for key, label in labels.items():
         red.add(getattr(cfg, key, ""), label)
     if policy and policy.unc_root:
@@ -807,15 +820,15 @@ class Journal:
     """
 
     def __init__(self, rt: Runtime, retries: int):
-        self.path, self.snap, self.retries = rt.state / "journal.jsonl", rt.state / "state.json", retries
+        self.path, self.snap, self.retries = rt.state / "journal.txt", rt.state / "state.json", retries   # .txt: attachable to Copilot
         self.lock, self.cases, self.seq = FileLock(rt.state / "writer.lock"), {}, 0
         self.lock.acquire()
         self.replay()
 
     def replay(self) -> None:
-        if not self.path.exists():
-            return
-        for raw in self.path.read_bytes().splitlines():
+        legacy = self.path.with_name("journal.jsonl")      # written by earlier versions: replayed first, never appended to
+        raws = [line for f in (legacy, self.path) if f.exists() for line in f.read_bytes().splitlines()]
+        for raw in raws:
             try:
                 ev = json.loads(raw)
             except ValueError:
@@ -1186,10 +1199,58 @@ def load_playwright():
 
 
 # The Playwright driver is node.exe (~90 MB) + its JavaScript package (~13 MB).  Started from S: it is read over the
-# network on EVERY run (measured on the VDI: 135.6 s).  A verified copy on this computer's local disk starts in seconds.
-# This folder is the ONE place outside approved storage the tool writes to (user decision, 2026-10-29): only this
-# public driver copy - never case data, logs or state.
-DRIVER_CACHE_ROOT = Path(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")) / "CopilotCaseSender" / "playwright-driver"
+# network on EVERY run (measured on the VDI: 135.6 s, then 91.3 s).  A verified copy on a local disk starts in seconds.
+# NEVER the system drive (user rule, 2026-10-30: a per-user quota there gave "No space left on device"): the copy is
+# made only in `driver_cache_dir`, a local non-system disk, and only this public driver - never case data, logs or state.
+DRIVER_CACHE_ROOT = None       # set by bootstrap_storage from driver_cache_dir; None = no copy, driver starts from S:
+LEGACY_DRIVER_ROOT = Path(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")) / "CopilotCaseSender"
+DRIVER_RESERVE_BYTES = 200 * 2**20          # left free on the copy's drive after the copy
+
+
+def drive_class(path) -> str:
+    """'fast' = a fixed local disk that is not the system drive; else 'system', 'network', 'removable' or 'unknown'."""
+    if os.name != "nt":
+        return "unknown"
+    drive = ntpath.splitdrive(os.path.abspath(str(path)))[0]
+    if not drive or drive.startswith("\\\\"):
+        return "network"
+    if os.path.normcase(drive) == os.path.normcase(os.environ.get("SystemDrive") or "C:"):
+        return "system"
+    try:
+        kind = ctypes.windll.kernel32.GetDriveTypeW(drive + "\\")
+    except Exception:
+        return "unknown"
+    return {3: "fast", 4: "network", 2: "removable"}.get(kind, "unknown")
+
+
+def fast_drives() -> list:
+    """Letters of the local, non-system disks of this computer (where driver_cache_dir may go)."""
+    if os.name != "nt":
+        return []
+    mask = ctypes.windll.kernel32.GetLogicalDrives()
+    return [f"{chr(65 + i)}:" for i in range(26) if mask >> i & 1 and drive_class(f"{chr(65 + i)}:\\") == "fast"]
+
+
+def free_for_me(path) -> int | None:
+    """Bytes this user may still write there (Windows counts a disk quota in this figure).  None if unknown."""
+    try:
+        avail = ctypes.c_ulonglong()
+        if ctypes.windll.kernel32.GetDiskFreeSpaceExW(str(path), ctypes.byref(avail), None, None):
+            return avail.value
+    except Exception:
+        pass
+    return None
+
+
+def clean_legacy_driver_copy() -> None:
+    """Earlier versions copied the driver to the system drive (and a copy cut short by the quota stayed there, using
+    it up).  Remove that folder - ours alone, holding nothing but the driver copy; links are never followed."""
+    try:
+        old = LEGACY_DRIVER_ROOT
+        if old.is_dir() and not is_reparse(old) and {p.name for p in old.iterdir()} <= {"playwright-driver"}:
+            shutil.rmtree(old, ignore_errors=True)
+    except Exception:
+        pass
 
 
 class DriverCache:
@@ -1199,7 +1260,7 @@ class DriverCache:
         import importlib.util
         spec = importlib.util.find_spec("playwright")
         self.src = Path(spec.origin).parent / "driver" if spec and spec.origin else None
-        self.root = DRIVER_CACHE_ROOT / (playwright_version() or "unknown")
+        self.root = DRIVER_CACHE_ROOT / (playwright_version() or "unknown") if DRIVER_CACHE_ROOT else None
         self.log = log
 
     def _files(self) -> dict:
@@ -1224,7 +1285,7 @@ class DriverCache:
     def ready(self) -> bool:
         """True only if the local copy matches the S: original (same files, sizes, dates) and node.exe is intact."""
         try:
-            if os.name != "nt" or self.src is None:
+            if os.name != "nt" or self.src is None or self.root is None:
                 return False
             man = json.loads((self.root / "manifest.json").read_text("utf-8"))
             if man.get("files") != self._files():
@@ -1251,12 +1312,19 @@ class DriverCache:
 
     def refresh(self) -> None:
         """Copy the driver from S: to the local disk (background, after the driver has started), verify, publish.
-        A copy cut short (run ended) is left as a temporary folder and cleared next time."""
+        A copy cut short (run ended) is left as a temporary folder and cleared next time; a failed copy is removed at once."""
+        if self.root is None:
+            return
+        tmp = None
         try:
             before = self._files()
             self.root.parent.mkdir(parents=True, exist_ok=True)
             for old in self.root.parent.glob(".tmp-*"):
                 shutil.rmtree(old, ignore_errors=True)
+            need, free = sum(size for size, _m in before.values()), free_for_me(self.root.parent)
+            if free is not None and free < need + DRIVER_RESERVE_BYTES:
+                raise OSError(f"not enough space there for you: {free >> 20} MB free, {need >> 20} MB + "
+                              f"{DRIVER_RESERVE_BYTES >> 20} MB reserve needed")
             tmp = self.root.parent / f".tmp-{uuid.uuid4().hex[:8]}"
             for rel in before:
                 dest = tmp / rel
@@ -1274,9 +1342,12 @@ class DriverCache:
             if self.root.exists():
                 shutil.rmtree(self.root, ignore_errors=True)
             os.replace(tmp, self.root)
-            self.log("dependencies", note="Playwright driver copied to this computer's local disk: the next start will be fast")
+            self.log("dependencies", note="Playwright driver copied to the fast drive (driver_cache_dir): the next start will be fast")
         except Exception as exc:                  # an optimisation only: the run is never affected
-            self.log("dependencies", note=f"local driver copy not made ({type(exc).__name__}: {exc}); next run starts from S: again")
+            if tmp is not None:
+                shutil.rmtree(tmp, ignore_errors=True)
+            self.log("dependencies", note=f"driver copy on the fast drive not made ({type(exc).__name__}: {exc}); "
+                                          "next run starts from S: again")
 
 
 LOCAL_DRIVER_SECONDS = 30      # the local copy starts in ~1 s; longer means it is blocked or hung -> start from S: instead
@@ -1301,7 +1372,7 @@ async def start_driver(api, log, node_configured: bool, refresh: bool = True):
         pw = await api().start()
         return pw, "S: (local copy refused)", time.monotonic() - t0
     pw = await api().start()
-    if refresh and not node_configured:
+    if refresh and not node_configured and cache.root is not None:
         threading.Thread(target=cache.refresh, daemon=True).start()
     return pw, "configured node" if node_configured else "S:", time.monotonic() - t0
 
@@ -1807,7 +1878,8 @@ class EdgeBrowser:
                 self.api = await asyncio.to_thread(load_playwright)
                 self.pw, where, secs = await start_driver(self.api[0], self.log, bool(self.cfg.node_executable))
                 self.log("connect", note=f"Playwright driver started in {secs:.1f}s from {where}"
-                                         + (" (a local copy is being made for next time)" if where == "S:" else "")
+                                         + ("" if where != "S:" else " (a copy is being made on the fast drive for next time)"
+                                            if DRIVER_CACHE_ROOT else " (no driver_cache_dir set: no fast copy, nothing written to C:)")
                                          + f"; startup so far {time.monotonic() - t0:.1f}s")
                 self.phase = "handshake with Edge"
             boot = asyncio.ensure_future(driver())
@@ -3683,6 +3755,11 @@ def check_command(args) -> int:
         from playwright._impl._driver import compute_driver_executable
         node = str(compute_driver_executable()[0])
         line("node for Playwright driver", Path(node).is_file(), "configured" if cfg.node_executable else "bundled")
+        t0 = time.monotonic()               # node.exe alone (no driver package): splits a slow start into exe vs package
+        subprocess.run([node, "--version"], stdin=subprocess.DEVNULL, capture_output=True, timeout=300)
+        print(f"  node.exe alone starts in {time.monotonic() - t0:.1f}s ({drive_class(node)} drive)")
+        print(f"  local non-system disks: {', '.join(fast_drives()) or 'none'}; driver_cache_dir: "
+              + (f"set ({drive_class(cfg.driver_cache_dir)} drive)" if cfg.driver_cache_dir else "not set (no fast copy)"))
 
         async def driver():
             pw, where, secs = await start_driver(load_playwright()[0], ctx_.log, bool(cfg.node_executable), refresh=False)
@@ -3895,7 +3972,7 @@ Invariants: at-most-once sending; one tab per case; tabs are brought to the fron
 
 Privacy: this report is UNREDACTED on purpose (it stays on the VDI and is handed over by the user): real paths, instruction IDs,
 file names, URLs and full error texts appear. Secrets are the one exception: environment variables whose names look like
-credentials are hidden, and no cookie / token / .env content is ever read. The console and events-*.jsonl logs remain redacted
+credentials are hidden, and no cookie / token / .env content is ever read. The console and events-*.txt logs remain redacted
 (case aliases such as case-1a2b3c); the table in section 5 maps every alias to its real instruction ID and folder. Timestamps are UTC (events) or local
 (console). "elapsed"/"seconds" fields are wall-clock seconds. Evidence level of everything here: observed on the VDI in this run.
 """
