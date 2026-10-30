@@ -1355,6 +1355,53 @@ class DriverCache:
 
 
 LOCAL_DRIVER_SECONDS = 30      # the local copy starts in ~1 s; longer means it is blocked or hung -> start from S: instead
+
+
+def mapped_drives() -> list:
+    """[(letter, remote)] for every mapped network drive, e.g. ("S:", "\\\\server\\share").  [] if unknown."""
+    out = []
+    try:
+        mpr, k32 = ctypes.WinDLL("mpr"), ctypes.windll.kernel32
+        mask = k32.GetLogicalDrives()
+        for i in range(26):
+            letter = f"{chr(65 + i)}:"
+            if mask >> i & 1 and k32.GetDriveTypeW(letter + "\\") == 4:
+                buf, size = ctypes.create_unicode_buffer(1024), ctypes.c_ulong(1024)
+                if mpr.WNetGetConnectionW(letter, buf, ctypes.byref(size)) == 0:
+                    out.append((letter, buf.value.rstrip("\\")))
+    except Exception:
+        pass
+    return out
+
+
+def drive_letter_spelling(path: str) -> str:
+    """The same file through its mapped drive letter (S:\\...) instead of \\\\server\\share\\...  Unchanged if no mapped
+    drive covers it.  Why: Node looks for a missing module in node_modules of every parent folder, and from a UNC path
+    it walks past the share to \\\\server\\node_modules - which Windows treats as a share request and gives up on only
+    after ~80 s (VDI 2026-10-30).  From the drive letter the walk ends at S:\\node_modules at once."""
+    p = str(path)
+    if os.name != "nt" or not p.startswith("\\\\"):
+        return p
+    hits = [(letter, remote) for letter, remote in mapped_drives()
+            if p.lower() == remote.lower() or p.lower().startswith(remote.lower() + "\\")]
+    if not hits:
+        return p
+    letter, remote = max(hits, key=lambda h: len(h[1]))
+    return letter + p[len(remote):]
+
+
+def use_drive_letter(log) -> None:
+    """Start the Playwright driver (node.exe + cli.js) through the drive letter when Python found it by UNC path."""
+    try:
+        import playwright._impl._transport as transport
+        node, cli = (str(p) for p in transport.compute_driver_executable())
+        n2, c2 = drive_letter_spelling(node), drive_letter_spelling(cli)
+        if (n2, c2) != (node, cli) and os.path.isfile(n2) and os.path.isfile(c2):
+            transport.compute_driver_executable = lambda: (n2, c2)
+            log("connect", note="Playwright driver started through its drive letter, not its \\\\server\\share path "
+                                "(from there a missing-module lookup reaches \\\\server\\node_modules: ~80 s)")
+    except Exception:
+        pass
 async def start_driver(api, log, node_configured: bool, refresh: bool = True):
     """Start the Playwright driver: the verified local copy first (bounded by LOCAL_DRIVER_SECONDS), else the original
     on S: (slow on the VDI, never cut short).  Returns (playwright, where, seconds).  A local copy that is blocked
@@ -1373,6 +1420,7 @@ async def start_driver(api, log, node_configured: bool, refresh: bool = True):
             cache.unuse()
         pw = await api().start()
         return pw, "S: (local copy refused)", time.monotonic() - t0
+    use_drive_letter(log)
     pw, where = None, "configured node" if node_configured else "S:"
     if pw is None:
         pw = await api().start()
@@ -3791,12 +3839,18 @@ def check_command(args) -> int:
         from playwright._impl._driver import compute_driver_executable
         node, cli = (str(p) for p in compute_driver_executable())
         line("node for Playwright driver", Path(node).is_file(), "configured" if cfg.node_executable else "bundled")
+        spelled = drive_letter_spelling(node)
+        print("  driver path: " + ("network path \\\\server\\share, started through its drive letter " + spelled[:2]
+                                   if spelled != node else "UNC, no mapped drive covers it (missing-module lookups may be slow)"
+                                   if node.startswith("\\\\") else "drive letter"))
+        node, cli = spelled, drive_letter_spelling(cli)
         print(f"  local non-system disks: {', '.join(fast_drives()) or 'none'}; driver_cache_dir: "
               + (f"set ({drive_class(cfg.driver_cache_dir)} drive)" if cfg.driver_cache_dir else "not set (no fast copy)"))
 
         # Where does a slow driver start go?  VDI 2026-10-30: node alone 1.1 s, bundles read 3.0 s, driver program
         # 83.9 s on every start; with the add-on lookups switched off (WS_NO_*) the driver started in 2.1 s.  Step 3
-        # names the folder that makes a missing-module lookup slow (LOOKUP_PROBE_JS).
+        # names the folder that makes a missing-module lookup slow (LOOKUP_PROBE_JS).  Found: \\server\node_modules
+        # (80.7 s), reached only from the UNC spelling - so these steps, like the run, use the drive letter.
         bundles = sorted(Path(cli).parent.glob("lib/*Bundle.js"))
         mb = sum(b.stat().st_size for b in bundles) / 2**20
         print(f"  timing 1/5  node.exe alone: {timed_run([node, '--version'])[0]} ({drive_class(node)} drive)")

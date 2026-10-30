@@ -2189,3 +2189,15 @@ def test_the_driver_never_searches_for_the_websocket_add_ons_and_the_probe_lists
         tempfile.tempdir, sys.path[:] = saved_tmp, saved_path
         sys.dont_write_bytecode = False
     assert "globalPaths" in S.LOOKUP_PROBE_JS and "_nodeModulePaths" in S.LOOKUP_PROBE_JS
+
+
+def test_a_driver_found_by_unc_path_is_started_through_its_mapped_drive_letter(monkeypatch):
+    r"""VDI 2026-10-30: from \\server\share Node's missing-module walk reaches \\server\node_modules (80.7 s)."""
+    if os.name != "nt":
+        pytest.skip("Windows only")
+    monkeypatch.setattr(S, "mapped_drives", lambda: [("S:", r"\\srv\share"), ("T:", r"\\srv\share\deep")])
+    assert S.drive_letter_spelling(r"\\srv\share\deps\playwright\driver\node.exe") == r"S:\deps\playwright\driver\node.exe"
+    assert S.drive_letter_spelling(r"\\SRV\Share\deep\cli.js") == r"T:\cli.js"            # longest mapping wins, any case
+    assert S.drive_letter_spelling(r"\\srv\shared\x.exe") == r"\\srv\shared\x.exe"         # not the same share
+    assert S.drive_letter_spelling(r"\\other\share\x.exe") == r"\\other\share\x.exe"       # no mapped drive: unchanged
+    assert S.drive_letter_spelling(r"S:\deps\node.exe") == r"S:\deps\node.exe"

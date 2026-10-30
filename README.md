@@ -44,8 +44,12 @@ by a safe alias (`other-xxxxxx`); two folders with the same ID are both blocked 
    on *every* start (a run-from-swap node.exe copy made no difference and was removed). Suspected cause: the driver's
    WebSocket library searching every folder Node knows for two optional add-ons that are not installed; the tool now
    sets `WS_NO_BUFFER_UTIL` / `WS_NO_UTF_8_VALIDATE` (process only) so that search never happens. VDI check after
-   that: driver start 2.1 s (was 82.7 s). `Run.cmd check` lists every folder Node searches for a missing module with
-   its real path and time (sanitise before sharing), to name the slow one.
+   that: driver start 2.1 s (was 82.7 s). **Exact cause** (VDI check,
+   2026-10-30): Python found the driver by its `\server\share` path, and from there Node's search for a missing module
+   walks past the share to `\server
+ode_modules`, which Windows treats as a share request and gives up on after
+   80.7 s. The driver is now started through its mapped drive letter (`S:\...`), where the walk ends at once; the
+   add-on switches stay as a second guard. `Run.cmd check` shows which path form it used.
    **Nothing is ever written to the system drive** (a per-user quota there gave "No space left on device"). Only if
    `driver_cache_dir` is set to a folder on a *local disk that is not the system drive* is the driver copied there
    once (space available to you checked first, a failed copy removed at once) and used only while it matches the
