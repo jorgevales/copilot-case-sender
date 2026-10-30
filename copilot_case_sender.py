@@ -3753,20 +3753,38 @@ def check_command(args) -> int:
         ensure_dependencies(cfg, rt, ctx_.log)
         line(f"playwright {playwright_version()}", True)
         from playwright._impl._driver import compute_driver_executable
-        node = str(compute_driver_executable()[0])
+        node, cli = (str(p) for p in compute_driver_executable())
         line("node for Playwright driver", Path(node).is_file(), "configured" if cfg.node_executable else "bundled")
-        t0 = time.monotonic()               # node.exe alone (no driver package): splits a slow start into exe vs package
-        subprocess.run([node, "--version"], stdin=subprocess.DEVNULL, capture_output=True, timeout=300)
-        print(f"  node.exe alone starts in {time.monotonic() - t0:.1f}s ({drive_class(node)} drive)")
         print(f"  local non-system disks: {', '.join(fast_drives()) or 'none'}; driver_cache_dir: "
               + (f"set ({drive_class(cfg.driver_cache_dir)} drive)" if cfg.driver_cache_dir else "not set (no fast copy)"))
 
+        # Where does a slow driver start go?  Each step below is timed on its own, cold steps first (VDI 2026-10-30:
+        # node.exe alone 1.6 s, whole driver 84.6 s - so the time is in the driver's own files or its start-up).
+        def timed(args) -> str:
+            t = time.monotonic()
+            try:
+                done = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True, timeout=300)
+                return f"{time.monotonic() - t:.1f}s" + ("" if done.returncode == 0 else f" (exit {done.returncode})")
+            except subprocess.TimeoutExpired:
+                return "over 300s"
+        bundles = sorted(Path(cli).parent.glob("lib/*Bundle.js"))
+        mb = sum(b.stat().st_size for b in bundles) / 2**20
+        print(f"  timing 1/6  node.exe alone: {timed([node, '--version'])} ({drive_class(node)} drive)")
+        print(f"  timing 2/6  node reads the {len(bundles)} driver bundles ({mb:.1f} MB, first open): " + timed(
+            [node, "-e", "const fs=require('fs');for(const f of process.argv.slice(1))fs.readFileSync(f)", *map(str, bundles)]))
+        print(f"  timing 3/6  node loads the driver program (cli --version): {timed([node, cli, '--version'])}")
+        t = time.monotonic()
+        api = load_playwright()[0]
+        print(f"  timing 4/6  Python imports Playwright: {time.monotonic() - t:.1f}s")
+
         async def driver():
-            pw, where, secs = await start_driver(load_playwright()[0], ctx_.log, bool(cfg.node_executable), refresh=False)
+            pw, where, secs = await start_driver(api, ctx_.log, bool(cfg.node_executable), refresh=False)
             await pw.stop()
             return where, secs
         where, secs = asyncio.run(driver())
-        line("Playwright driver starts", True, f"{secs:.1f}s from {where}")
+        line("Playwright driver starts", True, f"timing 5/6  {secs:.1f}s from {where}")
+        where, secs = asyncio.run(driver())
+        line("Playwright driver starts again", True, f"timing 6/6  {secs:.1f}s (second start: fast = a first-open cost)")
     except Exception as exc:
         line("dependencies / driver", False, safe_exc(ctx_.red, exc))
     line("edge executable", Path(cfg.edge_executable).is_file())
