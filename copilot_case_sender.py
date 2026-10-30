@@ -635,7 +635,11 @@ def bootstrap_storage(cfg, policy: PathPolicy) -> Runtime:
            "PIP_CACHE_DIR": rt.pipcache, "npm_config_cache": rt.root / "npm-cache",
            "PLAYWRIGHT_BROWSERS_PATH": rt.root / "pw-browsers", "XDG_CACHE_HOME": rt.root / "cache"}
     os.environ.update({k: str(v) for k, v in env.items()})
-    os.environ.update({"PYTHONDONTWRITEBYTECODE": "1", "PYTHONNOUSERSITE": "1", "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD": "1"})
+    os.environ.update({"PYTHONDONTWRITEBYTECODE": "1", "PYTHONNOUSERSITE": "1", "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD": "1",
+                       # the driver's WebSocket library otherwise searches every folder Node knows for two optional
+                       # add-ons that are not installed (suspected 80 s on the VDI, see check's traced timing)
+                       "WS_NO_BUFFER_UTIL": "1", "WS_NO_UTF_8_VALIDATE": "1"})
+    shutil.rmtree(rt.root / "driver-node", ignore_errors=True)    # run-from-swap node.exe copy of 2026-10-30: no gain
     if cfg.node_executable:  # must be set before Playwright starts its driver
         os.environ["PLAYWRIGHT_NODEJS_PATH"] = cfg.node_executable
     tempfile.tempdir = str(rt.temp)
@@ -1351,59 +1355,10 @@ class DriverCache:
 
 
 LOCAL_DRIVER_SECONDS = 30      # the local copy starts in ~1 s; longer means it is blocked or hung -> start from S: instead
-NET_RUN_FROM_SWAP = 0x0800     # PE header flag: Windows reads the whole program once and runs it from memory
-
-
-def swap_node(rt, log, src: Path | None = None) -> Path | None:
-    """A copy of the driver's node.exe, on approved storage (RUNTIME_ROOT, never C:), with IMAGE_FILE_NET_RUN_FROM_SWAP
-    set.  Windows loads a program on a network drive piece by piece as it runs; node.exe is 90 MB and the driver touches
-    much of it, so every start paid thousands of network round trips (VDI 2026-10-30: node --version 1.1 s, reading the
-    driver bundles 3.0 s, but `cli --version` 83.9 s - and the same again on a second start).  With the flag, Windows
-    reads the file in one go at start.  Remade only when the original changes.  None if it cannot be made."""
-    try:
-        if src is None:
-            import importlib.util
-            spec = importlib.util.find_spec("playwright")
-            src = Path(spec.origin).parent / "driver" / "node.exe"
-        st = os.stat(src)
-        key = {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
-        folder = rt.root / "driver-node"
-        exe, memo = folder / f"node-{playwright_version() or 'unknown'}.exe", folder / f"node-{playwright_version() or 'unknown'}.json"
-        try:
-            if json.loads(memo.read_text("utf-8")) == key and os.path.getsize(exe) == st.st_size:
-                return exe
-        except (OSError, ValueError):
-            pass
-        folder.mkdir(parents=True, exist_ok=True)
-        for old in folder.glob(".tmp-*"):
-            old.unlink(missing_ok=True)
-        tmp = folder / f".tmp-{uuid.uuid4().hex[:8]}.exe"
-        t0 = time.monotonic()
-        shutil.copyfile(src, tmp)
-        with open(tmp, "r+b") as fh:
-            head = bytearray(fh.read(4096))
-            pe = int.from_bytes(head[0x3C:0x40], "little")
-            if head[:2] != b"MZ" or head[pe:pe + 4] != b"PE\0\0":
-                raise OSError("node.exe is not a Windows program file")
-            flags = int.from_bytes(head[pe + 22:pe + 24], "little") | NET_RUN_FROM_SWAP
-            fh.seek(pe + 22)
-            fh.write(flags.to_bytes(2, "little"))
-        if os.path.getsize(tmp) != st.st_size:
-            raise OSError("copy size mismatch")
-        os.replace(tmp, exe)
-        write_atomic(memo, json.dumps(key))
-        log("dependencies", note=f"node.exe copy marked run-from-swap made on RUNTIME_ROOT in {time.monotonic() - t0:.1f}s")
-        return exe
-    except Exception as exc:                  # an optimisation only: the driver then starts from the original
-        log("dependencies", note=f"run-from-swap node.exe not made ({type(exc).__name__}: {exc})")
-        return None
-
-
-async def start_driver(api, log, node_configured: bool, refresh: bool = True, rt=None):
-    """Start the Playwright driver: the verified local copy first (bounded by LOCAL_DRIVER_SECONDS), else the
-    run-from-swap node.exe on S: (swap_node), else the original on S: (slow on the VDI, never cut short).
-    Returns (playwright, where, seconds).  A copy that is refused (e.g. by a policy) or hangs is reported by name
-    and the run carries on with the original."""
+async def start_driver(api, log, node_configured: bool, refresh: bool = True):
+    """Start the Playwright driver: the verified local copy first (bounded by LOCAL_DRIVER_SECONDS), else the original
+    on S: (slow on the VDI, never cut short).  Returns (playwright, where, seconds).  A local copy that is blocked
+    (e.g. a policy refusing programs there) or hangs is reported by name and the run carries on from S:."""
     t0 = time.monotonic()
     cache = DriverCache(log)
     if not node_configured and await asyncio.to_thread(cache.ready):
@@ -1418,16 +1373,7 @@ async def start_driver(api, log, node_configured: bool, refresh: bool = True, rt
             cache.unuse()
         pw = await api().start()
         return pw, "S: (local copy refused)", time.monotonic() - t0
-    swap = None if node_configured or rt is None or os.name != "nt" else await asyncio.to_thread(swap_node, rt, log)
     pw, where = None, "configured node" if node_configured else "S:"
-    if swap:
-        os.environ["PLAYWRIGHT_NODEJS_PATH"] = str(swap)
-        try:
-            pw, where = await api().start(), "S: (node run-from-swap)"
-        except Exception as exc:
-            log("connect", note=f"playwright_driver_start: run-from-swap node.exe failed ({type(exc).__name__}); "
-                                "starting the original node.exe instead")
-            os.environ.pop("PLAYWRIGHT_NODEJS_PATH", None)
     if pw is None:
         pw = await api().start()
     if refresh and not node_configured and cache.root is not None:
@@ -1934,7 +1880,7 @@ class EdgeBrowser:
             async def driver():
                 self.phase = "starting the Playwright driver"
                 self.api = await asyncio.to_thread(load_playwright)
-                self.pw, where, secs = await start_driver(self.api[0], self.log, bool(self.cfg.node_executable), rt=self.rt)
+                self.pw, where, secs = await start_driver(self.api[0], self.log, bool(self.cfg.node_executable))
                 self.log("connect", note=f"Playwright driver started in {secs:.1f}s from {where}"
                                          + ("" if not where.startswith("S:") else " (a copy is being made on the fast drive for next time)"
                                             if DRIVER_CACHE_ROOT else " (no driver_cache_dir set: no fast copy, nothing written to C:)")
@@ -3775,6 +3721,37 @@ def classify(cases, ctx, journal, listed):
     return todo, done
 
 
+# Loaded with `node --require` by `check` only: times every module lookup/load, file call and OS call of the driver
+# program and prints those over 0.3 s on exit (names only: a path is cut to its last part).
+DRIVER_TRACE_JS = r"""
+const Module = require('module'), fs = require('fs'), os = require('os'), path = require('path');
+const t0 = process.hrtime.bigint(), ms = () => Number(process.hrtime.bigint() - t0) / 1e6, slow = [];
+const name = (x) => { const s = String(x); return s.includes('/') || s.includes(String.fromCharCode(92)) ? path.basename(s) : s; };
+const wrap = (obj, key, label, at = 0) => {
+  const o = obj[key]; if (typeof o !== 'function') return;
+  obj[key] = function (...a) { const s = ms(); try { return o.apply(this, a); } finally {
+    const d = ms() - s; if (d > 300) slow.push(`${(s / 1000).toFixed(1)}s +${(d / 1000).toFixed(1)}s ${label} ${name(a[at])}`); } };
+};
+wrap(Module, '_resolveFilename', 'lookup'); wrap(Module, '_load', 'load'); wrap(Module.prototype, '_compile', 'compile', 1);
+for (const k of ['statSync', 'lstatSync', 'existsSync', 'readFileSync', 'readdirSync', 'realpathSync', 'accessSync', 'openSync'])
+  wrap(fs, k, 'fs.' + k);
+for (const k of ['userInfo', 'hostname', 'networkInterfaces', 'homedir', 'tmpdir', 'cpus']) wrap(os, k, 'os.' + k);
+process.on('exit', () => process.stderr.write(`TRACE total ${(ms() / 1000).toFixed(1)}s (node startup before this not counted)\n`
+  + slow.map((r) => `TRACE ${r}\n`).join('')));
+"""
+
+
+def timed_run(args) -> tuple:
+    """Run a short command; returns ('12.3s' or 'over 300s', its stderr text)."""
+    t = time.monotonic()
+    try:
+        done = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True, timeout=300)
+        return (f"{time.monotonic() - t:.1f}s" + ("" if done.returncode == 0 else f" (exit {done.returncode})"),
+                done.stderr.decode("utf-8", "replace"))
+    except subprocess.TimeoutExpired:
+        return "over 300s", ""
+
+
 def check_command(args) -> int:
     cfg = load_config()
     ok = True
@@ -3816,30 +3793,26 @@ def check_command(args) -> int:
         print(f"  local non-system disks: {', '.join(fast_drives()) or 'none'}; driver_cache_dir: "
               + (f"set ({drive_class(cfg.driver_cache_dir)} drive)" if cfg.driver_cache_dir else "not set (no fast copy)"))
 
-        # Where does a slow driver start go?  Each step below is timed on its own (VDI 2026-10-30: node alone 1.1 s,
-        # bundles read 3.0 s, `cli --version` with the original node.exe 83.9 s, and the same on every start - the
-        # program loaded piece by piece over the network.  Step 3 uses the run-from-swap copy, see swap_node).
-        def timed(args) -> str:
-            t = time.monotonic()
-            try:
-                done = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True, timeout=300)
-                return f"{time.monotonic() - t:.1f}s" + ("" if done.returncode == 0 else f" (exit {done.returncode})")
-            except subprocess.TimeoutExpired:
-                return "over 300s"
+        # Where does a slow driver start go?  Each step is timed on its own.  VDI 2026-10-30: node alone 1.1 s, bundles
+        # read 3.0 s, `cli --version` 83.9 s on EVERY start (a run-from-swap node.exe did not help: 85.8 s).  Step 3
+        # runs the driver program once with DRIVER_TRACE_JS, which names every lookup/file/system call over 0.3 s.
         bundles = sorted(Path(cli).parent.glob("lib/*Bundle.js"))
         mb = sum(b.stat().st_size for b in bundles) / 2**20
-        print(f"  timing 1/5  node.exe alone: {timed([node, '--version'])} ({drive_class(node)} drive)")
-        print(f"  timing 2/5  node reads the {len(bundles)} driver bundles ({mb:.1f} MB): " + timed(
-            [node, "-e", "const fs=require('fs');for(const f of process.argv.slice(1))fs.readFileSync(f)", *map(str, bundles)]))
-        swap = None if cfg.node_executable or os.name != "nt" else swap_node(rt, ctx_.log)
-        print("  timing 3/5  driver program (cli --version) with the run-from-swap node.exe: "
-              + (timed([str(swap), cli, "--version"]) + "  (was 83.9s with the original)" if swap else "copy not made, see the log"))
+        print(f"  timing 1/5  node.exe alone: {timed_run([node, '--version'])[0]} ({drive_class(node)} drive)")
+        print(f"  timing 2/5  node reads the {len(bundles)} driver bundles ({mb:.1f} MB): " + timed_run(
+            [node, "-e", "const fs=require('fs');for(const f of process.argv.slice(1))fs.readFileSync(f)", *map(str, bundles)])[0])
+        trace = rt.tools / "driver-trace.js"
+        write_atomic(trace, DRIVER_TRACE_JS)
+        took, err = timed_run([node, "--require", str(trace), cli, "--version"])
+        print(f"  timing 3/5  driver program (cli --version, traced; was 83.9s): {took}")
+        for row in [r for r in err.splitlines() if r.startswith("TRACE ")][:25]:
+            print(f"      {row[6:]}")
         t = time.monotonic()
         api = load_playwright()[0]
         print(f"  timing 4/5  Python imports Playwright: {time.monotonic() - t:.1f}s")
 
         async def driver():
-            pw, where, secs = await start_driver(api, ctx_.log, bool(cfg.node_executable), refresh=False, rt=rt)
+            pw, where, secs = await start_driver(api, ctx_.log, bool(cfg.node_executable), refresh=False)
             await pw.stop()
             return where, secs
         where, secs = asyncio.run(driver())

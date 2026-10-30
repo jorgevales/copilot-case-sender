@@ -469,6 +469,7 @@ def test_bootstrap_keeps_temp_and_writes_on_approved_storage(env, monkeypatch):
         assert os.path.normcase(tempfile.gettempdir()) == os.path.normcase(str(rt.temp))
         assert os.environ["PLAYWRIGHT_NODEJS_PATH"] == str(node)           # configured Node is what Playwright will use
         assert os.environ["PYTHONDONTWRITEBYTECODE"] == "1" and sys.dont_write_bytecode
+        assert os.environ["WS_NO_BUFFER_UTIL"] == "1" and os.environ["WS_NO_UTF_8_VALIDATE"] == "1"   # no add-on search
         with tempfile.NamedTemporaryFile(dir=tempfile.gettempdir()) as fh:  # temp files land under the runtime
             assert str(rt.temp) in fh.name
         with pytest.raises(S.StorageError):                                   # a write elsewhere is blocked, not allowed
@@ -2171,45 +2172,20 @@ def test_an_old_journal_jsonl_is_still_replayed_so_nothing_already_sent_is_sent_
     assert (env.rt.state / "journal.txt").exists() and "C2" not in (env.rt.state / "journal.jsonl").read_text("utf-8")
 
 
-def fake_exe(path, flags=0x22):
-    head = bytearray(4096)
-    head[:2], head[0x3C:0x40] = b"MZ", (0x80).to_bytes(4, "little")
-    head[0x80:0x84], head[0x80 + 22:0x80 + 24] = b"PE\0\0", flags.to_bytes(2, "little")
-    path.write_bytes(bytes(head) + b"x" * 1000)
 
-
-def test_node_is_copied_to_runtime_root_marked_run_from_swap_and_reused_until_the_original_changes(env):
-    """VDI 2026-10-30: node --version 1.1 s but `cli --version` 83.9 s on every start - node.exe paged in over the network."""
-    src = env.base / "orig-node.exe"
-    fake_exe(src)
-    notes = []
-    log = lambda phase, alias="", **f: notes.append(f.get("note", ""))        # noqa: E731
-    exe = S.swap_node(env.rt, log, src)
-    assert exe and S.PathPolicy(str(env.rt.root), mapper=lambda p: None).inside(str(exe))  # on approved storage, never C:
-    head = exe.read_bytes()
-    assert int.from_bytes(head[0x80 + 22:0x80 + 24], "little") == 0x22 | S.NET_RUN_FROM_SWAP and head[4096:] == src.read_bytes()[4096:]
-    assert S.swap_node(env.rt, log, src) == exe and len(notes) == 1           # reused: not copied again
-    time.sleep(0.01)
-    fake_exe(src, 0x23)                                                       # original updated: copy remade
-    assert S.swap_node(env.rt, log, src) == exe and len(notes) == 2
-    (env.base / "bad.exe").write_bytes(b"not a program" * 400)
-    assert S.swap_node(env.rt, log, env.base / "bad.exe") is None and "not made" in notes[-1]
-
-
-def test_a_refused_run_from_swap_node_falls_back_to_the_original(env, monkeypatch):
-    notes = []
-    monkeypatch.setattr(S, "swap_node", lambda rt, log: Path("swap-node.exe"))
-    monkeypatch.setattr(S.DriverCache, "ready", lambda self: False)
-    monkeypatch.delenv("PLAYWRIGHT_NODEJS_PATH", raising=False)
-
-    class Api:
-        def start(self):
-            async def go():
-                if os.environ.get("PLAYWRIGHT_NODEJS_PATH"):
-                    raise PermissionError("blocked by policy")
-                return "pw"
-            return go()
-    pw, where, _ = run(S.start_driver(Api, lambda phase, alias="", **f: notes.append(f.get("note", "")), False,
-                                      refresh=False, rt=env.rt))
-    assert (pw, where) == ("pw", "S:") and "run-from-swap node.exe failed" in notes[-1]
-    assert "PLAYWRIGHT_NODEJS_PATH" not in os.environ
+def test_the_driver_never_searches_for_the_websocket_add_ons_and_the_trace_names_slow_steps(env):
+    """VDI 2026-10-30: the driver program took ~84 s on every start; its WebSocket library searches every folder Node
+    knows for two optional add-ons that are not installed unless told not to."""
+    (env.rt.root / "driver-node").mkdir(parents=True)                         # the run-from-swap copy of 2026-10-30
+    (env.rt.root / "driver-node" / "node-1.64.1.exe").write_bytes(b"x")
+    saved_env, saved_tmp, saved_path = dict(os.environ), tempfile.tempdir, list(sys.path)
+    try:
+        S.bootstrap_storage(env.cfg, env.policy)
+        assert os.environ["WS_NO_BUFFER_UTIL"] == "1" and os.environ["WS_NO_UTF_8_VALIDATE"] == "1"
+        assert not (env.rt.root / "driver-node").exists()                     # cleaned up: it did not help
+    finally:
+        S.WRITE_GUARD["roots"] = None
+        os.environ.clear(); os.environ.update(saved_env)
+        tempfile.tempdir, sys.path[:] = saved_tmp, saved_path
+        sys.dont_write_bytecode = False
+    assert "_resolveFilename" in S.DRIVER_TRACE_JS and "d > 300" in S.DRIVER_TRACE_JS

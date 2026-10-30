@@ -40,11 +40,11 @@ by a safe alias (`other-xxxxxx`); two folders with the same ID are both blocked 
    seconds on the other route, the first to connect wins and is printed (`WINNER: attempt n of m, websocket|http route`);
    that route is remembered (`state\connect-route.txt`) and tried first next time. A slow attempt is never restarted.
    **Fast driver start:** started from S:, Playwright's driver (node.exe + package, ~100 MB) takes 90-135 s on the VDI.
-   Measured cause (2026-10-30): node.exe alone 1.1 s, reading the driver files 3.0 s, but loading the driver program
-   83.9 s on *every* start - Windows loads a program on a network drive piece by piece as it runs. So the driver runs
-   from a copy of node.exe in `RUNTIME_ROOT\driver-node` (on S:, never C:) marked *run-from-swap*, a standard Windows
-   program flag that makes Windows read the whole file once at start. Remade only when the original changes; if
-   Windows refuses it, the log says `playwright_driver_start: run-from-swap node.exe failed` and the original is used.
+   Measured (2026-10-30): node.exe alone 1.1 s, reading the driver files 3.0 s, but loading the driver program 83.9 s
+   on *every* start (a run-from-swap node.exe copy made no difference and was removed). Suspected cause: the driver's
+   WebSocket library searching every folder Node knows for two optional add-ons that are not installed; the tool now
+   sets `WS_NO_BUFFER_UTIL` / `WS_NO_UTF_8_VALIDATE` (process only) so that search never happens. `Run.cmd check` runs
+   the driver program once traced and lists every lookup, file or system call that took over 0.3 s.
    **Nothing is ever written to the system drive** (a per-user quota there gave "No space left on device"). Only if
    `driver_cache_dir` is set to a folder on a *local disk that is not the system drive* is the driver copied there
    once (space available to you checked first, a failed copy removed at once) and used only while it matches the
