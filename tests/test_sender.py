@@ -2173,7 +2173,7 @@ def test_an_old_journal_jsonl_is_still_replayed_so_nothing_already_sent_is_sent_
 
 
 
-def test_the_driver_never_searches_for_the_websocket_add_ons_and_the_trace_names_slow_steps(env):
+def test_the_driver_never_searches_for_the_websocket_add_ons_and_the_probe_lists_the_searched_folders(env):
     """VDI 2026-10-30: the driver program took ~84 s on every start; its WebSocket library searches every folder Node
     knows for two optional add-ons that are not installed unless told not to."""
     (env.rt.root / "driver-node").mkdir(parents=True)                         # the run-from-swap copy of 2026-10-30
@@ -2188,4 +2188,4 @@ def test_the_driver_never_searches_for_the_websocket_add_ons_and_the_trace_names
         os.environ.clear(); os.environ.update(saved_env)
         tempfile.tempdir, sys.path[:] = saved_tmp, saved_path
         sys.dont_write_bytecode = False
-    assert "_resolveFilename" in S.DRIVER_TRACE_JS and "d > 300" in S.DRIVER_TRACE_JS
+    assert "globalPaths" in S.LOOKUP_PROBE_JS and "_nodeModulePaths" in S.LOOKUP_PROBE_JS

@@ -3721,23 +3721,24 @@ def classify(cases, ctx, journal, listed):
     return todo, done
 
 
-# Loaded with `node --require` by `check` only: times every module lookup/load, file call and OS call of the driver
-# program and prints those over 0.3 s on exit (names only: a path is cut to its last part).
-DRIVER_TRACE_JS = r"""
-const Module = require('module'), fs = require('fs'), os = require('os'), path = require('path');
-const t0 = process.hrtime.bigint(), ms = () => Number(process.hrtime.bigint() - t0) / 1e6, slow = [];
-const name = (x) => { const s = String(x); return s.includes('/') || s.includes(String.fromCharCode(92)) ? path.basename(s) : s; };
-const wrap = (obj, key, label, at = 0) => {
-  const o = obj[key]; if (typeof o !== 'function') return;
-  obj[key] = function (...a) { const s = ms(); try { return o.apply(this, a); } finally {
-    const d = ms() - s; if (d > 300) slow.push(`${(s / 1000).toFixed(1)}s +${(d / 1000).toFixed(1)}s ${label} ${name(a[at])}`); } };
-};
-wrap(Module, '_resolveFilename', 'lookup'); wrap(Module, '_load', 'load'); wrap(Module.prototype, '_compile', 'compile', 1);
-for (const k of ['statSync', 'lstatSync', 'existsSync', 'readFileSync', 'readdirSync', 'realpathSync', 'accessSync', 'openSync'])
-  wrap(fs, k, 'fs.' + k);
-for (const k of ['userInfo', 'hostname', 'networkInterfaces', 'homedir', 'tmpdir', 'cpus']) wrap(os, k, 'os.' + k);
-process.on('exit', () => process.stderr.write(`TRACE total ${(ms() / 1000).toFixed(1)}s (node startup before this not counted)\n`
-  + slow.map((r) => `TRACE ${r}\n`).join('')));
+# Run with `node -e` by `check` only (no file to find): times a stat of every folder Node searches when a module is
+# missing, then one whole missing-module lookup.  VDI 2026-10-30: the driver's optional add-on lookups cost ~80 s per
+# start until switched off (WS_NO_*); this names the slow folder.  Prints REAL paths (the user sanitises before sharing).
+LOOKUP_PROBE_JS = r"""
+const Module = require('module'), fs = require('fs'), os = require('os'), lib = process.argv[1];
+const now = () => Number(process.hrtime.bigint()) / 1e6, out = (s) => process.stderr.write('PROBE ' + s + '\n');
+const env = (k) => process.env[k] === undefined ? 'unset' : process.env[k];
+out(`node ${process.execPath} | cwd ${process.cwd()} | homedir ${os.homedir()}`);
+for (const k of ['USERPROFILE', 'HOME', 'HOMEDRIVE', 'HOMEPATH', 'NODE_PATH', 'NODE_OPTIONS', 'APPDATA', 'LOCALAPPDATA'])
+  out(`env ${k} = ${env(k)}`);
+for (const dir of [...Module._nodeModulePaths(lib), ...Module.globalPaths]) {
+  const s = now(); let r = 'exists';
+  try { fs.statSync(dir); } catch (e) { r = e.code || e.name; }
+  out(`${((now() - s) / 1000).toFixed(1)}s  ${r}  ${dir}`);
+}
+const s = now(); let r = 'found';
+try { require.resolve('bufferutil', { paths: [lib] }); } catch (e) { r = e.code || e.name; }
+out(`${((now() - s) / 1000).toFixed(1)}s  whole lookup of a missing module (bufferutil): ${r}`);
 """
 
 
@@ -3793,20 +3794,18 @@ def check_command(args) -> int:
         print(f"  local non-system disks: {', '.join(fast_drives()) or 'none'}; driver_cache_dir: "
               + (f"set ({drive_class(cfg.driver_cache_dir)} drive)" if cfg.driver_cache_dir else "not set (no fast copy)"))
 
-        # Where does a slow driver start go?  Each step is timed on its own.  VDI 2026-10-30: node alone 1.1 s, bundles
-        # read 3.0 s, `cli --version` 83.9 s on EVERY start (a run-from-swap node.exe did not help: 85.8 s).  Step 3
-        # runs the driver program once with DRIVER_TRACE_JS, which names every lookup/file/system call over 0.3 s.
+        # Where does a slow driver start go?  VDI 2026-10-30: node alone 1.1 s, bundles read 3.0 s, driver program
+        # 83.9 s on every start; with the add-on lookups switched off (WS_NO_*) the driver started in 2.1 s.  Step 3
+        # names the folder that makes a missing-module lookup slow (LOOKUP_PROBE_JS).
         bundles = sorted(Path(cli).parent.glob("lib/*Bundle.js"))
         mb = sum(b.stat().st_size for b in bundles) / 2**20
         print(f"  timing 1/5  node.exe alone: {timed_run([node, '--version'])[0]} ({drive_class(node)} drive)")
         print(f"  timing 2/5  node reads the {len(bundles)} driver bundles ({mb:.1f} MB): " + timed_run(
             [node, "-e", "const fs=require('fs');for(const f of process.argv.slice(1))fs.readFileSync(f)", *map(str, bundles)])[0])
-        trace = rt.tools / "driver-trace.js"
-        write_atomic(trace, DRIVER_TRACE_JS)
-        took, err = timed_run([node, "--require", str(trace), cli, "--version"])
-        print(f"  timing 3/5  driver program (cli --version, traced; was 83.9s): {took}")
-        for row in [r for r in err.splitlines() if r.startswith("TRACE ")][:25]:
-            print(f"      {row[6:]}")
+        took, err = timed_run([node, "-e", LOOKUP_PROBE_JS, str(Path(cli).parent / "lib")])
+        print(f"  timing 3/5  folders Node searches for a missing module (real paths - sanitise before sharing): {took}")
+        for row in [r for r in err.splitlines() if r.startswith("PROBE ")][:40] or err.strip().splitlines()[-15:]:
+            print(f"      {row[6:] if row.startswith('PROBE ') else row}")
         t = time.monotonic()
         api = load_playwright()[0]
         print(f"  timing 4/5  Python imports Playwright: {time.monotonic() - t:.1f}s")
