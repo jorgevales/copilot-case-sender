@@ -43,6 +43,9 @@ by a safe alias (`other-xxxxxx`); two folders with the same ID are both blocked 
    `%LOCALAPPDATA%\CopilotCaseSender\playwright-driver` - the only thing ever written outside S: - and used only while
    it matches the original on S: (checked every run, including a checksum). The first run (or after an update) starts
    from S: and makes the copy in the background; later runs start the driver in seconds instead of ~2 minutes.
+   If the local copy is refused (e.g. a policy blocking programs in AppData) or does not start within 30 s, the log
+   says `playwright_driver_start: local copy ...` and the driver starts from S: instead. `Run.cmd check` prints how
+   long the driver took and where it started from (`local copy` / `S:`).
    `Run.cmd` prints `Starting...` before Python even loads. While the cursor
    question (and later the model question) is on screen **nothing else is printed**: lines made meanwhile appear right
    after your answer. To make tabs load sooner: a launched Edge gets every needed tab on its command line, a joined Edge

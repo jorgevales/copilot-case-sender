@@ -2094,3 +2094,31 @@ def test_the_first_driver_copy_passes_the_write_guard_and_nothing_else_outside_a
     finally:
         S.WRITE_GUARD.update(roots=None, extra=[])
     assert cache.ready() is True
+
+
+def test_a_blocked_or_hung_local_driver_copy_falls_back_to_s_and_says_so(monkeypatch):
+    """A policy refusing programs in AppData (or a hung node.exe) must not stop the run: the driver starts from S:."""
+    notes, used = [], []
+    monkeypatch.setattr(S.DriverCache, "ready", lambda self: True)
+    monkeypatch.setattr(S.DriverCache, "use", lambda self: used.append("local"))
+    monkeypatch.setattr(S.DriverCache, "unuse", lambda self: used.append("s"))
+    monkeypatch.setattr(S, "LOCAL_DRIVER_SECONDS", 0.1)
+    log = lambda phase, alias="", **f: notes.append(f.get("note", ""))      # noqa: E731
+
+    def api_for(first):
+        class Api:
+            def start(self):
+                async def go():
+                    if used[-1] == "local":
+                        if first == "hang":
+                            await asyncio.sleep(60)
+                        raise PermissionError("blocked by policy")
+                    return "pw"
+                return go()
+        return Api
+
+    for first, why in (("hang", "did not start within"), ("blocked", "failed (PermissionError)")):
+        used.clear()
+        pw, where, _ = run(S.start_driver(api_for(first), log, False, refresh=False))
+        assert pw == "pw" and used == ["local", "s"] and where.startswith("S:")
+        assert why in notes[-1] and "from S: instead" in notes[-1]

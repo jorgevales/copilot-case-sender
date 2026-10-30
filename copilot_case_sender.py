@@ -1239,8 +1239,15 @@ class DriverCache:
     def use(self) -> None:
         """Point Playwright at the local copy (its own driver lookup is replaced for this process only)."""
         import playwright._impl._transport as transport
+        self._orig = getattr(self, "_orig", None) or transport.compute_driver_executable
         node, cli = str(self.root / "node.exe"), str(self.root / "package" / "cli.js")
         transport.compute_driver_executable = lambda: (node, cli)
+
+    def unuse(self) -> None:
+        """Back to the original driver on S: (the local copy was blocked or hung)."""
+        if getattr(self, "_orig", None):
+            import playwright._impl._transport as transport
+            transport.compute_driver_executable = self._orig
 
     def refresh(self) -> None:
         """Copy the driver from S: to the local disk (background, after the driver has started), verify, publish.
@@ -1270,6 +1277,33 @@ class DriverCache:
             self.log("dependencies", note="Playwright driver copied to this computer's local disk: the next start will be fast")
         except Exception as exc:                  # an optimisation only: the run is never affected
             self.log("dependencies", note=f"local driver copy not made ({type(exc).__name__}: {exc}); next run starts from S: again")
+
+
+LOCAL_DRIVER_SECONDS = 30      # the local copy starts in ~1 s; longer means it is blocked or hung -> start from S: instead
+
+
+async def start_driver(api, log, node_configured: bool, refresh: bool = True):
+    """Start the Playwright driver: the verified local copy first (bounded by LOCAL_DRIVER_SECONDS), else the original
+    on S: (slow on the VDI, never cut short).  Returns (playwright, where, seconds).  A local copy that is blocked
+    (e.g. a policy refusing programs in AppData) or hangs is reported by name and the run carries on from S:."""
+    t0 = time.monotonic()
+    cache = DriverCache(log)
+    if not node_configured and await asyncio.to_thread(cache.ready):
+        cache.use()
+        try:
+            pw = await asyncio.wait_for(api().start(), LOCAL_DRIVER_SECONDS)
+            return pw, "local copy", time.monotonic() - t0
+        except Exception as exc:
+            why = (f"did not start within {LOCAL_DRIVER_SECONDS}s" if isinstance(exc, asyncio.TimeoutError)
+                   else f"failed ({type(exc).__name__})")
+            log("connect", note=f"playwright_driver_start: local copy {why}; starting the driver from S: instead")
+            cache.unuse()
+        pw = await api().start()
+        return pw, "S: (local copy refused)", time.monotonic() - t0
+    pw = await api().start()
+    if refresh and not node_configured:
+        threading.Thread(target=cache.refresh, daemon=True).start()
+    return pw, "configured node" if node_configured else "S:", time.monotonic() - t0
 
 
 # --------------------------------------------------------------------------------------------
@@ -1771,16 +1805,10 @@ class EdgeBrowser:
             async def driver():
                 self.phase = "starting the Playwright driver"
                 self.api = await asyncio.to_thread(load_playwright)
-                cache = DriverCache(self.log)
-                local = not self.cfg.node_executable and await asyncio.to_thread(cache.ready)
-                if local:
-                    cache.use()
-                self.phase = "starting the Playwright driver" + (" (local copy)" if local else " (from S:, first time)")
-                self.pw = await self.api[0]().start()
-                self.log("connect", note=f"Playwright driver started in {time.monotonic() - t0:.1f}s "
-                                         + ("from the local copy" if local else "from S: (a local copy is being made for next time)"))
-                if not local and not self.cfg.node_executable:
-                    threading.Thread(target=cache.refresh, daemon=True).start()
+                self.pw, where, secs = await start_driver(self.api[0], self.log, bool(self.cfg.node_executable))
+                self.log("connect", note=f"Playwright driver started in {secs:.1f}s from {where}"
+                                         + (" (a local copy is being made for next time)" if where == "S:" else "")
+                                         + f"; startup so far {time.monotonic() - t0:.1f}s")
                 self.phase = "handshake with Edge"
             boot = asyncio.ensure_future(driver())
             try:
@@ -3657,11 +3685,11 @@ def check_command(args) -> int:
         line("node for Playwright driver", Path(node).is_file(), "configured" if cfg.node_executable else "bundled")
 
         async def driver():
-            api = load_playwright()[0]
-            pw = await api().start()
+            pw, where, secs = await start_driver(load_playwright()[0], ctx_.log, bool(cfg.node_executable), refresh=False)
             await pw.stop()
-        asyncio.run(driver())
-        line("Playwright driver starts", True)
+            return where, secs
+        where, secs = asyncio.run(driver())
+        line("Playwright driver starts", True, f"{secs:.1f}s from {where}")
     except Exception as exc:
         line("dependencies / driver", False, safe_exc(ctx_.red, exc))
     line("edge executable", Path(cfg.edge_executable).is_file())
