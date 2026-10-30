@@ -8,6 +8,15 @@ Everything is in `copilot_case_sender.py` (read top to bottom, sections are numb
 Tests live in `tests/`. All paths below are **symbolic labels** (`CASES_ROOT`, `RUNTIME_ROOT`, …) – the real
 ones are typed once during setup and stay in your local, git-ignored `sender_config.json`.
 
+> **Do not do** (each one brings back an ~80 s startup delay or breaks a storage rule; see
+> [Startup on the network drive](#startup-on-the-network-drive)):
+> - Don't `.resolve()` / `os.path.realpath()` any path that goes to the Playwright driver (they turn `S:` into UNC).
+> - Don't launch anything through `\\server\share`; start it through the mapped drive letter.
+> - Don't fall back to the UNC path when the drive letter is missing: stop and say "map the drive".
+> - Don't remove the `ws` add-on settings (`DRIVER_ENV`: `WS_NO_BUFFER_UTIL`, `WS_NO_UTF_8_VALIDATE`).
+> - Don't change `HOME` / `USERPROFILE` / `NODE_PATH` to fix startup: they were never the cause.
+> - Don't write anything to the system drive (per-user quota: "No space left on device").
+
 ## Quick start (Windows, no admin rights)
 
 1. Put `Run.cmd` and `copilot_case_sender.py` together in a folder on `S:`.
@@ -39,16 +48,9 @@ by a safe alias (`other-xxxxxx`); two folders with the same ID are both blocked 
    are never touched. The connection to Edge is a race: one patient attempt starts at once, more join every few
    seconds on the other route, the first to connect wins and is printed (`WINNER: attempt n of m, websocket|http route`);
    that route is remembered (`state\connect-route.txt`) and tried first next time. A slow attempt is never restarted.
-   **Fast driver start:** started from S:, Playwright's driver (node.exe + package, ~100 MB) takes 90-135 s on the VDI.
-   Measured (2026-10-30): node.exe alone 1.1 s, reading the driver files 3.0 s, but loading the driver program 83.9 s
-   on *every* start (a run-from-swap node.exe copy made no difference and was removed). Suspected cause: the driver's
-   WebSocket library searching every folder Node knows for two optional add-ons that are not installed; the tool now
-   sets `WS_NO_BUFFER_UTIL` / `WS_NO_UTF_8_VALIDATE` (process only) so that search never happens. VDI check after
-   that: driver start 2.1 s (was 82.7 s). **Exact cause** (VDI check,
-   2026-10-30): Python found the driver by its `\\server\share` path, and from there Node's search for a missing module
-   walks past the share to `\\server\node_modules`, which Windows treats as a share request and gives up on after
-   80.7 s. The driver is now started through its mapped drive letter (`S:\...`), where the walk ends at once; the
-   add-on switches stay as a second guard. `Run.cmd check` shows which path form it used.
+   **Driver start:** about 2-4 s on the VDI (was ~83 s); see [Startup on the network drive](#startup-on-the-network-drive).
+   Every startup step prints a `startup` line with its time and `at Ns` since launch (driver import, driver start,
+   Edge connect, each tab ready, all tabs ready), also in the minimal console.
    **Nothing is ever written to the system drive** (a per-user quota there gave "No space left on device"). Only if
    `driver_cache_dir` is set to a folder on a *local disk that is not the system drive* is the driver copied there
    once (space available to you checked first, a failed copy removed at once) and used only while it matches the
@@ -240,6 +242,49 @@ A send is *uncertain* when `send_intent` was saved but no user message with your
 index or a shared URL), and looks at that conversation. If it still can't prove it, the case is
 `submission_uncertain`, its ID goes in the ledger, and it is **never auto-resent**. Exactly-once cannot be proved in
 every failure; this design guarantees *at-most-once automatically*, and tells you about the rest.
+
+## Startup on the network drive
+
+Placeholders: `<drive>:` = the mapped network drive the tool lives on, `\\<server>\<share>` = its UNC form.
+
+**What was proven on the VDI (2026-10-30)**
+
+| # | Fact | Evidence |
+|---|---|---|
+| F1 | `node.exe` started through its **UNC path**: Node's search for a missing module walks past the share root to `\\<server>\node_modules`; Windows treats that as a request for a *share* named `node_modules` and fails only after ~80 s (`UNKNOWN`). | check: that one folder 80.7 s `UNKNOWN`, every other folder 0.0 s `ENOENT` |
+| F2 | Every missing-module lookup paid that ~80 s. | whole `bufferutil` lookup 80.7 s; probe step 163.4 s = 2 x 80.7 s |
+| F3 | Started through the **mapped drive letter** the walk stops at `<drive>:\node_modules`; the server root is never touched. | check: 15 folders, all 0.0 s; whole lookup 0.0 s |
+| F4 | The home folder is not involved (`USERPROFILE`, `HOMEDRIVE`+`HOMEPATH`, Node's homedir all local; `HOME`, `NODE_PATH`, `NODE_OPTIONS` unset). | home-folder entries 0.0 s |
+| F5 | Telling the `ws` library not to look for its optional add-ons removed the lookups that triggered F1: driver start ~83 s -> ~2-4 s. | earlier runs vs later checks (2.1, 2.8, 3.8 s) |
+| F6 | `node.exe` alone ~1.5-2 s, reading the two driver bundles (6.4 MB) ~2.5 s, Python importing Playwright ~0.7-2 s: normal network-drive costs. | check steps 1, 2, 4 |
+| F7 | The VDI has no local non-system disk, so no fast local driver copy (`driver_cache_dir` unset). | check |
+| - | Ruled out: a run-from-swap `node.exe` copy (85.8 s, removed) and a driver copy on the system drive (user quota). | check / run report |
+
+**Rules kept in the code** (`driver_command()` in section 7 is the one place that decides the driver path, for
+`check` and the run alike):
+- The driver (`node.exe` + `cli.js`) starts through the mapped drive letter (`drive_letter_spelling`); Playwright's
+  package is put on `sys.path` through the drive letter too; the working folder is moved to the drive letter.
+- No `.resolve()` / `realpath()` on those paths (they turn a mapped drive back into UNC); `HERE` uses `abspath`.
+- No mapped drive covering the driver in this session = **stop** ("Map the drive, then run again"), never a UNC start.
+- `DRIVER_ENV` (`WS_NO_BUFFER_UTIL=1`, `WS_NO_UTF_8_VALIDATE=1`) goes to the driver process only, as a second guard.
+- `HOME` / `USERPROFILE` / `NODE_PATH` / `NODE_OPTIONS` are left alone; nothing system-wide, no admin rights.
+
+**`Run.cmd check` is the regression test.** Healthy values on the VDI:
+
+| Step | Measures | Healthy | Investigate if |
+|---|---|---|---|
+| 1/5 | `node.exe` alone | ~1.5-2.5 s | > 5 s |
+| 2/5 | Node reads the 2 driver bundles | ~2-3 s | > 6 s |
+| 3/5 | Every folder Node searches for a missing module (real paths: sanitise before sharing) | every folder 0.0 s, 15 folders | any folder > 0.5 s, any `UNKNOWN`, any `\\` entry (17 folders = UNC is back) -> `[FAIL]` |
+| 4/5 | Python imports Playwright | ~0.7-2 s | > 5 s |
+| 5/5 | Playwright driver starts | ~2-4 s | > 5 s |
+
+`check` also marks `[FAIL]` if `node.exe`, `cli.js`, the working folder or the Playwright package is on a UNC path,
+and notes it if Python itself was started by UNC path.
+
+**Change log:** 2026-10-30 - driver launched through the mapped drive letter; a UNC launch caused an ~80 s
+server-root share lookup per missing module. Driver start ~83 s -> ~2-4 s. Logs and journal are `.txt` (attachable
+to Copilot); nothing is written to the system drive.
 
 ## Storage, S: and UNC
 

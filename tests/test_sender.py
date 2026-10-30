@@ -469,7 +469,7 @@ def test_bootstrap_keeps_temp_and_writes_on_approved_storage(env, monkeypatch):
         assert os.path.normcase(tempfile.gettempdir()) == os.path.normcase(str(rt.temp))
         assert os.environ["PLAYWRIGHT_NODEJS_PATH"] == str(node)           # configured Node is what Playwright will use
         assert os.environ["PYTHONDONTWRITEBYTECODE"] == "1" and sys.dont_write_bytecode
-        assert os.environ["WS_NO_BUFFER_UTIL"] == "1" and os.environ["WS_NO_UTF_8_VALIDATE"] == "1"   # no add-on search
+        assert "WS_NO_BUFFER_UTIL" not in os.environ                         # driver process only (DRIVER_ENV)
         with tempfile.NamedTemporaryFile(dir=tempfile.gettempdir()) as fh:  # temp files land under the runtime
             assert str(rt.temp) in fh.name
         with pytest.raises(S.StorageError):                                   # a write elsewhere is blocked, not allowed
@@ -1693,7 +1693,7 @@ def test_teardown_removes_the_drawing_from_every_page_and_turns_it_off():
 
 # ------------------------------------------------------------------ startup: held console, tab tour, HTTP top-up, direct attach
 
-def test_console_lines_wait_while_a_question_is_open_and_the_answer_line_comes_first(capsys):
+def test_console_lines_wait_while_a_question_is_open_and_come_out_in_time_order(capsys):
     log = S.Log(None, S.Redactor(), "full")
     log.hold()
     log("queue", note="3 instruction(s) queued")
@@ -1704,9 +1704,9 @@ def test_console_lines_wait_while_a_question_is_open_and_the_answer_line_comes_f
         S.CONSOLE["log"] = None
     assert capsys.readouterr().out == ""                                       # nothing printed under the question
     log("session", note="moving cursor on")
-    log.release(answer_first=True)
+    log.release()
     lines = capsys.readouterr().out.splitlines()
-    assert "moving cursor on" in lines[0] and "queued" in lines[1] and "sign-in" in lines[2]
+    assert "queued" in lines[0] and "sign-in" in lines[1] and "moving cursor on" in lines[2]   # time order (no out-of-order stamps)
     log("queue", note="later")
     assert "later" in capsys.readouterr().out                                  # released: printed at once again
 
@@ -2104,6 +2104,7 @@ def test_a_blocked_or_hung_local_driver_copy_falls_back_to_s_and_says_so(monkeyp
     monkeypatch.setattr(S.DriverCache, "use", lambda self: used.append("local"))
     monkeypatch.setattr(S.DriverCache, "unuse", lambda self: used.append("s"))
     monkeypatch.setattr(S, "LOCAL_DRIVER_SECONDS", 0.1)
+    monkeypatch.setattr(S, "driver_command", lambda: ("node.exe", "cli.js", "drive letter"))
     log = lambda phase, alias="", **f: notes.append(f.get("note", ""))      # noqa: E731
 
     def api_for(first):
@@ -2122,7 +2123,39 @@ def test_a_blocked_or_hung_local_driver_copy_falls_back_to_s_and_says_so(monkeyp
         used.clear()
         pw, where, _ = run(S.start_driver(api_for(first), log, False, refresh=False))
         assert pw == "pw" and used == ["local", "s"] and where.startswith("S:")
-        assert why in notes[-1] and "from S: instead" in notes[-1]
+        refused = [n for n in notes if "from S: instead" in n]
+        assert why in refused[-1] and "process starting (drive letter)" in notes[-1]
+
+
+def test_the_driver_starts_through_the_drive_letter_with_its_own_env_or_not_at_all(env, monkeypatch):
+    r"""VDI 2026-10-30: from \\server\share the missing-module walk reached \\server\node_modules (80.7 s); from the
+    drive letter every folder took 0.0 s.  No mapped drive = stop with a clear message, never a UNC start."""
+    if os.name != "nt":
+        pytest.skip("Windows only")
+    drv = env.base / "driver"
+    (drv / "package").mkdir(parents=True)
+    (drv / "node.exe").write_bytes(b"x")
+    (drv / "package" / "cli.js").write_text("x", "utf-8")
+    letter, rest = os.path.splitdrive(str(drv))
+    unc = r"\\srv\share" + rest
+    transport = types.ModuleType("playwright._impl._transport")
+    transport.compute_driver_executable = lambda: (unc + r"\node.exe", unc + r"\package\cli.js")
+    transport.get_driver_env = lambda: {"A": "1"}
+    pw_mod, impl = types.ModuleType("playwright"), types.ModuleType("playwright._impl")
+    pw_mod._impl, impl._transport = impl, transport
+    for name, mod in (("playwright", pw_mod), ("playwright._impl", impl), ("playwright._impl._transport", transport)):
+        monkeypatch.setitem(sys.modules, name, mod)
+    monkeypatch.setattr(S, "mapped_drives", lambda: [(letter, r"\\srv\share")])
+    node, cli, how = S.driver_command()
+    assert (node, cli) == (str(drv / "node.exe"), str(drv / "package" / "cli.js")) and how.endswith(letter)
+    assert transport.compute_driver_executable() == (node, cli)                # the run starts exactly these
+    S.driver_command()                                                          # twice: the env is added once
+    assert transport.get_driver_env() == {"A": "1", **S.DRIVER_ENV} and "WS_NO_BUFFER_UTIL" not in os.environ
+    transport.compute_driver_executable = lambda: (unc + r"\node.exe", unc + r"\package\cli.js")
+    monkeypatch.setattr(S, "mapped_drives", lambda: [])                        # drive not mapped in this session
+    with pytest.raises(S.StorageError, match="Map the drive"):
+        S.driver_command()
+    assert transport.compute_driver_executable()[0].startswith("\\\\")          # nothing switched to UNC silently either
 
 
 def test_the_driver_copy_never_goes_to_the_system_drive_and_a_short_drive_leaves_nothing_behind(env, monkeypatch):
@@ -2173,15 +2206,12 @@ def test_an_old_journal_jsonl_is_still_replayed_so_nothing_already_sent_is_sent_
 
 
 
-def test_the_driver_never_searches_for_the_websocket_add_ons_and_the_probe_lists_the_searched_folders(env):
-    """VDI 2026-10-30: the driver program took ~84 s on every start; its WebSocket library searches every folder Node
-    knows for two optional add-ons that are not installed unless told not to."""
+def test_the_run_from_swap_copy_is_cleaned_up_and_the_probe_lists_the_searched_folders(env):
     (env.rt.root / "driver-node").mkdir(parents=True)                         # the run-from-swap copy of 2026-10-30
     (env.rt.root / "driver-node" / "node-1.64.1.exe").write_bytes(b"x")
     saved_env, saved_tmp, saved_path = dict(os.environ), tempfile.tempdir, list(sys.path)
     try:
         S.bootstrap_storage(env.cfg, env.policy)
-        assert os.environ["WS_NO_BUFFER_UTIL"] == "1" and os.environ["WS_NO_UTF_8_VALIDATE"] == "1"
         assert not (env.rt.root / "driver-node").exists()                     # cleaned up: it did not help
     finally:
         S.WRITE_GUARD["roots"] = None

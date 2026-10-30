@@ -77,6 +77,13 @@ def now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
 
 
+LAUNCHED = time.monotonic()      # one clock for the startup lines ("at 12.3s" = seconds since the tool started)
+
+
+def since_launch() -> str:
+    return f"{time.monotonic() - LAUNCHED:.1f}s"
+
+
 ZERO_WIDTH = dict.fromkeys(map(ord, "​‌‍⁠﻿"))  # the Copilot editor appends some
 
 
@@ -363,7 +370,7 @@ REQUIRED = ["cases_root", "instructions_path", "base_message_path", "python_exec
             "edge_executable", "runtime_root"]
 PATH_KEYS = REQUIRED + ["result_contract_path", "node_executable", "dependency_directory", "approved_root", "approved_unc_root",
                         "driver_cache_dir"]
-HERE = Path(__file__).resolve().parent
+HERE = Path(os.path.abspath(__file__)).parent   # never .resolve(): it turns a mapped drive (S:) into its UNC form
 
 
 def config_path() -> Path:
@@ -635,18 +642,16 @@ def bootstrap_storage(cfg, policy: PathPolicy) -> Runtime:
            "PIP_CACHE_DIR": rt.pipcache, "npm_config_cache": rt.root / "npm-cache",
            "PLAYWRIGHT_BROWSERS_PATH": rt.root / "pw-browsers", "XDG_CACHE_HOME": rt.root / "cache"}
     os.environ.update({k: str(v) for k, v in env.items()})
-    os.environ.update({"PYTHONDONTWRITEBYTECODE": "1", "PYTHONNOUSERSITE": "1", "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD": "1",
-                       # the driver's WebSocket library otherwise searches every folder Node knows for two optional
-                       # add-ons that are not installed (suspected 80 s on the VDI, see check's traced timing)
-                       "WS_NO_BUFFER_UTIL": "1", "WS_NO_UTF_8_VALIDATE": "1"})
+    os.environ.update({"PYTHONDONTWRITEBYTECODE": "1", "PYTHONNOUSERSITE": "1", "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD": "1"})
     shutil.rmtree(rt.root / "driver-node", ignore_errors=True)    # run-from-swap node.exe copy of 2026-10-30: no gain
     if cfg.node_executable:  # must be set before Playwright starts its driver
         os.environ["PLAYWRIGHT_NODEJS_PATH"] = cfg.node_executable
     tempfile.tempdir = str(rt.temp)
     if os.path.normcase(tempfile.gettempdir()) != os.path.normcase(str(rt.temp)):  # verify, don't assume
         raise StorageError("temporary-file redirection did not take effect")
-    if str(rt.deps) not in sys.path:  # embedded Python ignores PYTHONPATH, so add it explicitly
-        sys.path.insert(0, str(rt.deps))
+    deps = drive_letter_spelling(str(rt.deps))   # playwright.__file__ (and so the driver path) on the drive letter, not UNC
+    if deps not in sys.path:  # embedded Python ignores PYTHONPATH, so add it explicitly
+        sys.path.insert(0, deps)
     global DRIVER_CACHE_ROOT
     DRIVER_CACHE_ROOT = Path(cfg.driver_cache_dir) / "playwright-driver" \
         if getattr(cfg, "driver_cache_dir", "") and drive_class(cfg.driver_cache_dir) == "fast" else None
@@ -713,7 +718,7 @@ def use_colour() -> bool:
 
 
 # What the "minimal" console shows: the queue, the case being sent, its result, and anything the user must act on.
-MINIMAL_PHASES = {"queue", "start", "submitted", "submitted_partial", "submission_uncertain", "preflight_blocked",
+MINIMAL_PHASES = {"queue", "start", "startup", "submitted", "submitted_partial", "submission_uncertain", "preflight_blocked",
                   "failed_exhausted", "WARNING", "at-limit", "attempt-failed", "deferred", "released", "paused",
                   "stopped", "login", "session", "model", "reconnect", "recovered", "dependencies", "fixup", "resubmit",
                   "result_correct", "result_incorrect", "result_inconclusive", "result_invalid", "response_timeout"}
@@ -1390,27 +1395,58 @@ def drive_letter_spelling(path: str) -> str:
     return letter + p[len(remote):]
 
 
-def use_drive_letter(log) -> None:
-    """Start the Playwright driver (node.exe + cli.js) through the drive letter when Python found it by UNC path."""
-    try:
-        import playwright._impl._transport as transport
-        node, cli = (str(p) for p in transport.compute_driver_executable())
-        n2, c2 = drive_letter_spelling(node), drive_letter_spelling(cli)
-        if (n2, c2) != (node, cli) and os.path.isfile(n2) and os.path.isfile(c2):
-            transport.compute_driver_executable = lambda: (n2, c2)
-            log("connect", note="Playwright driver started through its drive letter, not its \\\\server\\share path "
-                                "(from there a missing-module lookup reaches \\\\server\\node_modules: ~80 s)")
-    except Exception:
-        pass
+# Do not remove: the driver's WebSocket library otherwise looks for two optional add-ons that are not installed, and
+# under a UNC start each missing-module lookup costs ~80 s (VDI 2026-10-30).  Second guard behind the drive letter.
+# Given to the driver process only (never os.environ, never system-wide).
+DRIVER_ENV = {"WS_NO_BUFFER_UTIL": "1", "WS_NO_UTF_8_VALIDATE": "1"}
+
+
+def driver_command() -> tuple:
+    r"""THE one place that decides how the Playwright driver starts - `check` and the run both call it (never a second
+    path computation).  Returns (node, cli, how).  Startup on the network drive, proven on the VDI 2026-10-30:
+      - started by its UNC path (\\server\share\...), Node's search for a missing module walks past the share to
+        \\server\node_modules, which Windows treats as a share request and gives up on after ~80 s;
+      - started by the mapped drive letter (S:\...) the walk ends at S:\node_modules at once (all folders 0.0 s).
+    So node.exe and cli.js are always started through the drive letter, never .resolve()d/realpath()ed (that turns a
+    mapped drive back into UNC).  No mapped drive covering them in this session = stop, never fall back to UNC.
+    The driver process also gets DRIVER_ENV.  Home folder and NODE_PATH are left alone: never the cause."""
+    import playwright._impl._transport as transport
+    node, cli = (str(p) for p in transport.compute_driver_executable())
+    n2, c2 = drive_letter_spelling(node), drive_letter_spelling(cli)
+    for label, path in (("node.exe", n2), ("the driver package (cli.js)", c2)):
+        if path.startswith("\\\\"):
+            raise StorageError(f"{label} would start from a UNC path: no mapped drive letter covers it in this session. "
+                               "Map the drive (e.g. S:), then run again - a UNC start costs ~80 s per missing-module lookup")
+        if not os.path.isfile(path):
+            raise StorageError(f"{label} was not found through the drive letter")
+    cwd = os.getcwd()
+    if cwd.startswith("\\\\"):                     # the driver inherits this process's working folder
+        if drive_letter_spelling(cwd).startswith("\\\\"):
+            raise StorageError("the working folder is a UNC path with no mapped drive letter: map the drive, then run again")
+        os.chdir(drive_letter_spelling(cwd))
+    transport.compute_driver_executable = lambda: (n2, c2)
+    if not getattr(transport.get_driver_env, "with_driver_env", False):
+        original = transport.get_driver_env
+
+        def with_driver_env() -> dict:
+            return {**original(), **DRIVER_ENV}
+        with_driver_env.with_driver_env = True
+        transport.get_driver_env = with_driver_env
+    how = "drive letter" if n2 == node else f"network path \\\\server\\share, started through its drive letter {n2[:2]}"
+    return n2, c2, how
+
+
 async def start_driver(api, log, node_configured: bool, refresh: bool = True):
-    """Start the Playwright driver: the verified local copy first (bounded by LOCAL_DRIVER_SECONDS), else the original
-    on S: (slow on the VDI, never cut short).  Returns (playwright, where, seconds).  A local copy that is blocked
-    (e.g. a policy refusing programs there) or hangs is reported by name and the run carries on from S:."""
+    """Start the Playwright driver: the verified local copy first (bounded by LOCAL_DRIVER_SECONDS), else node.exe on
+    the network drive through its drive letter (driver_command).  Returns (playwright, where, seconds).  A local copy
+    that is blocked or hangs is reported by name and the run carries on from the network drive."""
     t0 = time.monotonic()
     cache = DriverCache(log)
     if not node_configured and await asyncio.to_thread(cache.ready):
         cache.use()
+        driver_command()                               # driver env only; the local copy is not on the network drive
         try:
+            log("startup", note=f"driver: process starting from the local copy (at {since_launch()})")
             pw = await asyncio.wait_for(api().start(), LOCAL_DRIVER_SECONDS)
             return pw, "local copy", time.monotonic() - t0
         except Exception as exc:
@@ -1418,15 +1454,12 @@ async def start_driver(api, log, node_configured: bool, refresh: bool = True):
                    else f"failed ({type(exc).__name__})")
             log("connect", note=f"playwright_driver_start: local copy {why}; starting the driver from S: instead")
             cache.unuse()
-        pw = await api().start()
-        return pw, "S: (local copy refused)", time.monotonic() - t0
-    use_drive_letter(log)
-    pw, where = None, "configured node" if node_configured else "S:"
-    if pw is None:
-        pw = await api().start()
+    _node, _cli, how = driver_command()
+    log("startup", note=f"driver: process starting ({how}) (at {since_launch()})")
+    pw = await api().start()
     if refresh and not node_configured and cache.root is not None:
         threading.Thread(target=cache.refresh, daemon=True).start()
-    return pw, where, time.monotonic() - t0
+    return pw, "configured node" if node_configured else "S:", time.monotonic() - t0
 
 
 # --------------------------------------------------------------------------------------------
@@ -1824,6 +1857,7 @@ class EdgeBrowser:
         with fresh discovery).  A failed attempt makes room for the next one at once.  The first attempt that connects
         wins; every other one is cancelled, or disconnected if it also finished.  Gives up only at the budget end."""
         t0 = time.monotonic()
+        self.log("startup", note=f"edge: connect_over_cdp started (at {since_launch()})")
         budget_end = t0 + self.cfg.reconnect_budget_seconds
         port, last, started, next_at, pending = self.cfg.cdp_port, "no attempt", 0, t0, set()
         winner = None
@@ -1886,8 +1920,8 @@ class EdgeBrowser:
             write_atomic(memo, route)
         except PersistenceError:
             pass
-        self.log("connect", note=f"connected to Edge in {time.monotonic() - t0:.1f}s - WINNER: attempt {number} of {started}, "
-                                 f"{route} route (tried first next time)")
+        self.log("startup", note=f"edge: connected in {time.monotonic() - t0:.1f}s - WINNER: attempt {number} of {started}, "
+                                 f"{route} route (tried first next time) (at {since_launch()})")
 
     async def _close_quietly(self, browser):
         try:
@@ -1926,10 +1960,12 @@ class EdgeBrowser:
             t0 = time.monotonic()
 
             async def driver():
-                self.phase = "starting the Playwright driver"
+                self.phase = "starting the Playwright driver (Python import)"
                 self.api = await asyncio.to_thread(load_playwright)
+                self.log("startup", note=f"driver: Python imported Playwright in {time.monotonic() - t0:.1f}s (at {since_launch()})")
+                self.phase = "starting the Playwright driver"
                 self.pw, where, secs = await start_driver(self.api[0], self.log, bool(self.cfg.node_executable))
-                self.log("connect", note=f"Playwright driver started in {secs:.1f}s from {where}"
+                self.log("startup", note=f"driver: Playwright driver started in {secs:.1f}s from {where} (at {since_launch()})"
                                          + ("" if not where.startswith("S:") else " (a copy is being made on the fast drive for next time)"
                                             if DRIVER_CACHE_ROOT else " (no driver_cache_dir set: no fast copy, nothing written to C:)")
                                          + f"; startup so far {time.monotonic() - t0:.1f}s")
@@ -3836,40 +3872,56 @@ def check_command(args) -> int:
     try:
         ensure_dependencies(cfg, rt, ctx_.log)
         line(f"playwright {playwright_version()}", True)
-        from playwright._impl._driver import compute_driver_executable
-        node, cli = (str(p) for p in compute_driver_executable())
+        import playwright
+        node, cli, how = driver_command()          # the SAME function the run uses (one place decides the driver path)
         line("node for Playwright driver", Path(node).is_file(), "configured" if cfg.node_executable else "bundled")
-        spelled = drive_letter_spelling(node)
-        print("  driver path: " + ("network path \\\\server\\share, started through its drive letter " + spelled[:2]
-                                   if spelled != node else "UNC, no mapped drive covers it (missing-module lookups may be slow)"
-                                   if node.startswith("\\\\") else "drive letter"))
-        node, cli = spelled, drive_letter_spelling(cli)
+        print(f"  driver path: {how}")
+        for label, path in (("node.exe", node), ("driver package (cli.js)", cli), ("working folder", os.getcwd()),
+                            ("playwright package", playwright.__file__)):
+            line(f"{label} on a drive letter, not UNC", not str(path).startswith("\\\\"))
+        if sys.executable.startswith("\\\\"):      # does not slow the driver (started through the drive letter anyway)
+            print("  note: Python itself was started by UNC path - start Run.cmd from the drive letter (e.g. S:)")
         print(f"  local non-system disks: {', '.join(fast_drives()) or 'none'}; driver_cache_dir: "
               + (f"set ({drive_class(cfg.driver_cache_dir)} drive)" if cfg.driver_cache_dir else "not set (no fast copy)"))
 
-        # Where does a slow driver start go?  VDI 2026-10-30: node alone 1.1 s, bundles read 3.0 s, driver program
-        # 83.9 s on every start; with the add-on lookups switched off (WS_NO_*) the driver started in 2.1 s.  Step 3
-        # names the folder that makes a missing-module lookup slow (LOOKUP_PROBE_JS).  Found: \\server\node_modules
-        # (80.7 s), reached only from the UNC spelling - so these steps, like the run, use the drive letter.
+        # Regression test for startup on the network drive (README "Startup on the network drive").  Healthy on the VDI
+        # (2026-10-30): 1/5 ~1.5-2.5 s, 2/5 ~2-3 s, 3/5 every folder 0.0 s and 15 folders, 4/5 ~0.7-2 s, 5/5 ~2-4 s.
+        # Step 3 found the cause: from a UNC start the walk reached \\server\node_modules (80.7 s, UNKNOWN, 17 folders).
+        def slow(secs: float, limit: float) -> str:
+            return f"  ! slower than healthy (investigate over {limit:.0f}s)" if secs > limit else ""
+
+        def secs_of(took: str) -> float:
+            try:
+                return float(took.split("s")[0])
+            except ValueError:
+                return 999.0
         bundles = sorted(Path(cli).parent.glob("lib/*Bundle.js"))
         mb = sum(b.stat().st_size for b in bundles) / 2**20
-        print(f"  timing 1/5  node.exe alone: {timed_run([node, '--version'])[0]} ({drive_class(node)} drive)")
-        print(f"  timing 2/5  node reads the {len(bundles)} driver bundles ({mb:.1f} MB): " + timed_run(
-            [node, "-e", "const fs=require('fs');for(const f of process.argv.slice(1))fs.readFileSync(f)", *map(str, bundles)])[0])
+        took = timed_run([node, "--version"])[0]
+        print(f"  timing 1/5  node.exe alone: {took} ({drive_class(node)} drive){slow(secs_of(took), 5)}")
+        took = timed_run([node, "-e", "const fs=require('fs');for(const f of process.argv.slice(1))fs.readFileSync(f)",
+                          *map(str, bundles)])[0]
+        print(f"  timing 2/5  node reads the {len(bundles)} driver bundles ({mb:.1f} MB): {took}{slow(secs_of(took), 6)}")
         took, err = timed_run([node, "-e", LOOKUP_PROBE_JS, str(Path(cli).parent / "lib")])
         print(f"  timing 3/5  folders Node searches for a missing module (real paths - sanitise before sharing): {took}")
-        for row in [r for r in err.splitlines() if r.startswith("PROBE ")][:40] or err.strip().splitlines()[-15:]:
-            print(f"      {row[6:] if row.startswith('PROBE ') else row}")
+        rows = [r[6:] for r in err.splitlines() if r.startswith("PROBE ")]
+        for row in rows[:40] or err.strip().splitlines()[-15:]:
+            print(f"      {row}")
+        found = [re.match(r"(\d+\.\d)s  (\S+)  (.*)$", r) for r in rows]
+        folders = [m for m in found if m and not m.group(2).startswith("whole")]
+        bad = [m for m in found if m and (float(m.group(1)) > 0.5 or m.group(2) == "UNKNOWN" or m.group(3).startswith("\\\\"))]
+        line(f"missing-module search: {len(folders)} folders (15 expected from the drive letter; 17 = UNC is back), "
+             "none slow or UNC", bool(folders) and not bad, f"{len(bad)} bad" if bad else "")
         t = time.monotonic()
         api = load_playwright()[0]
-        print(f"  timing 4/5  Python imports Playwright: {time.monotonic() - t:.1f}s")
+        print(f"  timing 4/5  Python imports Playwright: {time.monotonic() - t:.1f}s{slow(time.monotonic() - t, 5)}")
 
         async def driver():
             pw, where, secs = await start_driver(api, ctx_.log, bool(cfg.node_executable), refresh=False)
             await pw.stop()
             return where, secs
         where, secs = asyncio.run(driver())
-        line("Playwright driver starts", True, f"timing 5/5  {secs:.1f}s from {where}")
+        line("Playwright driver starts", True, f"timing 5/5  {secs:.1f}s from {where}{slow(secs, 5)}")
     except Exception as exc:
         line("dependencies / driver", False, safe_exc(ctx_.red, exc))
     line("edge executable", Path(cfg.edge_executable).is_file())
@@ -4477,6 +4529,7 @@ async def ready_tabs(browser, cfg, tabs, log, tour=None) -> list:
     page).  A tab left on a sign-in page is reloaded at once (you signed in elsewhere); a tab still not ready is reloaded
     silently every READY_RELOAD_SECONDS, and after READY_RELOADS reloads it is dropped with a warning.  Order is kept."""
     origin = "{0.scheme}://{0.netloc}".format(urlparse(cfg.copilot_url))
+    t0 = time.monotonic()
 
     async def one(n, tab):
         try:
@@ -4492,6 +4545,7 @@ async def ready_tabs(browser, cfg, tabs, log, tour=None) -> list:
             if await tab.is_ready():
                 try:
                     await tab.adopt()            # fresh chat, exact target id
+                    log("startup", note=f"tab {n} ready in {time.monotonic() - t0:.1f}s (at {since_launch()})")
                     return tab
                 except SenderError:
                     pass
@@ -4513,7 +4567,9 @@ async def ready_tabs(browser, cfg, tabs, log, tour=None) -> list:
                 since = time.monotonic()
             await browser.stop.sleep(0.5)
     done = await asyncio.gather(*(one(n, t) for n, t in enumerate(tabs, 2)))
-    return [t for t in done if t]
+    ready = [t for t in done if t]
+    log("startup", note=f"tabs: {len(ready)} of {len(tabs)} ready in {time.monotonic() - t0:.1f}s (at {since_launch()})")
+    return ready
 
 
 async def quiet(coro):
@@ -4666,7 +4722,7 @@ def ask_cursor(cfg, log) -> "asyncio.Future":
             loop.call_soon_threadsafe(lambda err=exc: fut.done() or fut.set_exception(err))   # bound now: `exc` is cleared after except
             return
         log("session", note="moving cursor " + ("on" if result else "off"))
-        log.release(answer_first=True)        # the answer's line first, then everything that happened meanwhile
+        log.release()                         # in time order: what happened meanwhile, then the answer's line
         loop.call_soon_threadsafe(lambda: fut.done() or fut.set_result(result))
     threading.Thread(target=work, daemon=True).start()
     return fut
