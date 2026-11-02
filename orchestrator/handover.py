@@ -191,7 +191,7 @@ def _document_lines(events: list) -> list:
                 out.append(f"      - capture: {c}")
             if e.get("viewerPageCopy"):
                 out.append(f"      - viewer page copy: {e['viewerPageCopy']}")
-        elif name in ("search-result-not-single", "single-view-found-after-fixed-wait", "held-before-opening", "run-failed",
+        elif name in ("search-result-not-single", "search-state", "single-view-found-after-fixed-wait", "held-before-opening", "run-failed",
                       "identity-verified", "audit-trail-downloaded", "document-ui-fallback-started", "all-received-documents-downloaded"):
             extra = {k: v for k, v in e.items() if k not in ("at", "event")}
             out.append(f"    - {e.get('at', '')[11:19]} {name} {json.dumps(extra, ensure_ascii=False, default=str)[:400]}")
@@ -201,7 +201,7 @@ def _document_lines(events: list) -> list:
 def pipeline_report(paths: P.Paths, plan: dict, rows: list, edge_offset=None) -> Path | None:
     """RUNTIME_ROOT\\logs\\pipeline-report-<run>.md - never raises (a report must not change a run)."""
     try:
-        out = [f"# Pipeline report - run {paths.run.name}", "", PIPELINE_GUIDE, "", "## 1. Whole workload",
+        out = [f"# Pipeline report - run {paths.run.name}", "", "> " + P.REVIEWER_NOTE, "", PIPELINE_GUIDE, "", "## 1. Whole workload",
                f"- {P.workload_line(rows)}", "",
                "| row | instruction ID | account | status | Sub Worktype | outcome | detail |", "|---|---|---|---|---|---|---|"]
         out += [f"| {r['row']} | {r['instruction_id']} | {r['client_account_number']} | {r['process_status']} | {r['sub_worktype']} | "

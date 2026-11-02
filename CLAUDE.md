@@ -29,7 +29,7 @@ brand pattern of System 1/2 lives only in the git-ignored config (pasted once in
 | `3_copilot_sender/copilot_case_sender.py` | Part 3, the sender (~4,900 lines). Pipeline mode: `run --pipeline <run dir>` with `PipelineFeed` (section 9b). |
 | `guidance/` | `result_contract.md` template + README (real `<Sub Worktype>.md` files live in `guidance_dir`). |
 | `README.md` | Full user/design documentation. Authoritative for behaviour; read the relevant section before changing logic. |
-| `tests/test_sender.py`, `tests/test_pipeline.py`, `tests/test_code_checks.py` | 166 tests (code checks: keyword clashes, every part parses) (fake pages, real processes for one whole run). Need `SENDER_TEST_ROOT`; Part 2 tests need requests+bs4 (else skipped). |
+| `tests/test_sender.py`, `tests/test_pipeline.py`, `tests/test_code_checks.py` | 169 tests (code checks: keyword clashes, every part parses) (fake pages, real processes for one whole run). Need `SENDER_TEST_ROOT`; Part 2 tests need requests+bs4 (else skipped). |
 | `.gitignore` | Excludes `sender_config.json` (at the top level), `local_python.cmd`, `sender_runtime/`, logs, `.venv/`, `.env`. |
 
 Commands: `Run.cmd [run] | setup | check | plan | send-only` (`--detail minimal|full`).
@@ -49,6 +49,10 @@ Tests: `set SENDER_TEST_ROOT=<folder>` then `<python> -B -m pytest -p no:cachepr
 - Parts talk ONLY through `shared/pipeline.py` files. Parts 1/2 reuse the sender's storage bootstrap and driver start
   (never their own Playwright start path: the ~80 s UNC startup must not come back).
 - No guidance file for the search result's Sub Worktype = held BEFORE View is clicked (`guidance_problem`), nothing downloaded.
+- My Inbox search: fixed `SEARCH_WAIT` 1.5 s kept (user rule); no single View then = `settle_search` names the state
+  up to `SEARCH_SETTLE` 10 s. "Your inbox is empty" (`EMPTY_INBOX`) / several results = CaseHeld (no retry).
+- Reports and captures keep whole page copies (user's choice) but open with `P.REVIEWER_NOTE` (use everything, never
+  repeat company details). The review contract and snapshot reuse stay as they are (the user explains both in the base message).
 - Part 1 program errors (`PROGRAM_ERRORS`) are never retried, keep their trace (pipeline report), and the same one on a
   second case stops Part 1 (`run_cases`). Every new browser-side step needs a test that RUNS it (scripted page): the
   2026-11-02 VDI run failed every case on a line no test executed (`event(..., name=...)`; `event` is now positional-only).

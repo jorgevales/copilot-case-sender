@@ -122,9 +122,9 @@ def capture(label,exc):
     try:
         CAPTURES.mkdir(parents=True,exist_ok=True)
         title=clean(s.title.get_text()) if s.title else ""
-        (CAPTURES/f"{base}.txt").write_text(f"HTTP {r.status_code}\naddress: {P.strip_query(r.url)}\ntitle: {title}\n"
+        (CAPTURES/f"{base}.txt").write_text(P.REVIEWER_NOTE+f"\n\nHTTP {r.status_code}\naddress: {P.strip_query(r.url)}\ntitle: {title}\n"
                                             f"error: {type(exc).__name__}: {exc}\n\n"+P.strip_queries(clean(s.get_text(" ",strip=True)))[:100000],encoding="utf-8")
-        (CAPTURES/f"{base}.html").write_text(P.strip_queries(r.text)[:3000000],encoding="utf-8")
+        (CAPTURES/f"{base}.html").write_text(P.html_note(P.strip_queries(r.text)[:3000000]),encoding="utf-8")
         return [f"{base}.txt",f"{base}.html"]
     except Exception:
         return []

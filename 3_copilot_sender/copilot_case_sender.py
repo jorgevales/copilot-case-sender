@@ -4605,6 +4605,12 @@ def strip_query(url) -> str:
     return P.strip_query(url)
 
 
+def reviewer_note() -> str:
+    """The line that opens every report: use everything, repeat no company details (shared/pipeline.py)."""
+    from shared import pipeline as P
+    return "> " + P.REVIEWER_NOTE
+
+
 def _url_shape(url: str, red) -> str:
     return strip_query(url)
 
@@ -4754,7 +4760,8 @@ def write_run_report(ctx, journal, cases, runner, bfacts, started, start_seq, co
             digest, size = hashlib.sha256(script.read_bytes()).hexdigest()[:16], script.stat().st_size
         except OSError:
             digest, size = "?", 0
-        out = [f"# Run report - {datetime.datetime.now():%Y-%m-%d %H:%M:%S} (local) - exit code {code}", "", "## 0. How to read this report", REPORT_GUIDE,
+        out = [f"# Run report - {datetime.datetime.now():%Y-%m-%d %H:%M:%S} (local) - exit code {code}", "", reviewer_note(), "",
+               "## 0. How to read this report", REPORT_GUIDE,
                "## 1. Outcome", f"- command line: {red(' '.join(argv))}",
                f"- duration: {time.monotonic() - started:.1f}s | exit code: {code} ({'ok' if code == 0 else 'see errors'}) | cases that reached Copilot: {len(cases)}",
                f"- results by state: {dict(counts)}",
@@ -4861,7 +4868,8 @@ def write_responses(ctx, runner, cases, path) -> str:
     try:
         by_key = {c.key: c for c in cases}
         keys = [k for k in by_key if runner.transcripts.get(k)] + [k for k in runner.transcripts if k not in by_key]
-        out = [f"# Copilot responses - {datetime.datetime.now():%Y-%m-%d %H:%M} - {len(keys)} chat(s)", "", RESPONSES_GUIDE, ""]
+        out = [f"# Copilot responses - {datetime.datetime.now():%Y-%m-%d %H:%M} - {len(keys)} chat(s)", "", reviewer_note(), "",
+               RESPONSES_GUIDE, ""]
         for key in keys:
             c = by_key.get(key)
             state, reason = runner.results.get(key, ("?", ""))

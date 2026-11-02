@@ -106,6 +106,20 @@ def strip_query(url) -> str:
     return f"{u.scheme}://{u.netloc}{u.path}" + ("?" + "&".join(f"{k}=…" for k in names) if names else "")
 
 
+REVIEWER_NOTE = (
+    "FOR THE REVIEWING COPILOT: use everything in this file - and the screenshots, page copies and other files of the same "
+    "run - to explain exactly what happened, as precisely and usefully as you can. In what you write back, never copy "
+    "company or client details: no client or company names, instruction IDs, account or customer numbers, hosts, web "
+    "addresses, file paths, user or machine names, access codes, tokens or session values (page copies can contain them, "
+    "e.g. in inline scripts). Describe them generically instead (CASE-01, 'the System 1 host', 'an access value in an "
+    "inline script'). Sub Worktype names, file types, counts, timings, page states, error texts and settings may stay.")
+
+
+def html_note(html_text: str) -> str:
+    """A saved page copy, opening with REVIEWER_NOTE as an HTML comment (the page itself is unchanged)."""
+    return "<!-- " + REVIEWER_NOTE.replace("--", "-") + " -->\n" + str(html_text or "")
+
+
 URL_IN_TEXT = re.compile(r"https?://[^\s\"'<>)\]]+")
 
 

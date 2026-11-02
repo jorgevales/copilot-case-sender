@@ -12,8 +12,11 @@ It uses the one System 1 tab in the **systems Edge** (port `systems_cdp_port`, d
   **held before View is clicked**, nothing downloaded) → open it → verify the exact ID **and** the CSV's account on
   Overview (a different account = the case is held, never downloaded) → download into
   `CASES_ROOT\.work\<id> - <ACCOUNT>` → back to My Inbox.
-- **The search** keeps its fixed 1.5 s wait; when it does not show exactly one View, the reason says so in plain words
-  (with the count) and the case is retried once, as before.
+- **The search** keeps its fixed 1.5 s wait. Without exactly one View then, the page is watched up to 10 s from Enter
+  and its state named (each change recorded with the filters that are on): a single View that appears late is used;
+  **"Your inbox is empty. There are no tasks available."** = held as "not in My Inbox under the current filters
+  (<filters>)", no retry (the same search gives the same answer); several results = held, no retry; a sign-in page,
+  a page still loading or anything else after 10 s = a failure, retried once.
 - **Each document**, first the **direct route** (no click): its viewer address, paired with its row by the document
   ID it names (by page order only when no address names an ID and the counts match; otherwise no address), fetched with
   the System 1 sign-in. When that address answers with a viewer page instead of the file, the file that page shows

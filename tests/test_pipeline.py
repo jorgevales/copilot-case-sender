@@ -719,6 +719,81 @@ def test_part1_stops_when_the_same_program_error_hits_a_second_case(base, monkey
     assert not any(hexid(4) in s and "downloading" in s for s in said)
 
 
+class InboxPage:
+    """My Inbox after a search: each evaluate of the state script returns the next scripted state (the last one stays)."""
+    def __init__(self, states, url="https://system1.example.invalid/app/inbox"):
+        self.states, self.url, self.clicked = list(states), url, []
+
+    def locator(self, sel):
+        class Field:
+            async def fill(self, v):
+                self.v = v
+
+            async def input_value(self):
+                return self.v
+
+            async def press(self, key):
+                pass
+        return Field()
+
+    async def evaluate(self, script, arg=None):
+        st = self.states.pop(0) if len(self.states) > 1 else self.states[0]
+        if script == P1.SINGLE_VIEW_JS:
+            return {"count": st["views"], "subWorkType": "Bank Details" if st["views"] == 1 else ""}
+        return {"text": "", "loading": False, "password": False, "filters": ["My tasks", "Active", "Waiting"], **st}
+
+    async def eval_on_selector(self, sel, script):
+        self.clicked.append(sel)
+
+
+def search(monkeypatch, page):
+    async def same(*a, **k):
+        return page
+    monkeypatch.setattr(P1, "ensure_clean_inbox_search", same)
+    monkeypatch.setattr(P1, "live", same)
+    monkeypatch.setattr(P1, "SEARCH_WAIT", 0.01)
+    monkeypatch.setattr(P1, "SEARCH_SETTLE", 1.0)
+    monkeypatch.setattr(P1, "SEARCH_STABLE", 0.3)
+    events = []
+    return events
+
+
+def test_my_inbox_saying_empty_is_held_with_its_filters_and_never_clicked(base, monkeypatch):
+    p1_setup(base)
+    empty = {"views": 0, "text": "Tasks Your inbox is empty. There are no tasks available. You can start one of the following processes:"}
+    page = InboxPage([{"views": 0}, {"views": 0}, {"views": 0, "loading": True}, empty])   # nothing, loading, then the label
+    events = search(monkeypatch, page)
+    with pytest.raises(P1.CaseHeld, match="not in My Inbox under the current filters") as held:
+        T.run(P1.search_open(None, page, hexid(6), events))
+    assert "My tasks, Active, Waiting" in str(held.value) and not page.clicked
+    assert [e["state"] for e in events if e["event"] == "search-state"] == ["none", "loading", "empty"]
+
+
+def test_a_single_view_that_appears_late_is_used_and_other_states_are_named(base, monkeypatch):
+    p1_setup(base)
+    page = InboxPage([{"views": 0}, {"views": 0, "loading": True}, {"views": 1}])
+    events = search(monkeypatch, page)
+    with pytest.raises(P1.CaseHeld, match="no instructions"):                 # stops just before the click
+        T.run(P1.search_open(None, page, hexid(6), events, check_sub=lambda s: "no instructions for " + s))
+    assert any(e["event"] == "single-view-found-after-fixed-wait" and e["subWorkType"] == "Bank Details" for e in events)
+    page = InboxPage([{"views": 3}])
+    with pytest.raises(P1.CaseHeld, match="showed 3 results"):
+        T.run(P1.search_open(None, page, hexid(6), search(monkeypatch, page)))
+    page = InboxPage([{"views": 0, "loading": True}])                           # never settles: a failure (retried once)
+    with pytest.raises(RuntimeError, match="no View and no 'inbox is empty' label") as err:
+        T.run(P1.search_open(None, page, hexid(6), search(monkeypatch, page)))
+    assert not isinstance(err.value, P1.CaseHeld) and "page state: loading" in str(err.value)
+    page = InboxPage([{"views": 0, "password": True}])
+    with pytest.raises(RuntimeError, match="page state: signin"):
+        T.run(P1.search_open(None, page, hexid(6), search(monkeypatch, page)))
+
+
+def test_every_report_and_capture_opens_with_the_reviewer_note():
+    assert "never copy" in P.REVIEWER_NOTE and "access codes" in P.REVIEWER_NOTE
+    assert P.html_note("<html></html>").startswith("<!-- FOR THE REVIEWING COPILOT") and "--" not in P.html_note("")[4:].split("-->")[0]
+    assert T.S.reviewer_note().startswith("> FOR THE REVIEWING COPILOT")
+
+
 def test_part1_document_window_is_read_without_clicking_inside_the_document(base):
     paths, _ = p1_setup(base)
     folder = base / "f"

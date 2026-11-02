@@ -120,9 +120,9 @@ async def capture_page(page, label):
             pass
         title=await asyncio.wait_for(page.title(),5)
         text=await asyncio.wait_for(page.evaluate("()=>document.body?document.body.innerText:''"),5)
-        (CAPTURES/f'{base}.txt').write_text(f'address: {P.strip_query(page.url)}\ntitle: {title}\n\n'+P.strip_queries(text)[:200000],encoding='utf-8')
+        (CAPTURES/f'{base}.txt').write_text(P.REVIEWER_NOTE+f'\n\naddress: {P.strip_query(page.url)}\ntitle: {title}\n\n'+P.strip_queries(text)[:200000],encoding='utf-8')
         names.append(f'{base}.txt')
-        (CAPTURES/f'{base}.html').write_text(P.strip_queries(await asyncio.wait_for(page.content(),10))[:3000000],encoding='utf-8')
+        (CAPTURES/f'{base}.html').write_text(P.html_note(P.strip_queries(await asyncio.wait_for(page.content(),10))[:3000000]),encoding='utf-8')
         names.append(f'{base}.html')
     except Exception:
         pass
@@ -326,26 +326,13 @@ async def detect_open_section(page):
       return '';
     }""")
 
-async def search_open(context,page,instruction_id,events,check_sub=None):
-    """
-    Submit the new instruction ID, wait a fixed 1.5 seconds for My Inbox to
-    replace the previous filtered result, then click the only visible View.
-    No result-ID matching is performed.  `check_sub(sub)` may hold the case
-    (CaseHeld) on the result row's Sub WorkType BEFORE View is clicked.
-    """
-    page=await ensure_clean_inbox_search(page,timeout=60)
-    field=page.locator('[data-bulk-search="1"]')
-    await field.fill(instruction_id)
-    if await field.input_value()!=instruction_id:
-        raise RuntimeError('Instruction ID was not written into the search field')
-    await field.press('Enter')
-    event(events,'search-submitted',instructionId=instruction_id)
+SEARCH_WAIT=1.5       # fixed: the previous search's View can stay visible this long
+SEARCH_SETTLE=10.0    # no single View then: watch the page up to this long (from Enter) for a clear state
+SEARCH_STABLE=1.5     # 'inbox is empty' / several results must last this long before they are believed
+EMPTY_INBOX=re.compile(r"your inbox is empty|there are no tasks available",re.I)   # VDI wording, 2026-11-02
 
-    # Required fixed delay: the old filtered View can remain visible briefly.
-    await asyncio.sleep(1.5)
-    page=await live(context,page)
-
-    result=await page.evaluate(r"""() => {
+# Marks the single visible View (data-s4view) and reads its Sub WorkType; otherwise only counts the Views.
+SINGLE_VIEW_JS=r"""() => {
       const clean=v=>(v??'').toString().replace(/\s+/g,' ').trim();
       const visible=e=>{const s=getComputedStyle(e),r=e.getBoundingClientRect();return !!(r.width||r.height)&&s.display!=='none'&&s.visibility!=='hidden'};
       const views=[...document.querySelectorAll('button,a,[role=button]')]
@@ -361,17 +348,102 @@ async def search_open(context,page,instruction_id,events,check_sub=None):
         node=node.parentElement;
       }
       return {count:1,subWorkType:sub};
-    }""")
+    }"""
+
+# What My Inbox shows after a search (read only): Views, the visible text (the 'inbox is empty' label lives there), a
+# loading sign, a password field (sign-in page) and the filter choices that are on (checked / selected / pressed).
+INBOX_STATE_JS=r"""() => {
+      const clean=v=>(v??'').toString().replace(/\s+/g,' ').trim();
+      const visible=e=>{const s=getComputedStyle(e),r=e.getBoundingClientRect();return !!(r.width||r.height)&&s.display!=='none'&&s.visibility!=='hidden'};
+      const views=[...document.querySelectorAll('button,a,[role=button]')]
+        .filter(e=>visible(e)&&clean(e.innerText||e.value||e.textContent).toLowerCase()==='view').length;
+      const label=e=>clean((e.labels&&e.labels[0]&&e.labels[0].innerText)||e.getAttribute('aria-label')||
+        (e.closest('label')&&e.closest('label').innerText)||e.innerText||e.textContent).slice(0,60);
+      const filters=[...document.querySelectorAll('input[type=checkbox]:checked,input[type=radio]:checked,[aria-checked="true"],[aria-selected="true"],[aria-pressed="true"],select')]
+        .filter(visible).map(e=>e.tagName==='SELECT'?clean(e.selectedOptions[0]&&e.selectedOptions[0].textContent):label(e)).filter(Boolean);
+      return {views, text:clean(document.body?document.body.innerText:'').slice(0,4000),
+        loading:[...document.querySelectorAll('[aria-busy="true"],[role=progressbar],[class*=spinner i],[class*=loading i]')].some(visible),
+        password:!!document.querySelector('input[type=password]'), filters:[...new Set(filters)].slice(0,20)};
+    }"""
+
+
+def search_state(raw,in_system1=True):
+    """One word for what My Inbox shows: single / empty / several / signin / loading / none."""
+    if not in_system1 or raw.get('password'):return 'signin'
+    if raw.get('views')==1:return 'single'
+    if raw.get('views',0)>1:return 'several'
+    if EMPTY_INBOX.search(raw.get('text','')):return 'empty'
+    return 'loading' if raw.get('loading') else 'none'
+
+
+async def settle_search(context,page,events,started):
+    """No single View after SEARCH_WAIT: watch until My Inbox shows one clear state - a single View (at once),
+    'inbox is empty' or several results (each for SEARCH_STABLE) - or SEARCH_SETTLE has passed.  Every change of
+    state is recorded.  Returns (page, state, last raw state)."""
+    last,since,raw=None,0.0,{}
+    while True:
+        page=await live(context,page)
+        try:
+            raw=await page.evaluate(INBOX_STATE_JS)
+            state=search_state(raw,in_app(page.url))
+        except Exception as exc:
+            raw,state={'error':f'{type(exc).__name__}: {exc}'},'none'
+        waited=round(time.monotonic()-started,1)
+        if state!=last:
+            last,since=state,time.monotonic()
+            event(events,'search-state',state=state,views=raw.get('views'),loading=raw.get('loading'),
+                  filters=raw.get('filters'),afterSeconds=waited)
+        if state=='single' or (state in ('empty','several','signin') and time.monotonic()-since>=SEARCH_STABLE):
+            return page,state,raw
+        if time.monotonic()-started>=SEARCH_SETTLE:
+            return page,state,raw
+        await asyncio.sleep(.25)
+
+
+async def search_open(context,page,instruction_id,events,check_sub=None):
+    """
+    Submit the new instruction ID, wait a fixed 1.5 seconds for My Inbox to
+    replace the previous filtered result, then click the only visible View.
+    No result-ID matching is performed.  `check_sub(sub)` may hold the case
+    (CaseHeld) on the result row's Sub WorkType BEFORE View is clicked.
+    No single View at 1.5 s: settle_search names the page state.  'Your inbox
+    is empty' and several results are held (CaseHeld: the same search gives
+    the same answer, so no retry); anything else is a failure (retried once).
+    """
+    page=await ensure_clean_inbox_search(page,timeout=60)
+    field=page.locator('[data-bulk-search="1"]')
+    await field.fill(instruction_id)
+    if await field.input_value()!=instruction_id:
+        raise RuntimeError('Instruction ID was not written into the search field')
+    await field.press('Enter')
+    started=time.monotonic()
+    event(events,'search-submitted',instructionId=instruction_id)
+
+    # Required fixed delay: the old filtered View can remain visible briefly.
+    await asyncio.sleep(SEARCH_WAIT)
+    page=await live(context,page)
+
+    result=await page.evaluate(SINGLE_VIEW_JS)
     if result.get('count')!=1:
-        event(events,'search-result-not-single',views=result.get('count'),waitSeconds=1.5)
-        raise RuntimeError(
-            f"the ID search in My Inbox showed {result.get('count')} View button(s) 1.5 seconds after searching "
-            "(exactly one expected) - is the case in My Inbox? (Expected exactly one visible View; "
-            f"found {result.get('count')})"
-        )
+        event(events,'search-result-not-single',views=result.get('count'),waitSeconds=SEARCH_WAIT)
+        page,state,raw=await settle_search(context,page,events,started)
+        filters=', '.join(raw.get('filters') or []) or 'not readable'
+        if state=='single':
+            result=await page.evaluate(SINGLE_VIEW_JS)
+        if result.get('count')!=1:
+            if state=='empty':
+                raise CaseHeld("not in My Inbox under the current filters - My Inbox said 'Your inbox is empty' for this "
+                               f"ID (filters on: {filters})")
+            if state=='several':
+                raise CaseHeld(f"the ID search in My Inbox showed {raw.get('views')} results (exactly one expected; "
+                               f"filters on: {filters})")
+            raise RuntimeError(
+                f"the ID search in My Inbox showed no View and no 'inbox is empty' label within {SEARCH_SETTLE:.0f} s "
+                f"(page state: {state}; filters on: {filters}) (Expected exactly one visible View; found {raw.get('views')})"
+            )
 
     sub=result.get('subWorkType') or 'Unknown Sub WorkType'
-    event(events,'single-view-found-after-fixed-wait',subWorkType=sub,waitSeconds=1.5)
+    event(events,'single-view-found-after-fixed-wait',subWorkType=sub,waitSeconds=round(time.monotonic()-started,1))
     reason=check_sub(sub) if check_sub else ''
     if reason:
         event(events,'held-before-opening',reason=reason)
@@ -691,7 +763,7 @@ async def fast_direct_document(context, item, folder, semaphore):
                 try:
                     CAPTURES.mkdir(parents=True,exist_ok=True)
                     name=safe(f"viewer-page-{item.get('documentId') or item.get('index',0)+1}",max_length=90)+'.html'
-                    (CAPTURES/name).write_text(P.strip_queries(body.decode('utf-8','replace'))[:3000000],encoding='utf-8')
+                    (CAPTURES/name).write_text(P.html_note(P.strip_queries(body.decode('utf-8','replace'))[:3000000]),encoding='utf-8')
                     item['viewerPageCopy']=name
                 except Exception:
                     pass
