@@ -3205,8 +3205,8 @@ def judge_upload(snap: dict, expected: list) -> dict:
             "ready": ready, "signature": (sum(observed.values()), sum((observed & want).values()), len(snap["active"]))}
 
 
-# --- the answer contract (result_contract.md): a short 'Working' section, then ONE JSON object written as plain text on
-# the reply's very LAST line.  Only that line is read.  Keys in any order are accepted (and put in order for the files).
+# --- the answer contract (result_contract.md): the WHOLE reply is ONE line of JSON written as plain text, nothing around
+# it.  Only the reply's last line is read.  Keys in any order are accepted (and put in order for the files).
 RESULT_KEYS = ("COPILOT_RESULT", "DISCREPANCY_TYPE", "CASE_END_DATETIME", "REGISTER_SNAPSHOT_DATETIME", "CLIENT_REQUEST",
                "JUSTIFICATION", "A_B_COMPARISONS", "RULE_CHECKS")
 ROW_KEYS = ("ITEM", "Customer_expectation", "CUSTOMER_SOURCE", "System_data", "SYSTEM_SOURCE", "MATCH")
@@ -3214,18 +3214,33 @@ RULE_KEYS = ("RULE", "STATUS", "EVIDENCE", "NOTE")
 RESULT_WORDS = ("Correct", "Incorrect", "Inconclusive")
 DISCREPANCY_WORDS = ("None", TM.PROCESSOR_ERROR, TM.AGED_CASE)
 RULE_WORDS = ("Satisfied", "Not satisfied", "Not determinable", "Not applicable")
-FIXUP_TEXT = ("Your previous answer did not follow the required result structure. Resend your exact same answer, unchanged "
-              "in content, in the format of the attached result contract: the short Working section, then as the very last "
-              "line ONE JSON object written as plain text on a single line (no code block, no markdown) with exactly the "
-              "keys " + ", ".join(RESULT_KEYS) + ".")
-# Added to the visible message when answers are collected: the attached result contract is the ONLY answer format.
-# (VDI run 2026-11-02: all three first answers used another key set taken from somewhere else in the attachments.)
-CONTRACT_REMINDER = ("ANSWER FORMAT - this overrides any other answer format, template or JSON keys in the attached files or above: "
-                     "write the short Working section, then end your reply with ONE JSON object written as plain text on a "
-                     "single line as its very last line (no code block, nothing after it), with exactly the keys "
-                     + ", ".join(RESULT_KEYS) + "; each A_B_COMPARISONS row with exactly " + ", ".join(ROW_KEYS)
-                     + " (true, false or null) and each RULE_CHECKS row with exactly " + ", ".join(RULE_KEYS)
-                     + ", as defined in the attached result contract. No other keys.")
+FIXUP_TEXT = ("Your previous answer was rejected by the program that reads it (attached result contract). Reply again with "
+              "ONLY the corrected answer: ONE line of JSON written as plain text, starting with {\"COPILOT_RESULT\":\" and "
+              "ending with }, with nothing before or after it, no code block and no markdown, with exactly the keys "
+              + ", ".join(RESULT_KEYS) + " in that order. Fix exactly the problems listed below and keep the rest of your "
+              "review the same.")
+# Added to the visible message when answers are collected: the attached result contract is the ONLY answer format, and
+# the template line shows its exact shape with THIS case's date/time values already in place (filled like the base
+# message).  VDI runs 2026-11-02: first answers used another key set; then every answer failed the 'Working' + last-line
+# layout - so the reply is now the JSON line alone.
+ANSWER_TEMPLATE = ('{"COPILOT_RESULT":"<Correct or Incorrect or Inconclusive>","DISCREPANCY_TYPE":"<None or Potential '
+                   'processor error or Discrepancy from aged case>","CASE_END_DATETIME":"' + TM.PLACEHOLDERS[0] + '",'
+                   '"REGISTER_SNAPSHOT_DATETIME":"' + TM.PLACEHOLDERS[1] + '","CLIENT_REQUEST":"<one sentence: the request, '
+                   'its source and provenance label>","JUSTIFICATION":"<your argument for the result>","A_B_COMPARISONS":'
+                   '[{"ITEM":"<what is compared>","Customer_expectation":"<value the request requires>","CUSTOMER_SOURCE":'
+                   '"<document or Audit Trail entry and date; provenance: label>","System_data":"<Register value>",'
+                   '"SYSTEM_SOURCE":"<Account Summary > section > field>","MATCH":true}],"RULE_CHECKS":[{"RULE":"<check '
+                   'name from the rules file>","STATUS":"<Satisfied or Not satisfied or Not determinable or Not applicable>",'
+                   '"EVIDENCE":"<source and provenance label>","NOTE":"<short note>"}]}')
+CONTRACT_REMINDER = ("ANSWER FORMAT - this overrides any other answer format, template or JSON keys in the attached files or "
+                     "above. Your WHOLE reply is ONE line of JSON written as plain text: start with {\"COPILOT_RESULT\":\" "
+                     "and end with }. Nothing before it (no Working section, no heading, no explanation) and nothing after "
+                     "it (no notes, sources or suggestions); no code block, no backticks, no markdown, no line breaks. "
+                     "Exactly the keys " + ", ".join(RESULT_KEYS) + " in this order; each A_B_COMPARISONS row with exactly "
+                     + ", ".join(ROW_KEYS) + " (MATCH true, false or null without quotes); each RULE_CHECKS row with exactly "
+                     + ", ".join(RULE_KEYS) + ". Follow the steps of the attached result contract. Your reply must have "
+                     "exactly this shape - replace every <...> with your own findings (one row per comparison and per "
+                     "rule check) and keep the two date/time values exactly as they are:\n\n" + ANSWER_TEMPLATE)
 REFUSAL_RE = re.compile(r"(can['’]?t|cannot|unable to|not able to|won['’]?t|not allowed to) (help|assist|provide|complete|process|"
                         r"review|share|do that|comply)|sensitive (information|data|content)|personal (data|information)|"
                         r"against (my|our|the) (policy|policies|guidelines)|i['’]m sorry", re.I)

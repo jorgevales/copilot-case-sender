@@ -260,14 +260,17 @@ prompt, file bulk-assignment, and **pipelining** of the next case's inventory. S
 order (3 fixed files, so up to 17 case documents under the 20 limit). Your own copies live on S: and are **never** kept in
 the repository.
 
-**The answer** is a short plain-text section headed `Working`, then **one JSON object written as plain text on the
-reply's very last line** (not a code box). Eight keys:
+**The answer** is the **whole reply as ONE line of JSON written as plain text** - nothing before it (no `Working`
+section, no heading) and nothing after it, no code box (contract 2026-11-02, made stricter after a VDI run where every
+answer failed). The message ends with `CONTRACT_REMINDER` and a template line (`ANSWER_TEMPLATE`) with this case's own
+date/time values already in place. A fix-up asks for the corrected line only, fixing exactly the problems it lists.
+Eight keys:
 
     {"COPILOT_RESULT":"Correct|Incorrect|Inconclusive","DISCREPANCY_TYPE":"None|Potential processor error|Discrepancy from aged case","CASE_END_DATETIME":"...","REGISTER_SNAPSHOT_DATETIME":"...","CLIENT_REQUEST":"...","JUSTIFICATION":"...","A_B_COMPARISONS":[{"ITEM":"...","Customer_expectation":"...","CUSTOMER_SOURCE":"...","System_data":"...","SYSTEM_SOURCE":"...","MATCH":true}],"RULE_CHECKS":[{"RULE":"...","STATUS":"Satisfied|Not satisfied|Not determinable|Not applicable","EVIDENCE":"...","NOTE":"..."}]}
 
 The tool reads only the **newest assistant reply** of that case's chat once Copilot has stopped generating and the text
 has been unchanged for `answer_stable_seconds`, and of that reply **only its last non-empty line** (read with its line
-breaks). A result JSON found anywhere else (in the Working text, in a code block, or with text after it) is never
+breaks). A result JSON found anywhere else (after other text, in a code block, or with text after it) is never
 accepted: it gets a fix-up request that says so. The line is checked strictly (`validate_result`):
 * exactly the 8 keys (in **any order**: the tool puts them, and every row's keys, in the contract's order before saving -
   the report says "key order fixed by the script"); each comparison row exactly 6 keys, `MATCH` `true`, `false` or
@@ -346,7 +349,7 @@ every answer (`shared/review_workbook.py`, written with Python's standard librar
   attention (the case's red and yellow items), Client request, Justification, then the row's Type (Comparison / Rule
   check), What was checked, Customer expectation, Customer source, Register value, Register source, Outcome, Evidence,
   Note, then Case end date/time, Register snapshot date/time, Business days gap, Case age statement, Client Number,
-  Working section (not wrapped: read it in the formula bar), and empty reviewer columns: Reviewer agrees (Y/N list),
+  Working section (empty now that the reply is the JSON line alone), and empty reviewer columns: Reviewer agrees (Y/N list),
   Reviewer correction, Reviewer notes, Reviewer corrected result (Correct / Incorrect / Inconclusive list).
 * **Colours** (whole row): red = no match / Not satisfied, yellow = could not compare / Not determinable, green = match /
   Satisfied, grey = Not applicable. Header row and ID column frozen, a filter on every column.
