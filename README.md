@@ -9,7 +9,9 @@ Three parts work **at the same time**, so Copilot can review case 1 while System
 | `3_copilot_sender/` | **Part 3** | Sends each complete case to Copilot, one fresh chat, sent once, answer read back | the **Copilot Edge** (port 9333) |
 | `orchestrator/` | Coordinator | Asks for the CSV, starts everything, hands complete cases over, writes the daily report | no browser |
 | `shared/pipeline.py` | Contract | The small files the parts use to work together (read its header) | — |
-| `guidance/` | Instructions | `result_contract.md` + one `<Sub Worktype>.md` per type (your real ones live in `guidance_dir`) | — |
+| `shared/timing.py` | Case timing | The four case-timing values typed into each case's message (End Date, snapshot time, business days, age) | — |
+| `shared/review_workbook.py` | Results workbook | `Copilot review results.xlsx` for the human reviewers (no extra package) | — |
+| `guidance/` | Instructions | Only a README: your real result contract, daily instructions, base message and `<Sub Worktype>.md` files live on S: (never in the repository) | — |
 
 All paths below are **symbolic labels** (`CASES_ROOT`, `RUNTIME_ROOT`, …): the real ones are typed once in setup and
 stay in your local, git-ignored `sender_config.json`.
@@ -28,8 +30,9 @@ stay in your local, git-ignored `sender_config.json`.
 1. Keep this whole folder together on `S:`.
 2. Double-click `Run.cmd`. It asks once for `PYTHON_EXECUTABLE` (paste the path; quotes are fine) and starts `setup`
    the first time.
-3. `setup` asks for: `CASES_ROOT`, the **guidance folder** (one `<Sub Worktype>.md` per type), the `base_message` file,
-   the **result contract**, `PYTHON_EXECUTABLE`, `EDGE_EXECUTABLE` and `RUNTIME_ROOT`. Then, **once**, it asks for the
+3. `setup` asks for: `CASES_ROOT`, the **guidance folder** (one `<Sub Worktype>.md` per type), the `base_message` file
+   (`daily_review_base_message.md`), **`daily_review_instructions.md`** (required: how Copilot analyses every case), the
+   **result contract** (no template is offered any more), `PYTHON_EXECUTABLE`, `EDGE_EXECUTABLE` and `RUNTIME_ROOT`. Then, **once**, it asks for the
    pages the tool connects to (your original Part 1 / Part 2 scripts have each one):
    - **System 1, where the case documents are downloaded from:** its inbox page (My Inbox), the document viewer
      marker (optional; without it documents are opened one by one, which is slower) and the brand control
@@ -47,8 +50,10 @@ stay in your local, git-ignored `sender_config.json`.
 
 1. **The CSV.** Paste its path (the last one is offered). It needs the columns `instruction id` (the old
    `instrcution id` spelling also works), `Client Account Number`, `Client Number`, `Process Status` and
-   `Sub Worktype`. Only **Ended** rows are reviewed. Every other row (Voided, blank, an invalid ID, a duplicate, no
-   account) is listed under **SKIPPED** with its reason before anything starts.
+   `Sub Worktype`, and (optional, last) **`End Date`** - when the case ended, in UK time. Only **Ended** rows are
+   reviewed. Every other row (Voided, blank, an invalid ID, a duplicate, no account) is listed under **SKIPPED** with
+   its reason before anything starts. A CSV without any End Date is sent anyway (see [Case timing](#case-timing)).
+   Before this, an older results workbook is renamed (see [Results workbook](#results-workbook-copilot-review-resultsxlsx)).
 2. **The plan.** For each Ended row: *download and send*, *complete already* (send only), *already sent earlier*
    (sent-ledger), or *held* (for example, a folder for that ID already in CASES_ROOT that this tool did not make).
    Sub Worktypes without an instructions file are warned about.
@@ -65,13 +70,16 @@ stay in your local, git-ignored `sender_config.json`.
    - **The coordinator** moves a case into CASES_ROOT the moment it is complete: documents + Audit Trail +
      snapshot + an instructions file for its Sub Worktype. It copies the snapshot in and renames the folder in one
      step, so Copilot never sees a half-downloaded case.
-   - **Part 3** picks the case up within seconds. It attaches that type's `.md` + the result contract, then the
-     snapshot, the Audit Trail and the documents (Received Documents order), sends once and collects the answer
-     while the next case is still downloading.
+   - **Part 3** picks the case up within seconds. It attaches `daily_review_instructions.md`, that type's `.md` and the
+     result contract, then the snapshot, the Audit Trail and the documents (Received Documents order), types the base
+     message with this case's timing filled in, sends once and collects the answer while the next case is still
+     downloading.
 7. **The daily report**: on screen (a "Reviewed X of Y ... N need you" line, then everything that needs you) and as
    `RUNTIME_ROOT\reports\daily-report-<run>.csv`. One line per CSV row: sent + Copilot's verdict, held + why,
-   skipped + why, left-out files and the Copilot chat's address. An answer that is valid but odd is marked
-   `CHECK:` (Inconclusive with no comparisons, or Inconclusive although differences are listed).
+   skipped + why, left-out files and the Copilot chat's address. A valid answer's detail gives the discrepancy type and
+   the counts (comparisons, differences, not compared, rule checks, not satisfied, not determinable). Case timing sent as
+   'Not provided' is marked `CHECK:` there, so the row is listed as needing you. Under the report the console names
+   this run's **results workbook**.
 
 **Files for the reviewing Copilot** (all in `RUNTIME_ROOT\logs`, attach them after a run):
 - `run-report-<time>.md`: the sender's run (settings, timings, every case, errors and abnormal states, the whole
@@ -126,8 +134,9 @@ general review guidance file (`instructions_path`).
 # Part 3 — Copilot sender (details)
 
 Everything below describes `3_copilot_sender/copilot_case_sender.py` (read top to bottom; its sections are numbered).
-In the pipeline each case's instructions file is its Sub Worktype's `.md`. With `send-only` it is the one shared
-**review guidance** file (`review_guidance.md`). In both, the documents are attached, your `base_message` is typed,
+In the pipeline each case gets `daily_review_instructions.md` + its Sub Worktype's `.md`. With `send-only` it gets
+`daily_review_instructions.md` + the one shared **review guidance** file (`review_guidance.md`). In both, the documents
+are attached, your `base_message` is typed (with the case timing filled in),
 the case is **sent once**, and the outcome is saved before the next case starts.
 
 ## What it does, per case
@@ -246,22 +255,40 @@ prompt, file bulk-assignment, and **pipelining** of the next case's inventory. S
 
 ### V2: the answer contract and result collection
 
-The instructions file (review guidance or Sub Worktype `.md`) tells Copilot *what to analyse and how*; **`result_contract.md`** (shipped in `guidance/` as a strict
-template – edit it freely) tells it *exactly what to answer*. Both are attached to every case (2 fixed files, so up to 18
-case documents under the 20 limit). Your `base_message` should tell Copilot to answer only as the contract defines.
+`daily_review_instructions.md` tells Copilot *how to analyse any case*, the Sub Worktype `.md` (or the review guidance)
+*which checks apply*, and **`result_contract.md`** *exactly what to answer*. All three are attached to every case, in that
+order (3 fixed files, so up to 17 case documents under the 20 limit). Your own copies live on S: and are **never** kept in
+the repository.
 
-**The answer is plain text, not a code box** (code boxes sometimes fail to render): one JSON object, on one line:
+**The answer** is a short plain-text section headed `Working`, then **one JSON object written as plain text on the
+reply's very last line** (not a code box). Eight keys:
 
-    {"COPILOT_RESULT":"Correct|Incorrect|Inconclusive","JUSTIFICATION":"text","A_B_COMPARISONS":[{"ITEM":"what","Customer_expectation":"value","System_data":"live value","MATCH":true}]}
+    {"COPILOT_RESULT":"Correct|Incorrect|Inconclusive","DISCREPANCY_TYPE":"None|Potential processor error|Discrepancy from aged case","CASE_END_DATETIME":"...","REGISTER_SNAPSHOT_DATETIME":"...","CLIENT_REQUEST":"...","JUSTIFICATION":"...","A_B_COMPARISONS":[{"ITEM":"...","Customer_expectation":"...","CUSTOMER_SOURCE":"...","System_data":"...","SYSTEM_SOURCE":"...","MATCH":true}],"RULE_CHECKS":[{"RULE":"...","STATUS":"Satisfied|Not satisfied|Not determinable|Not applicable","EVIDENCE":"...","NOTE":"..."}]}
 
 The tool reads only the **newest assistant reply** of that case's chat once Copilot has stopped generating and the text
-has been unchanged for `answer_stable_seconds`. It finds the JSON object anywhere in the text (words around it or a code
-block are tolerated) and checks it strictly: exactly the 3 keys, the verdict exactly `Correct`/`Incorrect`/`Inconclusive`,
-each row exactly `ITEM`, `Customer_expectation`, `System_data`, `MATCH` (true/false), and the verdict must agree with the
-rows (`Correct` ⇒ every `MATCH` true; `Incorrect` ⇒ at least one false; both need at least one row).
+has been unchanged for `answer_stable_seconds`, and of that reply **only its last non-empty line** (read with its line
+breaks). A result JSON found anywhere else (in the Working text, in a code block, or with text after it) is never
+accepted: it gets a fix-up request that says so. The line is checked strictly (`validate_result`):
+* exactly the 8 keys (in **any order**: the tool puts them, and every row's keys, in the contract's order before saving -
+  the report says "key order fixed by the script"); each comparison row exactly 6 keys, `MATCH` `true`, `false` or
+  `null` (null = could not be compared, not a failure); each rule-check row exactly 4 keys and an allowed `STATUS`; no
+  empty text anywhere;
+* at least one comparison row, always; `RULE_CHECKS` empty only in `send-only` (no Sub Worktype file attached), and then
+  the result must be Inconclusive;
+* **the result follows the contract's order of priority**: any `MATCH` false or rule `Not satisfied` ⇒ Incorrect;
+  otherwise any `MATCH` null or rule `Not determinable` ⇒ Inconclusive; Correct needs every `MATCH` true and every
+  rule `Satisfied` / `Not applicable`;
+* **the timing label**: `DISCREPANCY_TYPE` is `None` exactly when no `MATCH` is false; otherwise it must match the case
+  age statement typed into this case's message (without one the business-day gap decides; without both: Potential
+  processor error), `JUSTIFICATION` must begin with `<type>:`, and an aged case must include the sentence
+  "This case was completed more than 3 business days before the Register snapshot was captured.";
+* `CASE_END_DATETIME` and `REGISTER_SNAPSHOT_DATETIME` must be copied **exactly** from the message.
 
-* **The format is in the message too:** the visible message ends with a short reminder of the three keys, saying it
-  overrides any other answer format in the attached files (on the VDI all three first answers used another key set).
+Any of these is a hard error: fix-up request, then resubmission (below).
+
+* **The format is in the message too:** the visible message ends with a short reminder of the eight keys and the
+  last-line rule, saying it overrides any other answer format in the attached files (on the VDI all three first answers
+  used another key set).
 * **Not valid?** The tool immediately asks, in the same chat, for “your exact same answer, unchanged in content, in the
   correct structure” and names what was wrong – up to `fixup_requests` (3) times. It checks the request really appeared
   in the chat and records it.
@@ -279,8 +306,9 @@ rows (`Correct` ⇒ every `MATCH` true; `Incorrect` ⇒ at least one false; both
   sent. A collector visits each answering tab (bringing it to the front – the sender and the collector never use the
   front tab at the same time), judges finished answers and sends fix-ups. A tab whose answer is collected is reset to a
   new chat and reused when a later case needs a tab.
-* **Results** (local, in `RUNTIME_ROOT\results`): `<instruction ID>.json` (the validated answer + raw text) and
-  `results.csv` (ID, status, verdict, rows, differences, tries, fixups, left-out files). The console prints each verdict:
+* **Results** (local, in `RUNTIME_ROOT\results`): `<instruction ID>.json` (the validated answer in the contract's key
+  order + the raw reply) and `results.csv` (unchanged: ID, status, verdict, rows, differences, tries, fixups, left-out
+  files). For people: the [results workbook](#results-workbook-copilot-review-resultsxlsx). The console prints each verdict:
   Correct white on green, Incorrect white on red, Inconclusive black on yellow. A valid verdict, even *Incorrect*, is a
   finished case; the ledger still means “submitted” and a case with a valid answer is skipped on re-runs.
 * **Re-runs:** a case submitted earlier but never answered gets its answer collected from its saved chat (same tab by exact
@@ -288,6 +316,48 @@ rows (`Correct` ⇒ every `MATCH` true; `Incorrect` ⇒ at least one false; both
   touched.
 * Model picker: models that Copilot greys out (for example after a usage limit) are shown as unavailable, are never the
   default, and choosing one stops the run with a clear message instead of burning retries.
+
+### Case timing
+
+The base message **must** contain the four placeholders `{{CASE_END_DATETIME}}`, `{{REGISTER_SNAPSHOT_DATETIME}}`,
+`{{BUSINESS_DAYS_GAP}}` and `{{CASE_AGE_STATEMENT}}`; `check` and every run refuse to start and name the missing one.
+Each case's message gets its own values (`shared/timing.py`):
+
+| Placeholder | Value |
+|---|---|
+| `CASE_END_DATETIME` | the CSV's `End Date`, exactly as written (e.g. `12/10/2026 02:17 PM`, UK time). An Excel serial number such as `46308.48958` (a comma also works) is written as `13/10/2026 11:45 AM`; a whole number as a date only |
+| `REGISTER_SNAPSHOT_DATETIME` | the snapshot's Account Summary `metadata.retrievedUtc`, to whole seconds (`2026-10-14T12:23:38+00:00`) |
+| `BUSINESS_DAYS_GAP` | working days from the case end to the snapshot, both in UK time (summer time worked out by the tool): the count starts the day **after** the case ended and includes the snapshot's day (ended Monday, snapshot Thursday = 3). Weekends and England & Wales bank holidays do not count: 2025-2028 are built in; add later years (or extra days) to an optional `bank_holidays.txt` beside `daily_review_instructions.md`, one date per line (`2029-01-01` or `01/01/2029`, `#` comments) |
+| `CASE_AGE_STATEMENT` | 3 or less: `Case completed within the last 3 business days`; more: `Case completed more than 3 business days` |
+
+Nothing is guessed: a missing or unreadable End Date, a snapshot without a readable time, a snapshot older than the
+case end, or a year with no bank-holiday list makes the affected values **`Not provided`** (the contract has a rule for
+that). The case is still sent, and the daily report marks it `CHECK:`. The values are kept in the journal (the case's
+`preparing` record), so an answer collected after a restart is checked against what was really sent. In `send-only`
+there is no CSV: the case end, gap and age are `Not provided` without a flag. *Locally verified* (tests); real CSVs:
+*Proposed* until the VDI run.
+
+### Results workbook (`Copilot review results.xlsx`)
+
+`RUNTIME_ROOT\reports\Copilot review results.xlsx` holds **this run's valid Copilot answers** and is rewritten after
+every answer (`shared/review_workbook.py`, written with Python's standard library: nothing to install).
+* **One row per comparison and per rule check**; the case's own values are repeated on each of its rows so Excel's filter
+  and sort work. Columns: Instruction ID, Client Account Number, Sub Worktype, Copilot result, Discrepancy type, Needs
+  attention (the case's red and yellow items), Client request, Justification, then the row's Type (Comparison / Rule
+  check), What was checked, Customer expectation, Customer source, Register value, Register source, Outcome, Evidence,
+  Note, then Case end date/time, Register snapshot date/time, Business days gap, Case age statement, Client Number,
+  Working section (not wrapped: read it in the formula bar), and empty reviewer columns: Reviewer agrees (Y/N list),
+  Reviewer correction, Reviewer notes, Reviewer corrected result (Correct / Incorrect / Inconclusive list).
+* **Colours** (whole row): red = no match / Not satisfied, yellow = could not compare / Not determinable, green = match /
+  Satisfied, grey = Not applicable. Header row and ID column frozen, a filter on every column.
+* **Start of a run** (the coordinator, or the sender in `send-only`): an older workbook is renamed
+  `Copilot review results - older <the time it was made>.xlsx`. If Excel has it open the run says so and waits for
+  Enter, then tries again; nothing starts before that.
+* **During the run** a workbook opened in Excel is never waited for: a warning, then it is written again after the next
+  answer. Still open at the end: a time-stamped copy `Copilot review results - <time>.xlsx` is written with every answer,
+  and its name is printed. The coordinator prints the workbook's path under the daily report.
+* Cases without a valid answer are not in the workbook (the daily report lists them). *Locally verified* (opened with
+  openpyxl in tests); opening in Excel on the VDI: *Proposed*.
 
 ### Re-runs and manual resend
 `RUNTIME_ROOT\sent_instructions.txt` lists every instruction ID that was submitted (or is `uncertain`). Those IDs are
@@ -307,10 +377,11 @@ unreadable/locked file, likely password-protected Office/PDF file, link not foll
 `ignore_names` (default `~$*`, `desktop.ini`, `thumbs.db`) are skipped but listed in the manifest.
 
 ### The 20-attachment limit
-`max_attachments` (default 20, **the review guidance file counts**) is the *reference program's* number; live testing showed
+`max_attachments` (default 20, **the instruction files count**: daily instructions, Sub Worktype / review guidance,
+result contract) is the *reference program's* number; live testing showed
 Copilot accepting exactly 20 files on a personal profile, but check your tenant. A case with exactly the limit is
 sent and the console says `at-limit`. When a case has **more** files, `over_limit_mode` decides:
-* `send_partial` (default): attach the review guidance + the first documents in sorted order up to the limit, print a
+* `send_partial` (default): attach the instruction files + the first documents in sorted order up to the limit, print a
   `WARNING` *before* sending (count of files left out), and finish as **`submitted_partial`** (yellow). The ledger
   records it as `partial`, the run exits with code 1, and the left-out file list stays in the local journal.
   The case is *not* resent automatically – delete its ledger line if you want to handle the rest manually.
@@ -467,7 +538,7 @@ skipped, not failed.
 | Code check: no call passes a keyword already given by position (the bug that failed every case on the VDI, 2026-11-02) | **Tested here** (`tests/test_code_checks.py`) |
 | Part 1 downloads: viewer address paired by document ID (position only when no address names an ID and counts match); a viewer page's own file fetched; a document window read without clicking inside it (its address, the file it shows, a download it starts, its own toolbar button only) | **Tested here** (fake responses / window; pairing run in Node). Real System 1 viewer: **needs your VDI** |
 | Part 2: Access Denied vs expired sign-in vs normal page; Access Denied twice stops the run; expired → pause → fresh cookies; only System 2 cookies read; the failing page kept with addresses cut | **Tested here** (synthetic pages) |
-| Copilot refusals: blocked chat (with and without a reply) ends the case, nothing clicked; refusal resent and confirmed; responses file with replies, buttons and `...` menu; odd verdicts flagged | **Tested here** (fake page). Real refusal page: **needs your VDI** |
+| Copilot refusals: blocked chat (with and without a reply) ends the case, nothing clicked; refusal resent and confirmed; responses file with replies, buttons and `...` menu | **Tested here** (fake page). Real refusal page: **needs your VDI** |
 | One whole run with real processes (coordinator + stand-ins for the three parts): skipped row, held case, two cases sent, daily report | **Tested here** |
 | Real System 1 / System 2 pages, cookie read over DevTools, two Edges side by side, background switches | **Needs your VDI** |
 | 5 folders → 5 queue entries; `.edge-debug-9223` excluded (case variants) | **Tested here** |

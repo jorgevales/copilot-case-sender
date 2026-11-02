@@ -55,10 +55,14 @@ class Env:
         self.instr = base / "instructions.md"
         self.instr.write_text("synthetic instructions", "utf-8")
         self.msg = base / "base_message.md"
-        self.msg.write_text("# Please review this synthetic case.\nThanks.", "utf-8")
+        self.msg.write_text("# Please review this synthetic case.\nEnded {{CASE_END_DATETIME}}, snapshot "
+                            "{{REGISTER_SNAPSHOT_DATETIME}}, gap {{BUSINESS_DAYS_GAP}}: {{CASE_AGE_STATEMENT}}.\nThanks.", "utf-8")
+        self.daily = base / "daily_review_instructions.md"
+        self.daily.write_text("synthetic daily review instructions", "utf-8")
         self.contract = base / "result_contract.md"
         self.contract.write_text("synthetic result contract", "utf-8")
         cfg = {**S.DEFAULTS, "cases_root": str(self.cases_root), "instructions_path": str(self.instr),
+               "daily_instructions_path": str(self.daily),
                "base_message_path": str(self.msg), "python_executable": sys.executable,
                "edge_executable": sys.executable, "runtime_root": str(self.runtime),
                "completion_mode": "submission_only", "result_contract_path": str(self.contract),
@@ -123,9 +127,28 @@ def env2():
     shutil.rmtree(base, ignore_errors=True)
 
 
+def row(match=True, **over):
+    return {"ITEM": "limit", "Customer_expectation": "500", "CUSTOMER_SOURCE": "client form; provenance: Client-supplied",
+            "System_data": "500", "SYSTEM_SOURCE": "Account Summary > Limit", "MATCH": match, **over}
+
+
+def rule(status="Satisfied", **over):
+    return {"RULE": "Signed by the required signatories", "STATUS": status, "EVIDENCE": "client form", "NOTE": "ok", **over}
+
+
+def answer_obj(verdict="Correct", rows=None, rules=None, kind=None, end="Not provided", snap="Not provided", **extra):
+    """A contract-valid answer (send-only timing: 'Not provided'); `extra` adds or overrides keys."""
+    rows = rows if rows is not None else [row({"Correct": True, "Incorrect": False}.get(verdict))]
+    rules = rules if rules is not None else [rule()]
+    kind = kind or ("Potential processor error" if any(isinstance(r, dict) and r.get("MATCH") is False for r in rows) else "None")
+    return {"COPILOT_RESULT": verdict, "DISCREPANCY_TYPE": kind, "CASE_END_DATETIME": end, "REGISTER_SNAPSHOT_DATETIME": snap,
+            "CLIENT_REQUEST": "Raise the limit to 500 (client form; provenance: Client-supplied).",
+            "JUSTIFICATION": (kind + ": because" if kind != "None" else "because"), "A_B_COMPARISONS": rows,
+            "RULE_CHECKS": rules, **extra}
+
+
 def answer_json(verdict="Correct", rows=None, **extra):
-    rows = rows if rows is not None else [{"ITEM": "limit", "Customer_expectation": "500", "System_data": "500", "MATCH": verdict != "Incorrect"}]
-    return json.dumps({"COPILOT_RESULT": verdict, "JUSTIFICATION": "because", "A_B_COMPARISONS": rows, **extra})
+    return json.dumps(answer_obj(verdict, rows, **extra))
 
 
 GOOD = answer_json()
@@ -722,7 +745,10 @@ def test_happy_path_one_send_per_case_no_cross_contamination(env):
     assert [v[0] for v in results.values()] == ["submitted"] * 3
     assert len(env.world.sends) == 3 and len({s[0] for s in env.world.sends}) == 3       # one tab per case
     for (tid, names, msg), expect in zip(env.world.sends, (["one.pdf"], ["two.pdf", "extra.txt"], ["three.pdf"])):
-        assert sorted(names) == sorted(expect + ["instructions.md"]) and msg == r.message
+        assert sorted(names) == sorted(expect + ["instructions.md"])
+        assert msg == r.message.replace("{{CASE_END_DATETIME}}", "Not provided").replace(        # send-only: no CSV, no snapshot
+            "{{REGISTER_SNAPSHOT_DATETIME}}", "Not provided").replace("{{BUSINESS_DAYS_GAP}}", "Not provided").replace(
+            "{{CASE_AGE_STATEMENT}}", "Not provided") and "{{" not in msg
     ledger = env.ledger.read()
     assert set(ledger) == {c.id for c in cases} and all(v == "submitted" for v in ledger.values())
 
@@ -1328,57 +1354,95 @@ def test_console_detail_setting_is_validated(env):
 
 # ------------------------------------------------------------------ V2: answer contract, collection, fix-ups
 
-def parsed(text=None, blocks=None):
-    return S.parse_answer({"text": text if text is not None else "", "blocks": blocks if blocks is not None else [text or ""]})
+def parsed(text=None, blocks=None, expect=None):
+    return S.parse_answer({"text": text if text is not None else "", "blocks": blocks if blocks is not None else [text or ""]},
+                          expect)
+
+
+WORKING = "Working\n- request: raise the limit (client form, Client-supplied)\n- comparison: limit 500 = 500\n"
 
 
 def test_valid_answers_in_every_verdict_pass():
     for verdict in ("Correct", "Incorrect", "Inconclusive"):
-        obj, problems = parsed(answer_json(verdict))
+        obj, problems = parsed(WORKING + answer_json(verdict))
         assert obj and problems == [], (verdict, problems)
-    inconclusive_empty = answer_json("Inconclusive", rows=[])
-    assert parsed(inconclusive_empty)[1] == []                                   # rows may be empty only for Inconclusive
+    assert parsed(answer_json("Inconclusive", rules=[rule("Not determinable", NOTE="no form")]))[1] == []
+    assert parsed(answer_json("Incorrect", rows=[row()], rules=[rule("Not satisfied")]))[1] == []      # a rule alone
+    assert parsed(answer_json("Inconclusive", rules=[]), expect={"rules_file": False, "case_end": "Not provided"})[1] == []
 
 
 def test_structure_and_verdict_problems_are_named():
-    row = {"ITEM": "x", "Customer_expectation": "a", "System_data": "a", "MATCH": True}
+    aged = {"case_end": "12/10/2026 02:17 PM", "snapshot": "2026-10-20T09:00:00+00:00", "gap": "6",
+            "age": "Case completed more than 3 business days"}
     cases = {
-        "missing key": (json.dumps({"COPILOT_RESULT": "Correct", "A_B_COMPARISONS": [row]}), "missing key(s): JUSTIFICATION"),
+        "missing key": (json.dumps({k: v for k, v in answer_obj().items() if k != "CLIENT_REQUEST"}), "missing key(s): CLIENT_REQUEST"),
         "extra key": (answer_json(NOTES="hi"), "unexpected key(s): NOTES"),
         "verdict word": (answer_json().replace('"Correct"', '"correct"'), "exactly Correct, Incorrect or Inconclusive"),
-        "empty justification": (answer_json().replace('"because"', '""'), "JUSTIFICATION must be non-empty"),
+        "discrepancy word": (answer_json(kind="Maybe"), "DISCREPANCY_TYPE must be exactly"),
+        "empty justification": (answer_json(JUSTIFICATION=""), "JUSTIFICATION must be non-empty"),
         "row shape": (answer_json(rows=[{"ITEM": "x", "MATCH": True}]), "row 1 must have exactly"),
-        "match type": (answer_json(rows=[{**row, "MATCH": "yes"}]), "MATCH must be true or false"),
-        "correct with a difference": (answer_json("Correct", rows=[{**row, "MATCH": False}]), "Correct requires every MATCH"),
-        "incorrect without a difference": (answer_json("Incorrect", rows=[row]), "Incorrect requires at least one MATCH"),
-        "correct without rows": (answer_json("Correct", rows=[]), "needs at least one"),
+        "empty row text": (answer_json(rows=[row(SYSTEM_SOURCE=" ")]), "SYSTEM_SOURCE must be non-empty"),
+        "match type": (answer_json(rows=[row("yes")]), "MATCH must be true, false or null"),
+        "rule shape": (answer_json(rules=[{"RULE": "x"}]), "RULE_CHECKS row 1 must have exactly"),
+        "rule word": (answer_json(rules=[rule("Done")]), "STATUS must be exactly"),
+        "rule note": (answer_json(rules=[rule("Not applicable", NOTE="")]), "NOTE must be non-empty"),
+        "no rules": (answer_json(rules=[]), "RULE_CHECKS needs one row per required check"),
+        "no rows": (answer_json("Inconclusive", rows=[]), "needs at least one row, always"),
+        "correct with a difference": (answer_json("Correct", rows=[row(False)]), "makes the result Incorrect"),
+        "correct with a failed rule": (answer_json("Correct", rules=[rule("Not satisfied")]), "makes the result Incorrect"),
+        "correct with a null": (answer_json("Correct", rows=[row(None)]), "makes the result Inconclusive"),
+        "correct, rule undetermined": (answer_json("Correct", rules=[rule("Not determinable")]), "makes the result Inconclusive"),
+        "incorrect without a cause": (answer_json("Incorrect", rows=[row()]), "Incorrect needs a MATCH false"),
+        "type without a difference": (answer_json(rows=[row()], kind="Potential processor error"), "must be None when no"),
+        "none with a difference": (json.dumps({**answer_obj("Incorrect"), "DISCREPANCY_TYPE": "None"}), "must be 'Potential processor error'"),
+        "prefix": (json.dumps({**answer_obj("Incorrect"), "JUSTIFICATION": "because"}), "must begin with 'Potential processor error:'"),
     }
     for name, (text, expected) in cases.items():
         obj, problems = parsed(text)
         assert any(expected in x for x in problems), (name, problems)
+    # the timing label and the copied values follow THIS case's message
+    old = answer_obj("Incorrect", end=aged["case_end"], snap=aged["snapshot"])
+    assert any("must be 'Discrepancy from aged case'" in x for x in parsed(json.dumps(old), expect=aged)[1])
+    good = {**old, "DISCREPANCY_TYPE": "Discrepancy from aged case", "JUSTIFICATION": "Discrepancy from aged case: x. "
+            "This case was completed more than 3 business days before the Register snapshot was captured."}
+    assert parsed(json.dumps(good), expect=aged)[1] == []
+    no_sentence = {**good, "JUSTIFICATION": "Discrepancy from aged case: x."}
+    assert any("must include the sentence" in x for x in parsed(json.dumps(no_sentence), expect=aged)[1])
+    assert any("CASE_END_DATETIME must be copied" in x
+               for x in parsed(json.dumps({**good, "CASE_END_DATETIME": "12/10/2026"}), expect=aged)[1])
+    assert any("REGISTER_SNAPSHOT_DATETIME must be copied" in x
+               for x in parsed(json.dumps({**good, "REGISTER_SNAPSHOT_DATETIME": "2026-10-20"}), expect=aged)[1])
+    within = {**aged, "age": "Case completed within the last 3 business days", "gap": "2"}
+    assert parsed(json.dumps({**old, "JUSTIFICATION": "Potential processor error: x"}), expect=within)[1] == []
+    unknown = {**aged, "age": "Not provided", "gap": "5"}          # no statement: the gap decides
+    assert parsed(json.dumps(good), expect=unknown)[1] == []
 
 
-def test_answer_extraction_rules():
+def test_answer_extraction_reads_only_the_last_line():
     assert parsed("no code here at all", blocks=[])[0] is None and "no JSON object" in parsed("hello", blocks=[])[1][0]
     obj, problems = parsed("{ not json", blocks=["{ not json"])
     assert obj is None and "not valid JSON" in problems[0]
-    older, newer = answer_json("Incorrect"), answer_json("Correct")
-    assert parsed("x", blocks=[older, newer])[0]["COPILOT_RESULT"] == "Correct"        # the newest block wins
-    assert parsed("intro\n```json\n" + GOOD + "\n```\nthanks", blocks=[])[0]["COPILOT_RESULT"] == "Correct"   # fenced text works too
-    assert parsed(GOOD, blocks=[])[0]["COPILOT_RESULT"] == "Correct"                                           # bare JSON reply works
+    assert parsed(WORKING + GOOD + "\n\n", blocks=[])[1] == []                    # trailing blank lines are fine
+    for late in (GOOD + "\nHope that helps!", "intro\n```json\n" + GOOD + "\n```\nthanks", WORKING + "Result: " + GOOD):
+        obj, problems = parsed(late, blocks=[])
+        assert obj is not None and "must be the very last line" in problems[0], late       # found, named, never accepted
+    obj, problems = parsed("Working\n- see below", blocks=[GOOD])                       # only inside a code block
+    assert obj is not None and "must be the very last line" in problems[0]
     assert "no JSON object" in parsed("x", blocks=["[1, 2]"])[1][0]
+    full = {"text": "Working- no line breaks here" + GOOD + "x", "full": WORKING + GOOD, "blocks": []}
+    assert S.parse_answer(full)[1] == []                                                # the line breaks come from innerText
 
 
-def test_plain_text_json_is_found_even_with_words_around_it_and_braces_inside_strings():
-    text = "Here is my review. " + answer_json() + " Hope that helps!"
-    obj, problems = parsed(text, blocks=[])
-    assert obj["COPILOT_RESULT"] == "Correct" and problems == []
-    tricky = answer_json(rows=[{"ITEM": "a {b} c", "Customer_expectation": "{x}", "System_data": "{x}", "MATCH": True}])
-    assert parsed("result: " + tricky, blocks=[])[1] == []
-    older, newer = answer_json("Incorrect"), answer_json("Correct")
-    assert parsed(older + "\nfixed:\n" + newer, blocks=[])[0]["COPILOT_RESULT"] == "Correct"      # newest object wins
-    wrong_only = '{"COPILOT_RESULT": "maybe"}'
-    assert parsed("x " + wrong_only, blocks=[])[1]                                                  # judged, so it can be named
+def test_keys_in_any_order_are_accepted_and_put_in_order():
+    obj = answer_obj("Incorrect")
+    shuffled = dict(reversed(list(obj.items())))
+    shuffled["A_B_COMPARISONS"] = [dict(reversed(list(r.items()))) for r in obj["A_B_COMPARISONS"]]
+    found, problems = parsed(json.dumps(shuffled))
+    assert problems == []
+    fixed, moved = S.canonical(found)
+    assert moved and list(fixed) == list(S.RESULT_KEYS) and list(fixed["A_B_COMPARISONS"][0]) == list(S.ROW_KEYS)
+    assert fixed == obj and S.canonical(obj)[1] is False
+    assert S.working_section(WORKING + GOOD + "\n") == WORKING.strip()
 
 
 def run_json(env2, answers_by_tab=None, cases=1, **cfg):
@@ -1497,15 +1561,12 @@ def test_the_responses_file_holds_every_reply_the_buttons_and_the_menu(env2):
     assert "SECRET" not in text and "instructions.md" in text and "result_correct" in text
 
 
-def test_odd_but_valid_verdicts_are_flagged_for_a_look():
-    assert S.odd_verdict("Inconclusive", 0, 0) == "CHECK: Inconclusive with no comparisons"
-    assert "4 difference(s)" in S.odd_verdict("Inconclusive", 7, 4)
-    assert S.odd_verdict("Incorrect", 5, 3) == "" and S.odd_verdict("Correct", 2, 0) == ""
+def test_refusals_are_recognised_for_the_report():
     assert S.looks_like_refusal(REFUSAL) and not S.looks_like_refusal('{"COPILOT_RESULT": "Correct"} sorry')
 
 
-def test_the_format_reminder_names_the_three_keys_and_overrides_other_formats():
-    for key in S.RESULT_KEYS + S.ROW_KEYS:
+def test_the_format_reminder_names_every_key_and_overrides_other_formats():
+    for key in S.RESULT_KEYS + S.ROW_KEYS + S.RULE_KEYS:
         assert key in S.CONTRACT_REMINDER
     assert "overrides any other answer format" in S.CONTRACT_REMINDER
 
@@ -1539,6 +1600,58 @@ def test_an_unanswered_earlier_submission_is_collected_after_a_restart_without_r
         await older.resume({c.key: c})
         return await older.run(collections.deque())
     assert run(go2())[c.key][0] == "result_correct" and env2.world.sends == []
+
+
+def test_a_restart_judges_the_answer_against_the_timing_its_message_carried(env2):
+    """The timing values typed into a case's message are journaled ('preparing'): after a restart the answer must still
+    copy THOSE values, even though the restarted run has no CSV row for the case."""
+    env2.make_case(1)
+    cases, _, _ = env2.cases()
+    c = cases[0]
+    timing = {"case_end": "12/10/2026 02:17 PM", "snapshot": "2026-10-14T12:23:38+00:00", "gap": "2",
+              "age": "Case completed within the last 3 business days", "notes": [], "rules_file": True}
+    r = env2.runner()
+    tab = run(r.browser.open_tab())
+    wrong = answer_json()                                                              # 'Not provided': not what was sent
+    tab.users, tab.replies = ["earlier message"], [{"text": wrong, "blocks": []}]
+    env2.journal.record(c.key, "preparing", alias=c.alias, instruction_id=c.id, timing=timing)
+    env2.journal.record(c.key, "submitted", alias=c.alias, instruction_id=c.id, contract=True, target_id=tab.target_id,
+                        conversation_url="https://example.invalid/chat/conversation/x", ledger_written=True)
+    assert r.expect_for(c) == timing
+    obj, problems = S.parse_answer({"text": wrong}, r.expect_for(c))
+    assert any("CASE_END_DATETIME must be copied" in x for x in problems)
+    right = answer_json(end=timing["case_end"], snap=timing["snapshot"])
+    assert S.parse_answer({"text": right}, r.expect_for(c))[1] == []
+
+
+def test_a_valid_answer_goes_into_the_results_workbook(env2):
+    import zipfile
+    env2.make_case(1)
+    env2.make_case(2)
+    found, _, _ = env2.cases()
+    r = env2.runner()
+    r.workbook = S.WB.ReviewWorkbook(env2.runtime / "reports")
+    results = run(r.run(collections.deque(found)))
+    assert [v[0] for v in results.values()] == ["result_correct"] * 2
+    assert r.workbook.close() == env2.runtime / "reports" / S.WB.NAME
+    sheet = zipfile.ZipFile(env2.runtime / "reports" / S.WB.NAME).read("xl/worksheets/sheet1.xml").decode("utf-8")
+    assert all(c.id in sheet for c in found) and "Raise the limit to 500" in sheet and "Satisfied" in sheet
+    assert "key order fixed" not in results[found[0].key][1] and "no discrepancy; 1 comparison(s)" in results[found[0].key][1]
+
+
+def test_the_base_message_needs_every_timing_placeholder_and_the_daily_instructions(env, monkeypatch):
+    monkeypatch.setenv("SENDER_CONFIG", str(env.base / "cfg.json"))
+    good = types.SimpleNamespace(**{**vars(env.cfg), "approved_root": str(env.base)})
+    assert S.validate_config(good)[1] == []
+    env.msg.write_text("Review it. {{CASE_END_DATETIME}} {{BUSINESS_DAYS_GAP}}", "utf-8")
+    problems = S.validate_config(good)[1]
+    assert any("{{REGISTER_SNAPSHOT_DATETIME}}" in p and "{{CASE_AGE_STATEMENT}}" in p for p in problems)
+    assert not any("{{CASE_END_DATETIME}}" in p for p in problems)
+    no_daily = types.SimpleNamespace(**{**vars(good), "daily_instructions_path": ""})
+    assert "daily_instructions_path is missing" in S.validate_config(no_daily)[1]
+    (env.base / "bank_holidays.txt").write_text("2029-01-01\nnot a date\n", "utf-8")    # beside the daily instructions
+    env.msg.write_text("{{CASE_END_DATETIME}} {{REGISTER_SNAPSHOT_DATETIME}} {{BUSINESS_DAYS_GAP}} {{CASE_AGE_STATEMENT}}", "utf-8")
+    assert any("bank_holidays.txt line 2" in p for p in S.validate_config(good)[1])
 
 
 def test_v1_submissions_without_a_contract_are_not_resumed(env2):

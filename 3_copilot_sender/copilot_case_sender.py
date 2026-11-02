@@ -335,6 +335,7 @@ def probe_dir(directory: Path) -> str:
 DEFAULTS = {
     "cdp_port": 9333, "result_contract_path": "", "copilot_url": "https://m365.cloud.microsoft/chat", "requested_model": "",
     "instructions_path": "",          # one general review guidance file: 'send-only' runs (the pipeline uses guidance_dir)
+    "daily_instructions_path": "",    # daily_review_instructions.md: how Copilot analyses ANY case, attached first to every case
     "recursive_documents": False,
     "completion_mode": "json_result",   # "json_result" = collect + validate Copilot's JSON answer; "submission_only" = V1 (send only)
     "node_executable": "", "dependency_directory": "", "approved_root": "", "approved_unc_root": "",
@@ -383,13 +384,17 @@ DEFAULTS = {
     "systems_cdp_port": 9223,         # Edge for System 1 + 2 (its own remembered profile); Copilot stays on cdp_port
     "last_csv_path": "",              # the daily CSV used last time (offered as the default)
 }
-REQUIRED = ["cases_root", "base_message_path", "python_executable", "edge_executable", "runtime_root"]
+REQUIRED = ["cases_root", "base_message_path", "daily_instructions_path", "python_executable", "edge_executable",
+            "runtime_root"]
 PATH_KEYS = REQUIRED + ["instructions_path", "result_contract_path", "node_executable", "dependency_directory", "approved_root",
                         "approved_unc_root", "driver_cache_dir", "guidance_dir", "last_csv_path"]
 HERE = Path(os.path.abspath(__file__)).parent   # never .resolve(): it turns a mapped drive (S:) into its UNC form
 PROJECT = HERE.parent                           # the tool's top folder: Run.cmd, sender_config.json, guidance/, shared/
 if str(PROJECT) not in sys.path:                # embedded Python does not add the script folder: shared/ is found here
     sys.path.insert(0, str(PROJECT))
+from shared import timing as TM                 # noqa: E402  the four case-timing values of the base message
+from shared import review_workbook as WB        # noqa: E402  Copilot review results.xlsx for the human reviewers
+from shared.pipeline import SNAPSHOT_SUFFIX      # noqa: E402  Part 2's account snapshot, copied into each case folder
 
 
 def config_path() -> Path:
@@ -486,10 +491,13 @@ def setup_command() -> int:
     value = ask("Path of a general Review guidance .md - only for 'Run.cmd send-only' (Enter = none)",
                 cur.get("instructions_path") or "", True)
     cur["instructions_path"] = str(resolve_file(value, "review_guidance.md") or "") if value else ""
-    cur["base_message_path"] = ask_file("base_message_path", "Path of the base_message Markdown file", "base_message.md")
-    template = PROJECT / "guidance" / "result_contract.md"
+    cur["base_message_path"] = ask_file("base_message_path", "Path of the base_message Markdown file (with the four "
+                                        "{{...}} case-timing placeholders)", "daily_review_base_message.md")
+    cur["daily_instructions_path"] = ask_file("daily_instructions_path", "Path of daily_review_instructions.md (how "
+                                              "Copilot analyses every case; attached first to every case)",
+                                              "daily_review_instructions.md")
     value = ask("Path of the Result contract .md - the strict JSON answer format (Enter = do not collect answers)",
-                cur.get("result_contract_path") or (str(template) if template.is_file() else ""), True)
+                cur.get("result_contract_path") or "", True)
     cur["result_contract_path"] = str(resolve_file(value, "result_contract.md") or "") if value else ""
     cur["completion_mode"] = "json_result" if cur["result_contract_path"] else "submission_only"
     cur["python_executable"] = ask_file("python_executable", "Embedded python.exe", "python.exe", sys.executable)
@@ -559,7 +567,7 @@ def validate_config(cfg):
     except PathError as exc:
         return None, [str(exc)]
     for key, kind in (("cases_root", "dir"), ("runtime_root", "dir"), ("instructions_path", "file"),
-                      ("base_message_path", "file"), ("result_contract_path", "file"), ("dependency_directory", "dir"),
+                      ("base_message_path", "file"), ("daily_instructions_path", "file"), ("result_contract_path", "file"), ("dependency_directory", "dir"),
                       ("guidance_dir", "dir")):
         value = getattr(cfg, key)
         if not value:
@@ -600,10 +608,19 @@ def validate_config(cfg):
         problems.append("completion_mode 'json_result' needs result_contract_path (or use 'submission_only')")
     if not problems:
         try:
-            load_message(Path(cfg.base_message_path))
+            missing = TM.missing_placeholders(load_message(Path(cfg.base_message_path)))
+            if missing:
+                problems.append("base_message is missing the case-timing placeholder(s) " + ", ".join(missing)
+                                + " - add each one where its value goes")
         except SenderError as exc:
             problems.append(str(exc))
+        problems += holidays_of(cfg).problems
     return policy, problems
+
+
+def holidays_of(cfg) -> "TM.Holidays":
+    """England & Wales bank holidays: built in, plus bank_holidays.txt beside daily_review_instructions.md."""
+    return TM.Holidays(Path(cfg.daily_instructions_path).parent if getattr(cfg, "daily_instructions_path", "") else None)
 
 
 def load_message(path: Path) -> str:
@@ -854,6 +871,7 @@ def say(text: str) -> None:
 
 def register_redactions(red: Redactor, cfg, policy: PathPolicy | None) -> None:
     labels = {"cases_root": "CASES_ROOT", "runtime_root": "RUNTIME_ROOT", "instructions_path": "REVIEW_GUIDANCE_FILE", "result_contract_path": "RESULT_CONTRACT_FILE",
+              "daily_instructions_path": "DAILY_INSTRUCTIONS_FILE",
               "base_message_path": "BASE_MESSAGE_FILE", "python_executable": "PYTHON_EXECUTABLE",
               "edge_executable": "EDGE_EXECUTABLE", "node_executable": "NODE_EXECUTABLE",
               "dependency_directory": "DEPENDENCY_DIR", "approved_root": "APPROVED_ROOT",
@@ -3187,20 +3205,27 @@ def judge_upload(snap: dict, expected: list) -> dict:
             "ready": ready, "signature": (sum(observed.values()), sum((observed & want).values()), len(snap["active"]))}
 
 
-# --- the answer contract: Copilot must reply with ONE JSON object, written as plain text, shaped like this -----
-RESULT_KEYS = ("COPILOT_RESULT", "JUSTIFICATION", "A_B_COMPARISONS")
-ROW_KEYS = ("ITEM", "Customer_expectation", "System_data", "MATCH")
+# --- the answer contract (result_contract.md): a short 'Working' section, then ONE JSON object written as plain text on
+# the reply's very LAST line.  Only that line is read.  Keys in any order are accepted (and put in order for the files).
+RESULT_KEYS = ("COPILOT_RESULT", "DISCREPANCY_TYPE", "CASE_END_DATETIME", "REGISTER_SNAPSHOT_DATETIME", "CLIENT_REQUEST",
+               "JUSTIFICATION", "A_B_COMPARISONS", "RULE_CHECKS")
+ROW_KEYS = ("ITEM", "Customer_expectation", "CUSTOMER_SOURCE", "System_data", "SYSTEM_SOURCE", "MATCH")
+RULE_KEYS = ("RULE", "STATUS", "EVIDENCE", "NOTE")
 RESULT_WORDS = ("Correct", "Incorrect", "Inconclusive")
+DISCREPANCY_WORDS = ("None", TM.PROCESSOR_ERROR, TM.AGED_CASE)
+RULE_WORDS = ("Satisfied", "Not satisfied", "Not determinable", "Not applicable")
 FIXUP_TEXT = ("Your previous answer did not follow the required result structure. Resend your exact same answer, unchanged "
-              "in content, as one JSON object written as plain text on a single line (no code block, no markdown) with "
-              "exactly the keys COPILOT_RESULT, JUSTIFICATION and A_B_COMPARISONS, as defined in the attached result contract.")
+              "in content, in the format of the attached result contract: the short Working section, then as the very last "
+              "line ONE JSON object written as plain text on a single line (no code block, no markdown) with exactly the "
+              "keys " + ", ".join(RESULT_KEYS) + ".")
 # Added to the visible message when answers are collected: the attached result contract is the ONLY answer format.
 # (VDI run 2026-11-02: all three first answers used another key set taken from somewhere else in the attachments.)
 CONTRACT_REMINDER = ("ANSWER FORMAT - this overrides any other answer format, template or JSON keys in the attached files or above: "
-                     "finish your reply with ONE JSON object written as plain text on a single line (no code block), with exactly "
-                     "the keys COPILOT_RESULT (Correct, Incorrect or Inconclusive), JUSTIFICATION (text) and A_B_COMPARISONS "
-                     "(a list of rows, each with exactly ITEM, Customer_expectation, System_data and MATCH true/false), "
-                     "as defined in the attached result contract. No other keys.")
+                     "write the short Working section, then end your reply with ONE JSON object written as plain text on a "
+                     "single line as its very last line (no code block, nothing after it), with exactly the keys "
+                     + ", ".join(RESULT_KEYS) + "; each A_B_COMPARISONS row with exactly " + ", ".join(ROW_KEYS)
+                     + " (true, false or null) and each RULE_CHECKS row with exactly " + ", ".join(RULE_KEYS)
+                     + ", as defined in the attached result contract. No other keys.")
 REFUSAL_RE = re.compile(r"(can['’]?t|cannot|unable to|not able to|won['’]?t|not allowed to) (help|assist|provide|complete|process|"
                         r"review|share|do that|comply)|sensitive (information|data|content)|personal (data|information)|"
                         r"against (my|our|the) (policy|policies|guidelines)|i['’]m sorry", re.I)
@@ -3211,51 +3236,113 @@ def looks_like_refusal(text: str) -> bool:
     return "{" not in (text or "") and bool(REFUSAL_RE.search(text or ""))
 
 
-def validate_result(obj: dict) -> list:
-    """Problems with an answer object ([] = valid).  Strict keys, exact verdict words, and the verdict must
-    agree with the MATCH flags of the comparison rows."""
+def _filled(value) -> bool:
+    """Text the contract accepts: not empty (numbers count as text; true/false/null do not)."""
+    return not isinstance(value, bool) and isinstance(value, (str, int, float)) and bool(str(value).strip())
+
+
+def validate_result(obj: dict, expect: dict | None = None) -> list:
+    """Problems with an answer object ([] = valid), by result_contract.md.  Key ORDER is not a problem (`canonical`
+    fixes it).  `expect` = what this case's message said: case_end, snapshot, age, gap (shared/timing.py) and
+    rules_file (False only in send-only, where no Sub Worktype rules file is attached); None = not checked."""
     problems = []
     missing, extra = [k for k in RESULT_KEYS if k not in obj], [k for k in obj if k not in RESULT_KEYS]
     if missing:
         problems.append("missing key(s): " + ", ".join(missing))
     if extra:
         problems.append("unexpected key(s): " + ", ".join(extra))
-    verdict = obj.get("COPILOT_RESULT")
+    verdict, kind = obj.get("COPILOT_RESULT"), obj.get("DISCREPANCY_TYPE")
     if verdict not in RESULT_WORDS:
         problems.append("COPILOT_RESULT must be exactly Correct, Incorrect or Inconclusive")
-    if not (isinstance(obj.get("JUSTIFICATION"), str) and obj["JUSTIFICATION"].strip()):
-        problems.append("JUSTIFICATION must be non-empty text")
-    rows = obj.get("A_B_COMPARISONS")
+    if kind not in DISCREPANCY_WORDS:
+        problems.append("DISCREPANCY_TYPE must be exactly " + ", ".join(DISCREPANCY_WORDS))
+    for k in ("CASE_END_DATETIME", "REGISTER_SNAPSHOT_DATETIME", "CLIENT_REQUEST", "JUSTIFICATION"):
+        if not (isinstance(obj.get(k), str) and obj[k].strip()):
+            problems.append(f"{k} must be non-empty text")
+    rows, rules = obj.get("A_B_COMPARISONS"), obj.get("RULE_CHECKS")
     if not isinstance(rows, list):
         problems.append("A_B_COMPARISONS must be a list of rows")
+    if not isinstance(rules, list):
+        problems.append("RULE_CHECKS must be a list of rows")
+    if problems:
         return problems
     for i, row in enumerate(rows, 1):
         if not isinstance(row, dict) or set(row) != set(ROW_KEYS):
-            problems.append(f"A_B_COMPARISONS row {i} must have exactly ITEM, Customer_expectation, System_data, MATCH")
+            problems.append(f"A_B_COMPARISONS row {i} must have exactly " + ", ".join(ROW_KEYS))
             continue
-        if not isinstance(row["MATCH"], bool):
-            problems.append(f"row {i}: MATCH must be true or false")
-        for k in ("ITEM", "Customer_expectation", "System_data"):
-            if isinstance(row[k], bool) or not isinstance(row[k], (str, int, float)):
-                problems.append(f"row {i}: {k} must be text")
-    if not problems:  # verdict cross-check
-        flags = [r["MATCH"] for r in rows]
-        if verdict in ("Correct", "Incorrect") and not rows:
-            problems.append(f"{verdict} needs at least one A_B_COMPARISONS row")
-        elif verdict == "Correct" and not all(flags):
-            problems.append("Correct requires every MATCH to be true")
-        elif verdict == "Incorrect" and all(flags):
-            problems.append("Incorrect requires at least one MATCH to be false")
+        if row["MATCH"] is not None and not isinstance(row["MATCH"], bool):
+            problems.append(f"comparison row {i}: MATCH must be true, false or null")
+        problems += [f"comparison row {i}: {k} must be non-empty text" for k in ROW_KEYS[:-1] if not _filled(row[k])]
+    for i, row in enumerate(rules, 1):
+        if not isinstance(row, dict) or set(row) != set(RULE_KEYS):
+            problems.append(f"RULE_CHECKS row {i} must have exactly " + ", ".join(RULE_KEYS))
+            continue
+        if row["STATUS"] not in RULE_WORDS:
+            problems.append(f"rule check {i}: STATUS must be exactly " + ", ".join(RULE_WORDS))
+        problems += [f"rule check {i}: {k} must be non-empty text" for k in ("RULE", "EVIDENCE", "NOTE") if not _filled(row[k])]
+    if not rows:
+        problems.append("A_B_COMPARISONS needs at least one row, always")
+    rules_file = True if expect is None else expect.get("rules_file", True)
+    if not rules and rules_file:
+        problems.append("RULE_CHECKS needs one row per required check of the attached Sub Worktype rules file")
+    if problems:
+        return problems
+    # section 4: the order of priority for the result
+    flags, statuses = [r["MATCH"] for r in rows], [r["STATUS"] for r in rules]
+    if False in flags or "Not satisfied" in statuses:
+        if verdict != "Incorrect":
+            problems.append("a MATCH false or a rule check 'Not satisfied' makes the result Incorrect")
+    elif None in flags or "Not determinable" in statuses or not rules:
+        if verdict != "Inconclusive":
+            problems.append("a MATCH null, a rule check 'Not determinable' or no rule checks at all (no rules file) "
+                            "makes the result Inconclusive")
+    elif verdict == "Incorrect":
+        problems.append("Incorrect needs a MATCH false or a rule check 'Not satisfied'")
+    # section 5: the timing label
+    if False not in flags:
+        if kind != "None":
+            problems.append("DISCREPANCY_TYPE must be None when no comparison has MATCH false")
+    else:
+        want = (TM.expected_discrepancy(expect) if expect is not None
+                else kind if kind != "None" else TM.PROCESSOR_ERROR)
+        if kind != want:
+            problems.append(f"DISCREPANCY_TYPE must be '{want}' for this case age (a comparison has MATCH false)")
+        elif not obj["JUSTIFICATION"].lstrip().startswith(kind + ":"):
+            problems.append(f"JUSTIFICATION must begin with '{kind}:'")
+        if kind == TM.AGED_CASE and TM.AGED_SENTENCE not in obj["JUSTIFICATION"]:
+            problems.append(f"JUSTIFICATION must include the sentence '{TM.AGED_SENTENCE}'")
+    # the timing values must be copied exactly from the message
+    if expect is not None:
+        if norm_ws(obj["CASE_END_DATETIME"]) != norm_ws(expect.get("case_end") or TM.NOT_PROVIDED):
+            problems.append(f"CASE_END_DATETIME must be copied exactly from the message: {expect.get('case_end')}")
+        snap = expect.get("snapshot") or TM.NOT_PROVIDED
+        if snap != TM.NOT_PROVIDED and norm_ws(obj["REGISTER_SNAPSHOT_DATETIME"]) != norm_ws(snap):
+            problems.append(f"REGISTER_SNAPSHOT_DATETIME must be copied exactly from the message: {snap}")
     return problems
 
 
-def odd_verdict(verdict: str, rows: int, differences: int) -> str:
-    """A valid answer that still deserves a look (flagged in the daily report, never changed)."""
-    if verdict == "Inconclusive" and not rows:
-        return "CHECK: Inconclusive with no comparisons"
-    if verdict == "Inconclusive" and differences:
-        return f"CHECK: Inconclusive although {differences} difference(s) are listed"
-    return ""
+def canonical(obj: dict) -> tuple:
+    """(the answer with its keys in the contract's order - top level and every row, whether the order had to be fixed).
+    Only for a VALID answer: the content is never changed."""
+    fixed = {k: obj[k] for k in RESULT_KEYS}
+    fixed["A_B_COMPARISONS"] = [{k: r[k] for k in ROW_KEYS} for r in obj["A_B_COMPARISONS"]]
+    fixed["RULE_CHECKS"] = [{k: r[k] for k in RULE_KEYS} for r in obj["RULE_CHECKS"]]
+    moved = (list(obj) != list(RESULT_KEYS) or any(list(r) != list(ROW_KEYS) for r in obj["A_B_COMPARISONS"])
+             or any(list(r) != list(RULE_KEYS) for r in obj["RULE_CHECKS"]))
+    return fixed, moved
+
+
+def last_line(text) -> str:
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    return lines[-1] if lines else ""
+
+
+def working_section(text) -> str:
+    """Everything of the reply above its last line (the 'Working' section), for the results workbook."""
+    lines = str(text or "").rstrip().splitlines()
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return "\n".join(lines[:-1]).strip()
 
 
 def json_objects(text: str) -> list:
@@ -3275,22 +3362,33 @@ def json_objects(text: str) -> list:
         i = end
 
 
-def parse_answer(answer: dict):
-    """(object or None, problems) from the NEWEST reply.  The result is expected as plain text (a code box is not
-    relied on - it sometimes does not render), but JSON inside a code block is read too.  The newest object that
-    has COPILOT_RESULT is judged; otherwise the newest object, so a wrong one can be named in the fix-up."""
-    body = answer.get("text") or ""
-    pool = []
+def reply_text(answer: dict) -> str:
+    """The reply as the reader sees it, line breaks included (innerText); textContent only when that is missing."""
+    return answer.get("full") or answer.get("text") or ""
+
+
+def parse_answer(answer: dict, expect: dict | None = None):
+    """(object or None, problems) from the NEWEST reply.  Only its LAST non-empty line is the answer (the contract puts
+    the Working section above it).  A result object found anywhere else (inside the Working text, a code block, or
+    followed by other text) is returned with that problem, so the fix-up can name it - it is never accepted."""
+    body = reply_text(answer)
+    line = last_line(body)
+    if line.startswith("{"):
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            obj = None
+        if isinstance(obj, dict):
+            return obj, validate_result(obj, expect)
+        return None, ["the last line of the reply looks like JSON but is not valid JSON on one line"]
+    pool = json_objects(body)[::-1]
     for block in reversed(answer.get("blocks") or []):
         pool += json_objects(block)[::-1]
-    pool += json_objects(body)[::-1]
-    for obj in pool:
-        if "COPILOT_RESULT" in obj:
-            return obj, validate_result(obj)
-    if pool:
-        return pool[0], validate_result(pool[0])
+    found = next((o for o in pool if "COPILOT_RESULT" in o), None)
+    if found is not None:
+        return found, ["the result JSON must be the very last line of the reply, as plain text with nothing after it"]
     looks = "text that looks like JSON but is not valid JSON" if "{" in body else "no JSON object"
-    return None, [f"the reply has {looks} (the result must be one JSON object written as plain text)"]
+    return None, [f"the reply has {looks} (its last line must be one JSON object written as plain text)"]
 
 
 def save_result(rt: Runtime, case, status: str, obj, raw: str, tries: int, fixups: int, omitted: int, chat: str = "") -> None:
@@ -3330,17 +3428,21 @@ class Pending:
 class Prepared:
     """Result of preparing the next case while the current one uploads (the pipeline)."""
 
-    def __init__(self, case, plan=None, blocked="", tab=None, generation=0, left_out=()):
+    def __init__(self, case, plan=None, blocked="", tab=None, generation=0, left_out=(), message=""):
         self.case, self.plan, self.blocked, self.tab, self.generation = case, plan, blocked, tab, generation
         self.left_out = list(left_out)  # documents NOT sent because of the attachment limit (local detail)
+        self.message = message          # THIS case's base message: the case-timing placeholders filled in
 
 
 class Runner:
     def __init__(self, cfg, rt, policy, journal, ledger, log, stop, browser, redact, message, instr):
         self.cfg, self.rt, self.policy, self.journal, self.ledger = cfg, rt, policy, journal, ledger
         self.log, self.stop, self.browser, self.redact = log, stop, browser, redact
-        self.message, self.instr = message, instr
-        self.needle = needle_of(message)
+        self.message, self.instr = message, instr     # the base message TEMPLATE (filled per case: message_for)
+        self.sent_text = {}               # case key -> the message actually typed for it (the needle of its sent bubble)
+        self.timing = {}                  # case key -> the case-timing values put in its message (shared/timing.py)
+        self.holidays = holidays_of(cfg)
+        self.workbook = None              # WB.ReviewWorkbook of this run (None = no workbook, e.g. in tests)
         self.sent_ids = ledger.read()
         self.attempts = collections.Counter()
         self.prefetch = None  # (case key, asyncio.Task)
@@ -3362,6 +3464,30 @@ class Runner:
     # -- helpers ------------------------------------------------------------------------------
     def rec(self, case, state, **fields):
         return self.journal.record(case.key, state, alias=case.alias, instruction_id=case.id, **fields)
+
+    def timing_for(self, case) -> dict:
+        """The four case-timing values of this case's message: End Date from the CSV (pipeline; send-only has no
+        CSV) and the retrieval time of the snapshot inside the case folder."""
+        retrieved = None
+        for doc in case.docs:
+            if doc.rel.endswith(SNAPSHOT_SUFFIX) and "/" not in doc.rel.replace("\\", "/"):
+                try:
+                    data = json.loads(Path(doc.path).read_text("utf-8-sig"))
+                    retrieved = ((data.get("Account Summary") or {}).get("metadata") or {}).get("retrievedUtc")
+                except (OSError, ValueError, AttributeError):
+                    retrieved = None
+                break
+        end = self.feed.end_date(case) if self.feed else None
+        timing = TM.case_timing(end, retrieved, self.holidays, from_csv=self.feed is not None)
+        timing["rules_file"] = self.feed is not None     # send-only attaches the general guidance, not a Sub Worktype file
+        return timing
+
+    def message_for(self, case) -> str:
+        return self.sent_text.get(case.key) or self.message
+
+    def expect_for(self, case):
+        """What this case's answer must agree with: the timing put in its message (journal after a restart)."""
+        return self.timing.get(case.key) or self.journal.cases.get(case.key, {}).get("timing")
 
     def note(self, case, kind: str, **fields):
         """One turn of this case's chat for the Copilot responses file (sent, reply, fix-up, page state)."""
@@ -3409,6 +3535,7 @@ class Runner:
             if self.feed is not None:      # Sub Worktype instructions + snapshot, Audit Trail, documents first
                 self.feed.arrange(case)
             plan, left_out = build_plan(case, self.feed.instr(case) if self.feed else self.instr, self.cfg, self.policy)
+            timing = await asyncio.to_thread(self.timing_for, case)
         except Blocked as exc:
             return Prepared(case, blocked=str(exc))
         tab = None
@@ -3417,7 +3544,9 @@ class Runner:
                 tab = self.pool_tab()          # prefetch only takes a warm tab; the attempt opens/recycles one if needed
             except Exception as exc:  # pipeline is an optimisation: failing here only loses the head start
                 self.log("prefetch", case.alias, note=safe_exc(self.redact, exc))
-        return Prepared(case, plan, tab=tab, generation=self.browser.generation, left_out=left_out)
+        self.timing[case.key] = timing
+        return Prepared(case, plan, tab=tab, generation=self.browser.generation, left_out=left_out,
+                        message=TM.fill(self.message, timing))
 
     def collecting(self) -> bool:
         return self.cfg.completion_mode == "json_result"
@@ -3480,9 +3609,10 @@ class Runner:
     async def attempt(self, case: Case, prep: Prepared, n: int, route: str, nxt) -> str:
         t0, aid = time.monotonic(), uuid.uuid4().hex[:10]
         expected = [p["name"] for p in prep.plan]
+        self.sent_text[case.key] = prep.message or self.message
         self.rec(case, "preparing", attempt=n, attempt_id=aid, route=route, plan=prep.plan, expected=len(expected),
                  prompt_version=self.prompt_version, omitted=len(prep.left_out), left_out=prep.left_out,
-                 contract=self.collecting())
+                 contract=self.collecting(), timing=self.timing.get(case.key))
         tab, usable = prep.tab, prep.tab
         prep.tab = None
         intent = reusable = False
@@ -3502,7 +3632,7 @@ class Runner:
                 await tab.attach(paths, route)
                 self.log("uploading", case.alias, attempt=n, route=route, expected=len(expected))
                 self.start_prefetch(nxt)                 # pipeline: next case prepares while this uploads
-                await tab.set_message(self.message)      # typing the message overlaps the file transfer
+                await tab.set_message(self.message_for(case))   # typing the message overlaps the file transfer
                 try:
                     await self.wait_upload_ready(tab, case, expected)
                     break
@@ -3639,12 +3769,13 @@ class Runner:
             raise AttemptFailed("a send was already recorded for this case")
         self.storage_alive()
         await tab.foreground()                        # the send must happen in the visible, active tab
-        ev = await tab.evidence(self.needle)          # (fresh() would fail here: our own chips are attached)
+        message = self.message_for(case)
+        ev = await tab.evidence(needle_of(message))   # (fresh() would fail here: our own chips are attached)
         if ev["users"] or ev["replies"]:
             raise AttemptFailed("conversation already contains messages")
-        if norm_ws(await tab.message_text()) != norm_ws(self.message):  # text may reset while uploading: re-fill once
-            await tab.set_message(self.message)
-            if norm_ws(await tab.message_text()) != norm_ws(self.message):
+        if norm_ws(await tab.message_text()) != norm_ws(message):  # text may reset while uploading: re-fill once
+            await tab.set_message(message)
+            if norm_ws(await tab.message_text()) != norm_ws(message):
                 raise AttemptFailed("composer text does not match the configured message")
         snap = await tab.snapshot()
         names = [p["name"] for p in plan]
@@ -3690,10 +3821,10 @@ class Runner:
     async def reconcile(self, case, tab, window: float):
         """Look at the SAME conversation (rebinding by exact target id after a reconnect).  Returns the
         evidence dict, or a short reason string when it can't be proven."""
-        deadline, target = time.monotonic() + window, tab.target_id
+        deadline, target, needle = time.monotonic() + window, tab.target_id, needle_of(self.message_for(case))
         while time.monotonic() < deadline:
             try:
-                ev = await tab.evidence(self.needle)
+                ev = await tab.evidence(needle)
                 if ev["match"]:
                     return ev
             except ConnectionLost:
@@ -3840,14 +3971,14 @@ class Runner:
         return True
 
     async def judge(self, p, answer):
-        obj, problems = parse_answer(answer)
-        text = answer.get("full") or answer["text"]
+        obj, problems = parse_answer(answer, self.expect_for(p.case))
+        text = reply_text(answer)
         refusal = obj is None and looks_like_refusal(answer["text"])
         state = await self.look(p)
         self.note(p.case, "reply", text=text, valid=obj is not None and not problems, problems=problems,
                   keys=sorted(obj) if isinstance(obj, dict) else [], looks_like_refusal=refusal, page=state)
         if obj is not None and not problems:
-            return self.finish_valid(p, obj, answer["text"])
+            return self.finish_valid(p, obj, text)
         self.log("fixup", p.case.alias, note=("the reply looks like a refusal; " if refusal else "")
                  + "answer structure problem: " + "; ".join(problems[:3])
                  + (f" (keys returned: {', '.join(sorted(obj)[:12])})" if isinstance(obj, dict) else ""))
@@ -3912,21 +4043,46 @@ class Runner:
         self.queue.append(case)
 
     def finish_valid(self, p, obj, raw):
-        case, verdict = p.case, obj["COPILOT_RESULT"]
-        rows = obj["A_B_COMPARISONS"]
+        case = p.case
+        obj, moved = canonical(obj)                      # keys in the contract's order; the content never changes
+        verdict, kind = obj["COPILOT_RESULT"], obj["DISCREPANCY_TYPE"]
+        rows, rules = obj["A_B_COMPARISONS"], obj["RULE_CHECKS"]
         diff = sum(1 for r in rows if r["MATCH"] is False)
+        unknown = sum(1 for r in rows if r["MATCH"] is None)
+        failed = sum(1 for r in rules if r["STATUS"] == "Not satisfied")
+        undetermined = sum(1 for r in rules if r["STATUS"] == "Not determinable")
         omitted = self.journal.cases.get(case.key, {}).get("omitted", 0)
         save_result(self.rt, case, "result_valid", obj, raw, self.attempts[case.key], p.fixups, omitted, self.chat.get(case.key, ""))
-        self.rec(case, "result_valid", verdict=verdict, rows=len(rows), differences=diff, fixups=p.fixups)
-        note = f"{len(rows)} comparison(s), {diff} difference(s)" + (f"; {omitted} file(s) were left out" if omitted else "")
-        odd = odd_verdict(verdict, len(rows), diff)
-        if odd:
-            note += "; " + odd
-            self.log("WARNING", case.alias, note=odd)
+        self.rec(case, "result_valid", verdict=verdict, discrepancy=kind, rows=len(rows), differences=diff,
+                 not_compared=unknown, rule_checks=len(rules), not_satisfied=failed, not_determinable=undetermined,
+                 fixups=p.fixups, key_order_fixed=moved)
+        note = (f"{'no discrepancy' if kind == 'None' else kind}; {len(rows)} comparison(s), {diff} difference(s), "
+                f"{unknown} not compared; {len(rules)} rule check(s), {failed} not satisfied, {undetermined} not determinable"
+                + (f"; {omitted} file(s) were left out" if omitted else "") + ("; key order fixed by the script" if moved else ""))
+        for check in (self.expect_for(case) or {}).get("notes") or []:     # case timing sent as 'Not provided'
+            note += "; " + check
+            self.log("WARNING", case.alias, note=check)
         self.results[case.key] = ("result_" + verdict.lower(), note)
-        self.log("result_" + verdict.lower(), case.alias, comparisons=len(rows), differences=diff, fixups=p.fixups)
+        self.log("result_" + verdict.lower(), case.alias, discrepancy=kind, comparisons=len(rows), differences=diff,
+                 rule_checks=len(rules), fixups=p.fixups)
         del self.pending[case.key]
         self.done_tabs.append((p.tab, p.generation))     # free to be reset and reused
+        self.to_workbook(case, obj, raw)
+
+    def to_workbook(self, case, obj, raw):
+        """The valid answer into Copilot review results.xlsx.  A workbook open in Excel is never waited for: it is
+        written again after the next answer and at the end of the run.  Never stops the run."""
+        if self.workbook is None:
+            return
+        timing = self.expect_for(case) or {}
+        info = self.feed.info(case) if self.feed else {"iid": case.id, "account": case.ref}
+        info.update(gap=timing.get("gap", ""), age=timing.get("age", ""))
+        try:
+            if not self.workbook.add(info, obj, working_section(raw)):
+                self.log("WARNING", case.alias, note=f"'{WB.NAME}' is open in Excel - it is written again after the "
+                                                     "next answer and at the end of the run (close it there)")
+        except Exception as exc:
+            self.log("WARNING", case.alias, note=f"the results workbook could not be written: {safe_exc(self.redact, exc)}")
 
     def finish_without_answer(self, p, state: str, reason: str, raw: str = ""):
         case = p.case
@@ -4051,8 +4207,9 @@ class PipelineFeed:
 
     The queue is not one scan at start: the coordinator hands a case over once it is complete (its folder moved from
     CASES_ROOT\\.work into CASES_ROOT + RUNTIME_ROOT\\pipeline\\cases\\<id>.json) and `poll` picks it up within seconds.
-    Each case gets ITS Sub Worktype's instructions file + the result contract, and its files go in the order
-    snapshot, Audit Trail, documents - so what is left out over max_attachments is always the last documents.
+    Each case gets daily_review_instructions.md, ITS Sub Worktype's instructions file and the result contract, and its
+    files go in the order snapshot, Audit Trail, documents - so what is left out over max_attachments is always the
+    last documents.  Its message carries the case timing of its CSV row (End Date) and snapshot.
     A stop (e.g. System 2 Access Denied) empties the queue; answers already sent are still collected."""
 
     def __init__(self, run_dir, ctx, salt: str):
@@ -4065,7 +4222,9 @@ class PipelineFeed:
         self.parts = [p for p in ("part1", "part2") if self.plan.get("parts", {}).get(p)]
         self.contract = (doc_of(Path(ctx.cfg.result_contract_path))
                          if ctx.cfg.completion_mode == "json_result" and ctx.cfg.result_contract_path else None)
-        self.seen, self.instr_of, self.order_of, self.cases = set(), {}, {}, []
+        self.daily = doc_of(Path(ctx.cfg.daily_instructions_path))
+        self.rows = {c["iid"]: c for c in self.plan["cases"]}     # the CSV row of each instruction ID
+        self.seen, self.instr_of, self.order_of, self.cases, self.sub_of = set(), {}, {}, [], {}
         self.closed = False
 
     # -- the queue ------------------------------------------------------------------------------
@@ -4106,8 +4265,9 @@ class PipelineFeed:
             except (PathError, OSError) as exc:
                 case.blocked, fixed = (str(exc) if isinstance(exc, PathError) else
                                        "the Sub Worktype instructions file could not be read"), []
-            self.instr_of[case.key] = fixed + ([self.contract] if self.contract else [])
+            self.instr_of[case.key] = [self.daily] + fixed + ([self.contract] if self.contract else [])
             self.order_of[case.key] = list(m.get("order") or [])
+            self.sub_of[case.key] = m.get("sub_worktype") or ""
             out.append(case)
             self.cases.append(case)
         self.closed = closed
@@ -4115,6 +4275,16 @@ class PipelineFeed:
 
     def instr(self, case) -> list:
         return self.instr_of.get(case.key) or []
+
+    def end_date(self, case) -> str:
+        """The CSV's End Date of this case ('' when the CSV has none for it)."""
+        return (self.rows.get(case.id) or {}).get("end_date", "")
+
+    def info(self, case) -> dict:
+        """What the results workbook shows about the case besides Copilot's answer."""
+        row = self.rows.get(case.id) or {}
+        return {"iid": case.id, "account": row.get("account", ""), "client_number": row.get("client_number", ""),
+                "sub_worktype": self.sub_of.get(case.key) or row.get("sub_worktype_csv", "")}
 
     def arrange(self, case) -> None:
         """Snapshot, Audit Trail, then documents in System 1's Received Documents order; anything else after, by name."""
@@ -4209,7 +4379,7 @@ def scan_pipeline(ctx, journal, listed, feed):
     todo = [c for c in feed.poll() if c.id not in listed]
     ctx.log("queue", note=f"{len(todo)} case(s) complete and ready now; {feed.expected(listed) - len(todo)} more "
                           "on their way from System 1 / System 2")
-    return cases, todo, [feed.contract] if feed.contract else []
+    return cases, todo, [feed.daily] + ([feed.contract] if feed.contract else [])
 
 
 # --------------------------------------------------------------------------------------------
@@ -4217,7 +4387,8 @@ def scan_pipeline(ctx, journal, listed, feed):
 # --------------------------------------------------------------------------------------------
 
 def prompt_version(cfg, message: str) -> str:
-    stats = [os.stat(path) for path in (cfg.instructions_path, cfg.result_contract_path) if path]
+    stats = [os.stat(path) for path in (getattr(cfg, "daily_instructions_path", ""), cfg.instructions_path,
+                                        cfg.result_contract_path) if path]
     parts = "|".join(f"{st.st_size}|{st.st_mtime_ns}" for st in stats)
     return hashlib.sha256(f"{parts}|{message}".encode()).hexdigest()[:12]
 
@@ -4303,6 +4474,8 @@ def check_command(args) -> int:
     line("runtime write + replace + read-back", not probe_dir(rt.state))
     line("cases root listable", bool(os.listdir(cfg.cases_root) is not None))
     line("base_message non-empty UTF-8", bool(load_message(Path(cfg.base_message_path))))
+    line("base_message has the four case-timing placeholders", not TM.missing_placeholders(load_message(Path(cfg.base_message_path))))
+    line("daily review instructions readable", Path(cfg.daily_instructions_path).is_file())
     line("temp redirected", os.path.normcase(tempfile.gettempdir()) == os.path.normcase(str(rt.temp)))
     bits = 8 * ctypes.sizeof(ctypes.c_void_p)
     print(f"  python {sys.version.split()[0]} {bits}-bit")
@@ -4398,7 +4571,8 @@ def plan_command(args) -> int:
         ledger = Ledger(ctx.rt.ledger, ctx.cfg.persist_retries)
         listed = sync_ledger(journal, ledger, ctx.log)
         cases, other, excluded = discover(ctx.cfg, ctx.policy, local_salt(ctx.rt), ctx.red)
-        instr = [doc_of(ctx.policy.check(general_guidance(ctx.cfg), "review guidance"))]
+        instr = [doc_of(ctx.policy.check(ctx.cfg.daily_instructions_path, "daily review instructions")),
+                 doc_of(ctx.policy.check(general_guidance(ctx.cfg), "review guidance"))]
         if ctx.cfg.completion_mode == "json_result":
             instr.append(doc_of(ctx.policy.check(ctx.cfg.result_contract_path, "result contract")))
         print(f"{len(cases)} case folder(s), {excluded} excluded browser-profile folder(s), "
@@ -4917,7 +5091,8 @@ def scan_queue(ctx, journal, listed):
     """Case discovery -> (cases, todo, instr).  Runs in a thread while Edge starts and the cursor question is open."""
     cfg = ctx.cfg
     cases, other, excluded = discover(cfg, ctx.policy, local_salt(ctx.rt), ctx.red)
-    instr = [doc_of(ctx.policy.check(general_guidance(cfg), "review guidance"))]
+    instr = [doc_of(ctx.policy.check(cfg.daily_instructions_path, "daily review instructions")),
+             doc_of(ctx.policy.check(general_guidance(cfg), "review guidance"))]
     if cfg.completion_mode == "json_result":
         instr.append(doc_of(ctx.policy.check(cfg.result_contract_path, "result contract")))
     todo, done = classify([c for c in cases if not c.blocked], ctx, journal, listed)
@@ -4936,6 +5111,8 @@ async def run_async(ctx, journal, ledger, listed, message, pipeline_dir=None) ->
     runner = Runner(cfg, ctx.rt, ctx.policy, journal, ledger, log, stop, browser, ctx.red, message, [])
     runner.prompt_version = prompt_version(cfg, message)
     feed = runner.feed = PipelineFeed(pipeline_dir, ctx, local_salt(ctx.rt)) if pipeline_dir else None
+    if cfg.completion_mode == "json_result":        # the older workbook was set aside before the run (make_room)
+        runner.workbook = WB.ReviewWorkbook(ctx.rt.root / "reports")
     cases = []
     code, results, crash, started, start_seq, bfacts = 0, {}, None, time.monotonic(), journal.seq, None
     ctx.edge_offset = edge_log_size(ctx.rt)        # the run report shows only the Edge messages written from here on
@@ -5006,10 +5183,17 @@ async def run_async(ctx, journal, ledger, listed, message, pipeline_dir=None) ->
             if task and not task.done():
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
+        try:
+            ctx.workbook = runner.workbook.close() if runner.workbook else None
+        except Exception as exc:                        # never hides the run's own outcome
+            ctx.workbook = None
+            log("WARNING", note=f"the results workbook could not be written: {safe_exc(ctx.red, exc)}")
         if feed:
             cases = feed.cases                          # this run's cases (the daily report covers every CSV row)
             try:
                 feed.write_results(runner.results, journal)
+                if ctx.workbook:                        # the coordinator names it under the daily report
+                    feed.P.write_json(feed.paths.sub("status") / "workbook.json", {"path": str(ctx.workbook)})
             except OSError:
                 pass
         log.release()
@@ -5034,6 +5218,9 @@ async def run_async(ctx, journal, ledger, listed, message, pipeline_dir=None) ->
         print(f"Run report (for review): {ctx.reported}", flush=True)
     if getattr(ctx, "responses_name", ""):
         print(f"Copilot responses (every chat in full): {ctx.rt.logs / ctx.responses_name}", flush=True)
+    if getattr(ctx, "workbook", None):
+        late = "" if ctx.workbook.name == WB.NAME else f"  ('{WB.NAME}' was open in Excel: this copy has every answer)"
+        print(f"Copilot review results (Excel): {ctx.workbook}{late}", flush=True)
     return code
 
 
@@ -5365,6 +5552,11 @@ def run_command(args) -> int:
     message = load_message(Path(cfg.base_message_path))
     if cfg.completion_mode == "json_result":            # the contract's format, visible in the message itself
         message = message.rstrip() + "\n\n" + CONTRACT_REMINDER
+        if not getattr(args, "pipeline", None):         # (the coordinator already did this before Parts 1 and 2 started)
+            try:
+                WB.make_room(ctx.rt.root / "reports")   # an older results workbook is renamed; open in Excel = wait for Enter
+            except RuntimeError as exc:
+                raise SenderError(str(exc)) from None
     journal = Journal(ctx.rt, cfg.persist_retries)
     try:
         ledger = Ledger(ctx.rt.ledger, cfg.persist_retries)

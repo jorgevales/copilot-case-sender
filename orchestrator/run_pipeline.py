@@ -32,6 +32,7 @@ for _p in (PROJECT, PROJECT / "3_copilot_sender", HERE):
 
 import copilot_case_sender as sender               # noqa: E402  config, storage rules, Edge helpers (Part 3's, reused)
 from shared import pipeline as P                   # noqa: E402
+from shared import review_workbook as WB            # noqa: E402
 import handover as H                               # noqa: E402
 
 PART_SCRIPTS = {"part1": PROJECT / "1_system1_documents" / "system1_documents.py",
@@ -196,6 +197,11 @@ def main(argv=None) -> int:
             return 2
         ctx = sender.context(cfg)                   # validates paths, storage rules (nothing on the system drive)
         sender.ensure_dependencies(cfg, ctx.rt, ctx.log)
+        if cfg.completion_mode == "json_result":    # before anything starts: the older results workbook is renamed
+            try:                                    # (open in Excel = wait for Enter, then try again)
+                WB.make_room(ctx.rt.root / "reports")
+            except RuntimeError as exc:
+                raise sender.SenderError(str(exc)) from None
         csv_path = Path(sender.clean_path(args.csv)) if args.csv else ask_csv(cfg)
         cases, skipped = P.read_case_list(csv_path)
         if str(csv_path) != cfg.last_csv_path:
@@ -206,9 +212,12 @@ def main(argv=None) -> int:
                 pass
         print(f"\nCSV: {len(cases) + len(skipped)} row(s) - {len(cases)} with Process Status 'Ended'.")
         print_skipped(skipped)
+        if cases and not any(c["end_date"] for c in cases):
+            print("NOTE: no End Date in this CSV - every case is sent with case timing 'Not provided' (flagged CHECK).\n")
         sent = set(sender.Ledger(ctx.rt.ledger, cfg.persist_retries).read())
         paths = P.Paths.new_run(cfg.runtime_root, cfg.cases_root).create()
-        plan = H.build_plan(cases, skipped, paths, sent, cfg.guidance_dir, cfg.result_contract_path)
+        special = [cfg.result_contract_path, cfg.daily_instructions_path]     # never taken for a Sub Worktype's file
+        plan = H.build_plan(cases, skipped, paths, sent, cfg.guidance_dir, special)
         P.write_json(paths.plan, plan)
         print_plan(plan)
         control = P.Control(paths)
@@ -228,7 +237,7 @@ def main(argv=None) -> int:
                     procs[part] = start_part(part, paths, ctx.rt)
         else:
             control.close_feed()                    # nothing to download: only the complete cases are sent
-        hand = H.Handover(paths, control, plan, cfg.guidance_dir, cfg.result_contract_path,
+        hand = H.Handover(paths, control, plan, cfg.guidance_dir, special,
                           alive=lambda part: part in procs and procs[part].poll() is None)
         quit_ = threading.Event()
 
@@ -285,6 +294,9 @@ def finish(paths: P.Paths, plan: dict, control: P.Control, code: int, edge_offse
         if P.needs_you(r):
             print(f"  row {r['row']:>4}  {r['instruction_id']:<32}  {r['outcome']}  {r['detail']}")
     print(f"Full report (every CSV row): {report}")
+    book = (P.read_json(paths.sub("status") / "workbook.json", {}) or {}).get("path")
+    if book:
+        print(f"Copilot review results (Excel, every valid answer of this run): {book}")
     detail = H.pipeline_report(paths, plan, rows, edge_offset)
     if detail:
         print(f"What System 1 / System 2 saw (for review): {detail}")

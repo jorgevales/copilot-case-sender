@@ -9,6 +9,12 @@ __pycache__/
 .venv/
 .env
 
+# The real review files (public repository: never committed; keep them on S:)
+/daily_review_base_message.md
+/daily_review_instructions.md
+/result_contract.md
+/bank_holidays.txt
+
 # Local graphify knowledge graph and Claude Code config: keep out of the repo unless requested
 graphify-out/
 .claude/

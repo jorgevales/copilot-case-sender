@@ -65,6 +65,15 @@ def write_csv(path, rows, header=("instrcution id", "Client Account Number", "Cl
     return path
 
 
+def plan_row(paths, iid, end_date):
+    """Give a planned case its CSV End Date (as read_case_list would)."""
+    plan = P.read_plan(paths)
+    for c in plan["cases"]:
+        if c["iid"] == iid:
+            c["end_date"] = end_date
+    P.write_json(paths.plan, plan)
+
+
 def make_paths(base):
     paths = P.Paths.new_run(base / "runtime", base / "cases").create()
     return paths, P.Control(paths)
@@ -339,8 +348,9 @@ def test_cases_arriving_during_the_run_are_sent_each_with_its_own_instructions_i
     assert sorted(s for s, _ in results.values()) == ["result_correct", "result_correct"]
     names = [c[1] for c in env.world.attach_calls]
     snap = "AB100000" + P.SNAPSHOT_SUFFIX
-    assert names[0] == ["Change of Address.md", "result_contract.md", snap, "Audit Trail.pdf", "b form.pdf", "a letter.pdf"]
-    assert names[1][2] == "AB200000" + P.SNAPSHOT_SUFFIX
+    assert names[0] == ["daily_review_instructions.md", "Change of Address.md", "result_contract.md", snap, "Audit Trail.pdf",
+                        "b form.pdf", "a letter.pdf"]
+    assert names[1][3] == "AB200000" + P.SNAPSHOT_SUFFIX
     assert w.feed.done
 
 
@@ -352,8 +362,8 @@ def test_over_the_limit_the_last_documents_are_left_out_never_the_snapshot_or_au
     w.hand.step()
     r = w.runner()
     T.run(r.run(collections.deque(w.feed.poll())))
-    sent = env.world.attach_calls[0][1]          # send-only mode: no result contract, so 4 = instructions + 3 files
-    assert sent == ["Change of Address.md", "AB100000" + P.SNAPSHOT_SUFFIX, "Audit Trail.pdf", "b form.pdf"]
+    sent = env.world.attach_calls[0][1]          # send-only mode: no result contract, so 4 = 2 instructions + 2 files
+    assert sent == ["daily_review_instructions.md", "Change of Address.md", "AB100000" + P.SNAPSHOT_SUFFIX, "Audit Trail.pdf"]
     assert r.partial
 
 
@@ -1047,9 +1057,13 @@ def test_one_whole_run_coordinates_the_three_parts_and_reports_every_csv_row(bas
     runtime.mkdir()
     g, contract = guidance(base, "Change of Address")
     msg = base / "base_message.md"
-    msg.write_text("Please review.", "utf-8")
+    msg.write_text("Please review. {{CASE_END_DATETIME}} {{REGISTER_SNAPSHOT_DATETIME}} {{BUSINESS_DAYS_GAP}} "
+                   "{{CASE_AGE_STATEMENT}}", "utf-8")
+    daily = base / "daily_review_instructions.md"
+    daily.write_text("daily instructions", "utf-8")
     config = base / "sender_config.json"
     config.write_text(json.dumps({"cases_root": str(cases_root), "runtime_root": str(runtime), "base_message_path": str(msg),
+                                  "daily_instructions_path": str(daily),
                                   "python_executable": sys.executable, "edge_executable": sys.executable,
                                   "approved_root": str(base), "guidance_dir": str(g), "result_contract_path": str(contract),
                                   "system1_url": "https://system1.example.invalid/app/inbox", "system1_brand_text": "Brand",
@@ -1091,3 +1105,66 @@ def test_one_whole_run_coordinates_the_three_parts_and_reports_every_csv_row(bas
     assert sorted(p.name for p in cases_root.iterdir() if p.name != ".work") == \
         [f"{hexid(1)} - AB100000", f"{hexid(4)} - AB400000"]
     assert "SKIPPED - 1 row(s)" in out and "DAILY REPORT" in out
+
+
+# ---------------------------------------------------------------------------------------------- case timing (End Date)
+
+def test_the_csv_end_date_column_is_read_and_is_optional(base):
+    with_end = write_csv(base / "a.csv", [(hexid(1), "AB100000", "C1", "Ended", "Change of Address", "46308.48958"),
+                                          (hexid(2), "AB200000", "C2", "Ended", "Change of Address", "")],
+                         header=("instruction id", "Client Account Number", "Client Number", "Process Status", "Sub Worktype",
+                                 "End  date"))
+    cases, _ = P.read_case_list(with_end)
+    assert [c["end_date"] for c in cases] == ["46308.48958", ""]
+    without = write_csv(base / "b.csv", [(hexid(1), "AB100000", "C1", "Ended", "Change of Address")])
+    cases, _ = P.read_case_list(without)
+    assert cases[0]["end_date"] == ""
+
+
+def test_a_pipeline_case_gets_its_timing_in_the_message_its_answer_checked_and_a_workbook_row(env2):
+    WB = sys.modules.get("shared.review_workbook") or __import__("shared.review_workbook", fromlist=["x"])
+    env = env2
+    w = FeedWorld(env, 1)
+    iid, acc = w.specs[0]
+    plan_row(w.paths, iid, "12/10/2026 02:17 PM")
+    w.feed = S.PipelineFeed(w.paths.run, types.SimpleNamespace(cfg=env.cfg, policy=env.policy, red=env.red, rt=env.rt,
+                                                                log=env.log), S.local_salt(env.rt))
+    fake_download(w.paths, iid, acc)
+    P.write_json(w.paths.snapshot(acc), {"Account Summary": {"metadata": {"requestedAccount": acc,
+                                                                          "retrievedUtc": "2026-10-14T12:23:38.123456+00:00"}}})
+    w.control.finished("part1")
+    w.hand.step()
+    good = T.answer_obj("Incorrect", end="12/10/2026 02:17 PM", snap="2026-10-14T12:23:38+00:00")
+    wrong_end = {**good, "CASE_END_DATETIME": "Not provided"}
+    env.world.behaviors = [{"answers": ["Working\n- compared\n" + json.dumps(wrong_end), json.dumps(good)]}]
+    r = w.runner()
+    r.workbook = WB.ReviewWorkbook(env.base / "reports")
+    results = T.run(r.run(collections.deque(w.feed.poll())))
+    message = env.world.sends[0][2]
+    assert "{{" not in message and "12/10/2026 02:17 PM" in message and "2026-10-14T12:23:38+00:00" in message
+    assert "Case completed within the last 3 business days" in message and " 2:" in message      # Mon -> Wed = 2
+    (state, note), = results.values()
+    assert state == "result_incorrect" and "Potential processor error" in note and "CHECK" not in note
+    tab = list(env.world.tabs.values())[0]
+    assert len(tab.followups) == 1 and "must be copied" in tab.followups[0]     # the wrong copy was sent back once
+    saved = json.loads((env.rt.results / f"{iid}.json").read_text("utf-8"))
+    assert list(saved["result"]) == list(S.RESULT_KEYS)
+    book = env.base / "reports" / WB.NAME
+    import zipfile
+    with zipfile.ZipFile(book) as z:
+        sheet = z.read("xl/worksheets/sheet1.xml").decode("utf-8")
+    assert iid in sheet and "No match" in sheet and "Case completed within the last 3 business days" in sheet
+    assert r.workbook.close() == book
+
+
+def test_a_case_without_an_end_date_is_sent_with_not_provided_and_flagged(env2):
+    env = env2
+    w = FeedWorld(env, 1)
+    w.finish_case(0)
+    w.control.finished("part1")
+    w.hand.step()
+    r = w.runner()
+    results = T.run(r.run(collections.deque(w.feed.poll())))
+    (state, note), = results.values()
+    assert state == "result_correct" and "CHECK: no End Date in the CSV" in note
+    assert env.world.sends[0][2].count("Not provided") == 4

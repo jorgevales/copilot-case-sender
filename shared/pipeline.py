@@ -142,7 +142,8 @@ def read_case_list(path) -> tuple[list, list]:
     """The daily CSV -> (cases to review, skipped rows).
 
     Columns (header spelling is loose): instruction id (also the 'instrcution id' spelling), Client Account Number,
-    Client Number, Process Status, Sub Worktype.  Only Process Status 'Ended' is reviewed; every other row is returned
+    Client Number, Process Status, Sub Worktype, and (optional, last) End Date - the case end in UK time, as text or
+    as an Excel serial number (shared/timing.py).  Only Process Status 'Ended' is reviewed; every other row is returned
     in `skipped` with the reason, so it can be shown clearly - nothing is dropped silently."""
     path = Path(path)
     if not path.is_file():
@@ -157,7 +158,7 @@ def read_case_list(path) -> tuple[list, list]:
         heads = {_norm_head(h): h for h in reader.fieldnames or [] if h}
         col = {"iid": heads.get("instrcutionid") or heads.get("instructionid"),
                "account": heads.get("clientaccountnumber"), "client": heads.get("clientnumber"),
-               "status": heads.get("processstatus"), "sub": heads.get("subworktype")}
+               "status": heads.get("processstatus"), "sub": heads.get("subworktype"), "end": heads.get("enddate")}
         missing = [name for key, name in (("iid", "instruction id"), ("account", "Client Account Number"),
                                           ("status", "Process Status"), ("sub", "Sub Worktype")) if not col[key]]
         if missing:
@@ -167,6 +168,7 @@ def read_case_list(path) -> tuple[list, list]:
             get = lambda key: " ".join(str(row.get(col[key]) or "").split()) if col[key] else ""
             item = {"row_number": n, "iid": get("iid").lower(), "account": norm_account(get("account")),
                     "client_number": get("client"), "status": get("status"), "sub_worktype_csv": get("sub"),
+                    "end_date": get("end"),
                     "row": {" ".join(str(k).split()): " ".join(str(v or "").split()) for k, v in row.items() if k}}
             if not any(item["row"].values()):
                 continue                                    # an empty line

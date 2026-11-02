@@ -22,6 +22,11 @@ from shared import pipeline as P
 
 # ---------------------------------------------------------------------------------------------- the plan
 
+def _special(contract) -> list:
+    """Files in the guidance folder that are never a Sub Worktype's instructions (contract, daily instructions)."""
+    return [p for p in (contract if isinstance(contract, (list, tuple)) else [contract]) if p]
+
+
 def build_plan(cases: list, skipped: list, paths: P.Paths, sent: set, guidance_dir, contract) -> dict:
     """What each CSV row needs this run: 'download' (Parts 1 + 2, then sent), 'send' (complete from an earlier run),
     'done' (sent in an earlier run) or 'held' (cannot be done safely - with the reason)."""
@@ -46,7 +51,7 @@ def build_plan(cases: list, skipped: list, paths: P.Paths, sent: set, guidance_d
         out.append(item)
     downloads = [c for c in out if c["needs"] == "download"]
     no_guidance = sorted({c["sub_worktype_csv"] for c in downloads
-                          if not P.guidance_for(c["sub_worktype_csv"], guidance_dir, exclude=[contract])})
+                          if not P.guidance_for(c["sub_worktype_csv"], guidance_dir, exclude=_special(contract))})
     return {"run": paths.run.name, "day": P.today(), "created": P.now(), "cases": out, "skipped": skipped,
             "parts": {"part1": bool(downloads), "part2": bool(downloads)}, "no_guidance": no_guidance}
 
@@ -94,7 +99,7 @@ class Handover:
                 if p1_over:
                     self._hold(iid, "System 1 documents were not downloaded (Part 1 ended before this case)")
                 continue
-            guidance = P.guidance_for(m["sub_worktype"], self.guidance_dir, exclude=[self.contract])
+            guidance = P.guidance_for(m["sub_worktype"], self.guidance_dir, exclude=_special(self.contract))
             if guidance is None:
                 self._hold(iid, f"no instructions file for Sub Worktype '{m['sub_worktype']}' in the guidance folder")
                 continue
