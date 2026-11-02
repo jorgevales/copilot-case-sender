@@ -1137,7 +1137,7 @@ def inventory(case: Case, cfg, policy: PathPolicy) -> None:
         elif st.st_size > limit:
             odd[f"larger than {cfg.max_file_mb} MB"] += 1
         elif _looks_protected(head, tail, ext):
-            odd["password-protected or not a valid Office file"] += 1
+            odd[f"password-protected or not a valid Office file ({rel})"] += 1
         case.docs.append(types.SimpleNamespace(rel=rel, path=path, size=st.st_size, mtime=st.st_mtime_ns, name=path.name))
     case.problems = [f"{n} x {why}" for why, n in sorted(odd.items())]
     if not case.docs and not case.problems:
@@ -3207,9 +3207,10 @@ def judge_upload(snap: dict, expected: list) -> dict:
 
 # --- the answer contract (result_contract.md): the WHOLE reply is ONE line of JSON written as plain text, nothing around
 # it.  Only the reply's last line is read.  Keys in any order are accepted (and put in order for the files).
-RESULT_KEYS = ("COPILOT_RESULT", "DISCREPANCY_TYPE", "CASE_END_DATETIME", "REGISTER_SNAPSHOT_DATETIME", "CLIENT_REQUEST",
-               "JUSTIFICATION", "A_B_COMPARISONS", "RULE_CHECKS")
-ROW_KEYS = ("ITEM", "Customer_expectation", "CUSTOMER_SOURCE", "System_data", "SYSTEM_SOURCE", "MATCH")
+RESULT_KEYS = ("COPILOT_RESULT", "DISCREPANCY_TYPE", "HEADLINE", "CASE_END_DATETIME", "REGISTER_SNAPSHOT_DATETIME",
+               "CLIENT_REQUEST", "JUSTIFICATION", "A_B_COMPARISONS", "RULE_CHECKS")
+ROW_KEYS = ("ITEM", "Customer_expectation", "CUSTOMER_SOURCE", "System_data", "SYSTEM_SOURCE", "MATCH", "EXPLANATION")
+ROW_TEXT = tuple(k for k in ROW_KEYS if k != "MATCH")
 RULE_KEYS = ("RULE", "STATUS", "EVIDENCE", "NOTE")
 RESULT_WORDS = ("Correct", "Incorrect", "Inconclusive")
 DISCREPANCY_WORDS = ("None", TM.PROCESSOR_ERROR, TM.AGED_CASE)
@@ -3224,12 +3225,14 @@ FIXUP_TEXT = ("Your previous answer was rejected by the program that reads it (a
 # message).  VDI runs 2026-11-02: first answers used another key set; then every answer failed the 'Working' + last-line
 # layout - so the reply is now the JSON line alone.
 ANSWER_TEMPLATE = ('{"COPILOT_RESULT":"<Correct or Incorrect or Inconclusive>","DISCREPANCY_TYPE":"<None or Potential '
-                   'processor error or Discrepancy from aged case>","CASE_END_DATETIME":"' + TM.PLACEHOLDERS[0] + '",'
+                   'processor error or Discrepancy from aged case>","HEADLINE":"<the outcome in at most 20 words>",'
+                   '"CASE_END_DATETIME":"' + TM.PLACEHOLDERS[0] + '",'
                    '"REGISTER_SNAPSHOT_DATETIME":"' + TM.PLACEHOLDERS[1] + '","CLIENT_REQUEST":"<one sentence: the request, '
                    'its source and provenance label>","JUSTIFICATION":"<your argument for the result>","A_B_COMPARISONS":'
                    '[{"ITEM":"<what is compared>","Customer_expectation":"<value the request requires>","CUSTOMER_SOURCE":'
                    '"<document or Audit Trail entry and date; provenance: label>","System_data":"<Register value>",'
-                   '"SYSTEM_SOURCE":"<Account Summary > section > field>","MATCH":true}],"RULE_CHECKS":[{"RULE":"<check '
+                   '"SYSTEM_SOURCE":"<Account Summary > section > field>","MATCH":false,"EXPLANATION":"<this field only: what '
+                   'differs or why it cannot be compared>"}],"RULE_CHECKS":[{"RULE":"<check '
                    'name from the rules file>","STATUS":"<Satisfied or Not satisfied or Not determinable or Not applicable>",'
                    '"EVIDENCE":"<source and provenance label>","NOTE":"<short note>"}]}')
 CONTRACT_REMINDER = ("ANSWER FORMAT - this overrides any other answer format, template or JSON keys in the attached files or "
@@ -3237,7 +3240,8 @@ CONTRACT_REMINDER = ("ANSWER FORMAT - this overrides any other answer format, te
                      "and end with }. Nothing before it (no Working section, no heading, no explanation) and nothing after "
                      "it (no notes, sources or suggestions); no code block, no backticks, no markdown, no line breaks. "
                      "Exactly the keys " + ", ".join(RESULT_KEYS) + " in this order; each A_B_COMPARISONS row with exactly "
-                     + ", ".join(ROW_KEYS) + " (MATCH true, false or null without quotes); each RULE_CHECKS row with exactly "
+                     + ", ".join(ROW_KEYS) + " (MATCH true, false or null without quotes; one row per field compared, "
+                     "each with its OWN EXPLANATION); each RULE_CHECKS row with exactly "
                      + ", ".join(RULE_KEYS) + ". Follow the steps of the attached result contract. Your reply must have "
                      "exactly this shape - replace every <...> with your own findings (one row per comparison and per "
                      "rule check) and keep the two date/time values exactly as they are:\n\n" + ANSWER_TEMPLATE)
@@ -3271,7 +3275,7 @@ def validate_result(obj: dict, expect: dict | None = None) -> list:
         problems.append("COPILOT_RESULT must be exactly Correct, Incorrect or Inconclusive")
     if kind not in DISCREPANCY_WORDS:
         problems.append("DISCREPANCY_TYPE must be exactly " + ", ".join(DISCREPANCY_WORDS))
-    for k in ("CASE_END_DATETIME", "REGISTER_SNAPSHOT_DATETIME", "CLIENT_REQUEST", "JUSTIFICATION"):
+    for k in ("HEADLINE", "CASE_END_DATETIME", "REGISTER_SNAPSHOT_DATETIME", "CLIENT_REQUEST", "JUSTIFICATION"):
         if not (isinstance(obj.get(k), str) and obj[k].strip()):
             problems.append(f"{k} must be non-empty text")
     rows, rules = obj.get("A_B_COMPARISONS"), obj.get("RULE_CHECKS")
@@ -3287,7 +3291,7 @@ def validate_result(obj: dict, expect: dict | None = None) -> list:
             continue
         if row["MATCH"] is not None and not isinstance(row["MATCH"], bool):
             problems.append(f"comparison row {i}: MATCH must be true, false or null")
-        problems += [f"comparison row {i}: {k} must be non-empty text" for k in ROW_KEYS[:-1] if not _filled(row[k])]
+        problems += [f"comparison row {i}: {k} must be non-empty text" for k in ROW_TEXT if not _filled(row[k])]
     for i, row in enumerate(rules, 1):
         if not isinstance(row, dict) or set(row) != set(RULE_KEYS):
             problems.append(f"RULE_CHECKS row {i} must have exactly " + ", ".join(RULE_KEYS))
@@ -4952,7 +4956,8 @@ def write_run_report(ctx, journal, cases, runner, bfacts, started, start_seq, co
         out = [f"# Run report - {datetime.datetime.now():%Y-%m-%d %H:%M:%S} (local) - exit code {code}", "", reviewer_note(), "",
                "## 0. How to read this report", REPORT_GUIDE,
                "## 1. Outcome", f"- command line: {red(' '.join(argv))}",
-               f"- duration: {time.monotonic() - started:.1f}s | exit code: {code} ({'ok' if code == 0 else 'see errors'}) | cases that reached Copilot: {len(cases)}",
+               f"- duration: {time.monotonic() - started:.1f}s | exit code: {code} ({'ok' if code == 0 else 'see errors'}) | cases handed to the sender: {len(cases)} | sent to Copilot: "
+               f"{sum(1 for c in cases if journal.cases.get(c.key, {}).get('state') in TERMINAL_SENT)}",
                f"- results by state: {dict(counts)}",
                f"- stopped by user: {runner.stop.is_set if runner else 'n/a'} | browser reconnects: {max(0, (bfacts or {}).get('connection_generation', 1) - 1)}",
                f"- uncaught error: {'none' if crash is None else type(crash).__name__ + ': ' + red(str(crash)[:500])}",

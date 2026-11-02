@@ -23,11 +23,11 @@ Put all your reasoning inside the `JUSTIFICATION` value. There is no other place
 
 Write the keys in exactly this order, spelled exactly like this, and no other keys:
 
-`{"COPILOT_RESULT":"…","DISCREPANCY_TYPE":"…","CASE_END_DATETIME":"…","REGISTER_SNAPSHOT_DATETIME":"…","CLIENT_REQUEST":"…","JUSTIFICATION":"…","A_B_COMPARISONS":[{"ITEM":"…","Customer_expectation":"…","CUSTOMER_SOURCE":"…","System_data":"…","SYSTEM_SOURCE":"…","MATCH":true}],"RULE_CHECKS":[{"RULE":"…","STATUS":"…","EVIDENCE":"…","NOTE":"…"}]}`
+`{"COPILOT_RESULT":"…","DISCREPANCY_TYPE":"…","HEADLINE":"…","CASE_END_DATETIME":"…","REGISTER_SNAPSHOT_DATETIME":"…","CLIENT_REQUEST":"…","JUSTIFICATION":"…","A_B_COMPARISONS":[{"ITEM":"…","Customer_expectation":"…","CUSTOMER_SOURCE":"…","System_data":"…","SYSTEM_SOURCE":"…","MATCH":false,"EXPLANATION":"…"}],"RULE_CHECKS":[{"RULE":"…","STATUS":"…","EVIDENCE":"…","NOTE":"…"}]}`
 
 A complete example with made-up values (your values come from your own review):
 
-{"COPILOT_RESULT":"Incorrect","DISCREPANCY_TYPE":"Potential processor error","CASE_END_DATETIME":"12/10/2026 02:17 PM","REGISTER_SNAPSHOT_DATETIME":"2026-10-14T12:23:38+00:00","CLIENT_REQUEST":"Add Person A as a signatory on the account (signed client form added 10/10/2026; provenance: Client-supplied).","JUSTIFICATION":"Potential processor error: the client form requests Person A as signatory but Register does not show Person A ticked as Signatory. All required rule checks were satisfied.","A_B_COMPARISONS":[{"ITEM":"Person A - Signatory flag","Customer_expectation":"Ticked","CUSTOMER_SOURCE":"Signed client form added 10/10/2026; provenance: Client-supplied","System_data":"Unticked","SYSTEM_SOURCE":"Account Summary > Interested Parties > Person A > Signatory","MATCH":false}],"RULE_CHECKS":[{"RULE":"Instruction signed by the required signatories","STATUS":"Satisfied","EVIDENCE":"Signed client form added 10/10/2026; provenance: Client-supplied","NOTE":"Required signatures present"}]}
+{"COPILOT_RESULT":"Incorrect","DISCREPANCY_TYPE":"Potential processor error","HEADLINE":"Person A was not set as a signatory on Register.","CASE_END_DATETIME":"12/10/2026 02:17 PM","REGISTER_SNAPSHOT_DATETIME":"2026-10-14T12:23:38+00:00","CLIENT_REQUEST":"Add Person A as a signatory on the account (signed client form added 10/10/2026; provenance: Client-supplied).","JUSTIFICATION":"Potential processor error: the client form requests Person A as signatory but Register does not show Person A ticked as Signatory. All required rule checks were satisfied.","A_B_COMPARISONS":[{"ITEM":"Person A - Signatory flag","Customer_expectation":"Ticked","CUSTOMER_SOURCE":"Signed client form added 10/10/2026; provenance: Client-supplied","System_data":"Unticked","SYSTEM_SOURCE":"Account Summary > Interested Parties > Person A > Signatory","MATCH":false,"EXPLANATION":"The signed client form asks for Person A to be a signatory, but Register shows the Signatory box for Person A unticked."},{"ITEM":"Person A - Surname","Customer_expectation":"Smith","CUSTOMER_SOURCE":"Signed client form added 10/10/2026; provenance: Client-supplied","System_data":"Smith","SYSTEM_SOURCE":"Account Summary > Interested Parties > Person A > Surname","MATCH":true,"EXPLANATION":"Same value."}],"RULE_CHECKS":[{"RULE":"Instruction signed by the required signatories","STATUS":"Satisfied","EVIDENCE":"Signed client form added 10/10/2026; provenance: Client-supplied","NOTE":"Required signatures present"}]}
 
 The message you received ends with the same template, with this case's own date/time values already in place.
 
@@ -35,7 +35,7 @@ The message you received ends with the same template, with this case's own date/
 
 ## 3. How to fill each key (follow these steps in order)
 
-**Step 1 - `A_B_COMPARISONS`** (a list with **at least one** row, always). One row per point of the client's request compared with Register. Each row has exactly these six keys, in this order:
+**Step 1 - `A_B_COMPARISONS`** (a list with **at least one** row, always). **One row per field** of the client's request compared with Register: if the request covers 22 fields, write 22 rows. Never put two fields in one row. Each row has exactly these seven keys, in this order:
 
 | Key | What to write |
 |---|---|
@@ -45,6 +45,9 @@ The message you received ends with the same template, with this case's own date/
 | `System_data` | The Register value, or exactly one of: `Blank on Register`, `Not available in Register snapshot`, `Not captured`, `Not retrieved`. |
 | `SYSTEM_SOURCE` | The Register JSON location, parts joined with ` > `. Example: `Account Summary > Interested Parties > Person A > Signatory`. |
 | `MATCH` | `true` (they match), `false` (they do not match) or `null` (they cannot be compared). Written with **no quotes**. |
+| `EXPLANATION` | **About this field only.** `MATCH` `false`: what exactly differs (the client's value versus the Register value) and what a reviewer should check. `MATCH` `null`: why this field cannot be compared. `MATCH` `true`: a few words, e.g. `Same value.` Do not repeat the field name at the start: the program shows it as `{ITEM}: {EXPLANATION}`. |
+
+**A value missing from the snapshot is never a mismatch.** If the Register JSON does not contain the field, or its section says `Not available in Register snapshot`, write `System_data` `Not available in Register snapshot` and `MATCH` `null`. Use `Blank on Register` (a real, comparable value) only when the field is present and empty, or its section says `Blank on Register`.
 
 If nothing could be compared at all, still write one row showing what you tried, with `MATCH` `null`.
 
@@ -83,9 +86,11 @@ Never calculate business days yourself.
 
 **Step 5 - `CASE_END_DATETIME` and `REGISTER_SNAPSHOT_DATETIME`.** Copy them **character for character** from the message ("Case end date/time" and "Register snapshot date/time"). If the message shows `Not provided`, write `Not provided`. Do not reformat, convert or shorten them.
 
-**Step 6 - `CLIENT_REQUEST`.** One sentence: the client's request as established, with its source and provenance label. If it cannot be established, write `Not established from case evidence` followed by the reason.
+**Step 6 - `HEADLINE`.** The outcome in at most 20 words, e.g. `2 of 22 fields differ on Register: signatory and postcode.` or `All 22 requested fields match Register.`
 
-**Step 7 - `JUSTIFICATION`.** Your argument for the result: what you compared, what you checked, and what is missing or uncertain. Its **first words** depend on `DISCREPANCY_TYPE`:
+**Step 7 - `CLIENT_REQUEST`.** One sentence: the client's request as established, with its source and provenance label. If it cannot be established, write `Not established from case evidence` followed by the reason.
+
+**Step 8 - `JUSTIFICATION`.** Your argument for the result: what you compared, what you checked, and what is missing or uncertain. Its **first words** depend on `DISCREPANCY_TYPE`:
 
 | `DISCREPANCY_TYPE` | `JUSTIFICATION` must start with | and must also contain |
 |---|---|---|
@@ -112,10 +117,10 @@ If the case age was not provided, say so in `JUSTIFICATION`. When a `MATCH` is `
 ## 5. Final check before you send
 
 1. My reply is one single line, starts with `{"COPILOT_RESULT":"` and ends with `}`, with nothing before or after it and no code block.
-2. It has exactly these eight keys in this order: `COPILOT_RESULT`, `DISCREPANCY_TYPE`, `CASE_END_DATETIME`, `REGISTER_SNAPSHOT_DATETIME`, `CLIENT_REQUEST`, `JUSTIFICATION`, `A_B_COMPARISONS`, `RULE_CHECKS`.
-3. `A_B_COMPARISONS` has at least one row; every row has the six keys; every `MATCH` is `true`, `false` or `null` without quotes.
+2. It has exactly these nine keys in this order: `COPILOT_RESULT`, `DISCREPANCY_TYPE`, `HEADLINE`, `CASE_END_DATETIME`, `REGISTER_SNAPSHOT_DATETIME`, `CLIENT_REQUEST`, `JUSTIFICATION`, `A_B_COMPARISONS`, `RULE_CHECKS`.
+3. `A_B_COMPARISONS` has one row per field compared (at least one); every row has the seven keys; every `MATCH` is `true`, `false` or `null` without quotes; every row has its own `EXPLANATION`.
 4. `RULE_CHECKS` has one row per required check, each with the four keys and a non-empty `NOTE`.
-5. `COPILOT_RESULT` follows Step 3, `DISCREPANCY_TYPE` follows Step 4, and `JUSTIFICATION` starts as Step 7 requires.
+5. `COPILOT_RESULT` follows Step 3, `DISCREPANCY_TYPE` follows Step 4, and `JUSTIFICATION` starts as Step 8 requires.
 6. `CASE_END_DATETIME` and `REGISTER_SNAPSHOT_DATETIME` are copied exactly from the message.
 7. No double quotes inside text values, no line breaks, no empty values.
 

@@ -1152,7 +1152,7 @@ def test_a_pipeline_case_gets_its_timing_in_the_message_its_answer_checked_and_a
     book = env.base / "reports" / WB.NAME
     import zipfile
     with zipfile.ZipFile(book) as z:
-        sheet = z.read("xl/worksheets/sheet1.xml").decode("utf-8")
+        sheet = z.read("xl/worksheets/sheet2.xml").decode("utf-8")
     assert iid in sheet and "No match" in sheet and "Case completed within the last 3 business days" in sheet
     assert r.workbook.close() == book
 

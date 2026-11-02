@@ -211,9 +211,10 @@ def ctl(c):
     t=clean(c.get("type")).lower()
     if t in {"checkbox","radio"}:return c.has_attr("checked")
     return "" if t in {"hidden","password","file"} else clean(c.get("value"))
+MISSING_SECTION="Not available in Register snapshot (this section was not found on the page)"
 def fields(sec):
     out={}
-    if not sec:return out
+    if not sec:return {"captureStatus":MISSING_SECTION}  # never an empty {} that reads like blank values
     for g in sec.select(".form-group,.control-group"):
         l=g.select_one("label.control-label") or g.find("label")
         if l:
@@ -222,12 +223,14 @@ def fields(sec):
     return out
 def named_table(rt,name):
     sec=section(rt,name);t=sec.find("table") if sec else None
-    if not t:return {"columns":[],"rows":[]}
+    if not sec:return {"captureStatus":MISSING_SECTION,"columns":[],"rows":[]}
+    if not t:return {"captureStatus":"Not available in Register snapshot (the section has no table)","columns":[],"rows":[]}
     x=parse_table(t);rows=[]
     for row in x.get("rows",[]):
         row.pop("Action",None);row.pop("Edit",None)
         if not any("click add new" in clean(v.get("value")).casefold() for v in row.values() if isinstance(v,dict)):rows.append(row)
-    return {"columns":[c for c in x.get("columns",[]) if c not in {"Action","Edit"}],"rows":rows}
+    status="Captured" if rows else "Blank on Register (the table is on the page and has no entries)"
+    return {"captureStatus":status,"columns":[c for c in x.get("columns",[]) if c not in {"Action","Edit"}],"rows":rows}
 def fetch_party(d):
     r,s=soup_get(d["url"]);rt=root(s)
     return {"interestedPartyId":d.get("interestedPartyId",""),"nameFromAccount":d.get("nameFromAccount",""),"metadata":{"sourceUrl":r.url,"httpStatus":r.status_code,"retrievedUtc":datetime.now(timezone.utc).isoformat(),"pageTitle":clean(s.title.get_text()) if s.title else ""},"Personal Details":fields(section(rt,"Personal Details")),"Emails":named_table(rt,"Email"),"Phone numbers":named_table(rt,"Phone numbers"),"Addresses":named_table(rt,"Address"),"Security checks":{"AML":fields(section(rt,"AML")),"PEP":fields(section(rt,"PEP")),"Financial Sanctions":fields(section(rt,"Financial Sanctions")),"Signature":"Signature present in the profile" if (section(rt,"Signature") and section(rt,"Signature").find("img",src=True)) else "No signature found in the profile"}}

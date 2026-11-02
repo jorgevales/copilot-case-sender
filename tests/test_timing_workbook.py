@@ -116,10 +116,12 @@ def test_expected_discrepancy_follows_the_age_then_the_gap():
 
 def comparison(item, match, **over):
     return {"ITEM": item, "Customer_expectation": "Ticked", "CUSTOMER_SOURCE": "form", "System_data": "Unticked",
-            "SYSTEM_SOURCE": "Account Summary > Signatory", "MATCH": match, **over}
+            "SYSTEM_SOURCE": "Account Summary > Signatory", "MATCH": match,
+            "EXPLANATION": f"{item} explained", **over}
 
 
-RESULT = {"COPILOT_RESULT": "Incorrect", "DISCREPANCY_TYPE": "Potential processor error", "CASE_END_DATETIME": "12/10/2026",
+RESULT = {"COPILOT_RESULT": "Incorrect", "DISCREPANCY_TYPE": "Potential processor error", "HEADLINE": "Signatory not set",
+          "CASE_END_DATETIME": "12/10/2026",
           "REGISTER_SNAPSHOT_DATETIME": "2026-10-14T12:23:38+00:00", "CLIENT_REQUEST": "Add <Person A> & co",
           "JUSTIFICATION": "Potential processor error: x",
           "A_B_COMPARISONS": [comparison("Signatory", False), comparison("Name", True), comparison("DOB", None)],
@@ -130,33 +132,46 @@ INFO = {"iid": "a" * 32, "account": "AB100000", "sub_worktype": "Change of Addre
         "age": T.WITHIN}
 
 
-def test_case_rows_put_comparisons_then_rule_checks_with_the_case_repeated():
-    rows = W.case_rows(INFO, RESULT, "Working\nline")
-    assert [o for _, o in rows] == ["No match", "Match", "Could not compare", "Satisfied", "Not determinable", "Not applicable"]
-    col = {h: i for i, h in enumerate(W.HEADERS)}
-    first, rule = rows[0][0], rows[3][0]
-    assert len(first) == len(W.HEADERS) and all(r[0][col["Instruction ID"]] == "a" * 32 for r in rows)
-    assert first[col["Type"]] == "Comparison" and first[col["Register value"]] == "Unticked" and first[col["Evidence"]] == ""
-    assert rule[col["Type"]] == "Rule check" and rule[col["What was checked"]] == "Signed" and rule[col["Customer source"]] == ""
-    assert first[col["Business days gap"]] == "2" and first[col["Working section"]] == "Working\nline"
-    assert first[col["Needs attention"]] == ("No match: Signatory (expected: Ticked; Register: Unticked)\n"
-                                             "Could not compare: DOB\nNot determinable: Witness")
-    assert all(v == "" for v in first[-len(W.REVIEWER_COLUMNS):])
-    clean = {**RESULT, "A_B_COMPARISONS": [comparison("Name", True)], "RULE_CHECKS": []}
-    assert W.needs_attention(clean) == "Nothing flagged"
-    assert "Status" not in W.HEADERS                                    # every reviewed case is 'Ended'
+def cells(sheet):
+    return [[text for text, _ in row] for row in sheet.rows]
+
+
+def test_each_wrong_field_gets_its_own_explanation_and_one_row_per_case():
+    summary, cases, issues, checks = W.build([(INFO, RESULT), ({**INFO, "iid": "b" * 32}, {**RESULT, "COPILOT_RESULT": "Correct",
+                                              "A_B_COMPARISONS": [comparison("Name", True)], "RULE_CHECKS": []})])
+    c, i, a = cells(cases), cells(issues), cells(checks)
+    assert [s.name for s in (summary, cases, issues, checks)] == list(W.SHEETS)
+    assert len(c) == 3 and c[0] == W.CASE_HEAD                                    # ONE row per case
+    col = {h: n for n, h in enumerate(W.CASE_HEAD)}
+    assert c[1][col["Headline"]] == "Signatory not set" and c[1][col["Issues"]] == "3"
+    assert c[1][col["Issue details (one per field)"]] == ("1. [No match] Signatory: Signatory explained\n\n"
+                                                          "2. [Could not compare] DOB: DOB explained\n\n"
+                                                          "3. [Not determinable] Witness: no page")
+    assert c[2][col["Issue details (one per field)"]] == "No issues"
+    assert [r[6] for r in i[1:]] == ["Signatory: Signatory explained", "DOB: DOB explained", "Witness: no page"]
+    assert [r[4] for r in i[1:]] == ["No match", "Could not compare", "Not determinable"]
+    assert issues.links[0] == ("A2", "'Cases'!A2") and len(issues.links) == 3
+    assert [r[10] for r in a[1:7]] == ["No match", "Match", "Could not compare", "Satisfied", "Not determinable", "Not applicable"]
+    keys = [k for _, k in issues.rows[1]]
+    assert keys[0][1] == W.RED and keys[0][3] is True and issues.rows[2][0][1][3] is False   # thick line above a new case
+    flat = [r for r in cells(summary) if r]
+    assert ["Incorrect", "1"] in flat and ["No match", "1"] in flat and ["Not available in Register snapshot", "0"] in flat
 
 
 def test_the_xlsx_is_a_valid_package_with_escaped_text_and_no_control_characters():
-    data = W.xlsx_bytes(W.case_rows(INFO, {**RESULT, "JUSTIFICATION": "bad\x01char\x0b"}, ""))
+    data = W.xlsx_bytes([(INFO, {**RESULT, "JUSTIFICATION": "bad\x01char\x0b"})])
     import io
     with zipfile.ZipFile(io.BytesIO(data)) as z:
-        assert sorted(z.namelist()) == sorted(["[Content_Types].xml", "_rels/.rels", "xl/workbook.xml",
-                                               "xl/_rels/workbook.xml.rels", "xl/styles.xml", "xl/worksheets/sheet1.xml"])
-        sheet = z.read("xl/worksheets/sheet1.xml").decode("utf-8")
+        names = sorted(z.namelist())
+        assert names == sorted(["[Content_Types].xml", "_rels/.rels", "xl/workbook.xml", "xl/_rels/workbook.xml.rels",
+                                "xl/styles.xml"] + [f"xl/worksheets/sheet{n}.xml" for n in range(1, 5)])
+        sheet = z.read("xl/worksheets/sheet2.xml").decode("utf-8")
+        book = z.read("xl/workbook.xml").decode("utf-8")
+        assert "<hyperlinks>" in z.read("xl/worksheets/sheet3.xml").decode("utf-8")
     assert "Add &lt;Person A&gt; &amp; co" in sheet and "badchar" in sheet and "\x01" not in sheet and "\x0b" not in sheet
-    assert '<autoFilter ref="A1:' in sheet and 'state="frozen"' in sheet and '"Y,N"' in sheet
-    assert W.column_letter(1) == "A" and W.column_letter(27) == "AA" and W.column_letter(len(W.HEADERS)) == "AA"
+    assert '<autoFilter ref="A1:' in sheet and 'state="frozen"' in sheet and '"Y,N"' in sheet and "tabSelected" in sheet
+    assert all(f'name="{n}"' in book for n in W.SHEETS)
+    assert W.column_letter(1) == "A" and W.column_letter(27) == "AA"
 
 
 def test_an_older_workbook_is_set_aside_and_an_open_one_is_waited_for(folder, monkeypatch):
@@ -199,6 +214,6 @@ def test_the_workbook_is_written_after_every_answer_and_a_copy_is_made_when_it_s
     copy = book.close()
     assert copy.name.startswith("Copilot review results - ") and "older" not in copy.name and copy.exists()
     with zipfile.ZipFile(copy) as z:
-        sheet = z.read("xl/worksheets/sheet1.xml").decode("utf-8")
+        sheet = z.read("xl/worksheets/sheet2.xml").decode("utf-8")
     assert "a" * 32 in sheet and "b" * 32 in sheet                      # the copy has every answer
     assert not any(p.name.startswith(".") for p in folder.iterdir())   # no temp file left behind

@@ -260,7 +260,7 @@ prompt, file bulk-assignment, and **pipelining** of the next case's inventory. S
 order (3 fixed files, so up to 17 case documents under the 20 limit). Your own copies live on S: and are **never** kept in
 the repository.
 
-**The answer** is the **whole reply as ONE line of JSON written as plain text** - nothing before it (no `Working`
+**The answer** (9 keys incl. `HEADLINE`; every comparison row has its own `EXPLANATION`, shown as `{field}: {discrepancy}` in the workbook) is the **whole reply as ONE line of JSON written as plain text** - nothing before it (no `Working`
 section, no heading) and nothing after it, no code box (contract 2026-11-02, made stricter after a VDI run where every
 answer failed). The message ends with `CONTRACT_REMINDER` and a template line (`ANSWER_TEMPLATE`) with this case's own
 date/time values already in place. A fix-up asks for the corrected line only, fixing exactly the problems it lists.
@@ -344,15 +344,18 @@ there is no CSV: the case end, gap and age are `Not provided` without a flag. *L
 
 `RUNTIME_ROOT\reports\Copilot review results.xlsx` holds **this run's valid Copilot answers** and is rewritten after
 every answer (`shared/review_workbook.py`, written with Python's standard library: nothing to install).
-* **One row per comparison and per rule check**; the case's own values are repeated on each of its rows so Excel's filter
-  and sort work. Columns: Instruction ID, Client Account Number, Sub Worktype, Copilot result, Discrepancy type, Needs
-  attention (the case's red and yellow items), Client request, Justification, then the row's Type (Comparison / Rule
-  check), What was checked, Customer expectation, Customer source, Register value, Register source, Outcome, Evidence,
-  Note, then Case end date/time, Register snapshot date/time, Business days gap, Case age statement, Client Number,
-  Working section (empty now that the reply is the JSON line alone), and empty reviewer columns: Reviewer agrees (Y/N list),
-  Reviewer correction, Reviewer notes, Reviewer corrected result (Correct / Incorrect / Inconclusive list).
-* **Colours** (whole row): red = no match / Not satisfied, yellow = could not compare / Not determinable, green = match /
-  Satisfied, grey = Not applicable. Header row and ID column frozen, a filter on every column.
+* **Four tabs** (it opens on Cases):
+  - **Summary** - totals by result, discrepancy type, Sub Worktype, issue type, and how often the Register value of a
+    non-matching field was `Not available in Register snapshot` / `Blank on Register` / a real value.
+  - **Cases** - ONE row per case: ID, account, Sub Worktype, Copilot result (coloured), discrepancy type, Headline,
+    number of issues, **Issue details** (every wrong / not-comparable field and failed / undeterminable rule as its own
+    numbered paragraph `1. [No match] {field}: {discrepancy}`, a blank line between them), client request,
+    justification, counts, timing, Client Number and reviewer columns (Y/N and result lists).
+  - **Issues** - one row per red / yellow item (the reviewers' to-do list): `{field}: {discrepancy}`, both values and
+    both sources; the ID links back to the case's row in Cases; a thick line above each new case.
+  - **All checks** - every comparison and rule check with its explanation (audit).
+* **Colours**: red = no match / Not satisfied / Incorrect, yellow = could not compare / Not determinable /
+  Inconclusive, green = match / Satisfied / Correct, grey = Not applicable. Header rows frozen, filters on.
 * **Start of a run** (the coordinator, or the sender in `send-only`): an older workbook is renamed
   `Copilot review results - older <the time it was made>.xlsx`. If Excel has it open the run says so and waits for
   Enter, then tries again; nothing starts before that.

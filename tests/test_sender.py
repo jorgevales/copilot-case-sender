@@ -129,7 +129,8 @@ def env2():
 
 def row(match=True, **over):
     return {"ITEM": "limit", "Customer_expectation": "500", "CUSTOMER_SOURCE": "client form; provenance: Client-supplied",
-            "System_data": "500", "SYSTEM_SOURCE": "Account Summary > Limit", "MATCH": match, **over}
+            "System_data": "500", "SYSTEM_SOURCE": "Account Summary > Limit", "MATCH": match,
+            "EXPLANATION": "same value" if match else "the Register value differs from the form", **over}
 
 
 def rule(status="Satisfied", **over):
@@ -141,7 +142,8 @@ def answer_obj(verdict="Correct", rows=None, rules=None, kind=None, end="Not pro
     rows = rows if rows is not None else [row({"Correct": True, "Incorrect": False}.get(verdict))]
     rules = rules if rules is not None else [rule()]
     kind = kind or ("Potential processor error" if any(isinstance(r, dict) and r.get("MATCH") is False for r in rows) else "None")
-    return {"COPILOT_RESULT": verdict, "DISCREPANCY_TYPE": kind, "CASE_END_DATETIME": end, "REGISTER_SNAPSHOT_DATETIME": snap,
+    return {"COPILOT_RESULT": verdict, "DISCREPANCY_TYPE": kind, "HEADLINE": f"{verdict}: the limit was checked",
+            "CASE_END_DATETIME": end, "REGISTER_SNAPSHOT_DATETIME": snap,
             "CLIENT_REQUEST": "Raise the limit to 500 (client form; provenance: Client-supplied).",
             "JUSTIFICATION": (kind + ": because" if kind != "None" else "because"), "A_B_COMPARISONS": rows,
             "RULE_CHECKS": rules, **extra}
@@ -1634,8 +1636,8 @@ def test_a_valid_answer_goes_into_the_results_workbook(env2):
     results = run(r.run(collections.deque(found)))
     assert [v[0] for v in results.values()] == ["result_correct"] * 2
     assert r.workbook.close() == env2.runtime / "reports" / S.WB.NAME
-    sheet = zipfile.ZipFile(env2.runtime / "reports" / S.WB.NAME).read("xl/worksheets/sheet1.xml").decode("utf-8")
-    assert all(c.id in sheet for c in found) and "Raise the limit to 500" in sheet and "Satisfied" in sheet
+    sheet = zipfile.ZipFile(env2.runtime / "reports" / S.WB.NAME).read("xl/worksheets/sheet2.xml").decode("utf-8")
+    assert all(c.id in sheet for c in found) and "Raise the limit to 500" in sheet and "No issues" in sheet
     assert "key order fixed" not in results[found[0].key][1] and "no discrepancy; 1 comparison(s)" in results[found[0].key][1]
 
 
