@@ -18,6 +18,10 @@ earlier the same day is reused.
   you to sign in again in the systems Edge and press Enter, then it continues with fresh cookies.
 - **Any other failure**: the account is retried once, then reported in `status\part2-failed.json`. Its cases are
   held ("no System 2 snapshot"), never sent without one.
+- **For the report**: when an account (or the sign-in check) fails, the page System 2 answered with is kept in
+  `RUNTIME_ROOT\logs\captures\<run>\system2-<account>.txt/.html` (HTTP status, title, text; addresses cut before
+  `?`). `diagnostics\part2\accounts.json` in the run folder says per account: reused (with the file's time) / saved /
+  failed, and how many party pages could not be read.
 
 **Pages**: every System 2 address comes from the config, pasted once in setup. None is written in this code (the
 repository is public):

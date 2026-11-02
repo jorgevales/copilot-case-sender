@@ -773,7 +773,7 @@ MINIMAL_PHASES = {"queue", "start", "startup", "submitted", "submitted_partial",
                   "failed_exhausted", "WARNING", "at-limit", "attempt-failed", "deferred", "released", "paused",
                   "stopped", "login", "session", "model", "reconnect", "recovered", "dependencies", "fixup", "resubmit",
                   "result_correct", "result_incorrect", "result_inconclusive", "result_invalid", "response_timeout",
-                  "system1", "system2", "handover", "pipeline"}         # pipeline: Part 1 / Part 2 / hand-over progress
+                  "refused_chat_blocked", "system1", "system2", "handover", "pipeline"}         # pipeline: Part 1 / Part 2 / hand-over progress
 
 
 class Log:
@@ -800,7 +800,8 @@ class Log:
         shade = {"submitted": "42;97",            # white text on green: sent successfully
                  "submitted_partial": "43;30",    # black on yellow: sent, but some files were left out
                  "WARNING": "43;30", "result_correct": "42;97", "result_incorrect": "41;97",
-                 "result_inconclusive": "43;30", "result_invalid": "41;97", "response_timeout": "43;30"}.get(phase)
+                 "result_inconclusive": "43;30", "result_invalid": "41;97", "response_timeout": "43;30",
+                 "refused_chat_blocked": "41;97"}.get(phase)
         if shade and use_colour():
             text = f"\x1b[{shade}m {text} \x1b[0m"
         if self.detail == "full" or phase in MINIMAL_PHASES:
@@ -869,7 +870,8 @@ def register_redactions(red: Redactor, cfg, policy: PathPolicy | None) -> None:
 # 5. STATE: append-only journal + sent-instructions ledger
 # --------------------------------------------------------------------------------------------
 
-TERMINAL_SENT = ("submitted", "submission_uncertain", "fixup_sent", "result_valid", "result_invalid", "response_timeout")
+TERMINAL_SENT = ("submitted", "submission_uncertain", "fixup_sent", "result_valid", "result_invalid", "response_timeout",
+                 "refused_chat_blocked")
 
 
 class Journal:
@@ -2296,8 +2298,45 @@ ANSWER_JS = "([userSel, asstSel]) => {" + OUTER_JS + r"""
   const last = replies[replies.length - 1];     // ONLY the newest assistant reply of this conversation
   const blocks = last ? [...last.querySelectorAll('pre')].map(p => (p.querySelector('code') || p).textContent) : [];
   const stop = [...document.querySelectorAll('button')].some(b => /^stop/i.test((b.getAttribute('aria-label') || '').trim()));
-  return {users: users.length, replies: replies.length, text: last ? last.textContent : '', blocks, generating: stop};
+  return {users: users.length, replies: replies.length, text: last ? last.textContent : '', full: last ? last.innerText : '',
+          blocks, generating: stop};
 }"""
+# What the chat looks like around the newest reply, for the Copilot responses file (read only, nothing is clicked):
+# the buttons of the reply's own turn (Copy, Like, ..., Try again), notable buttons anywhere (New chat, Try again,
+# Regenerate), whether the message box is still there (a refusal can remove it), alerts, and the end of the page text.
+PAGE_STATE_JS = "([userSel, asstSel, editors]) => {" + OUTER_JS + r"""
+  const vis = e => !!(e && (e.offsetWidth || e.offsetHeight || e.getClientRects().length));
+  const norm = v => String(v || '').replace(/\s+/g, ' ').trim();
+  const name = b => norm(b.getAttribute('aria-label')) || norm(b.title) || norm(b.textContent);
+  const replies = outer([...document.querySelectorAll(asstSel)]), users = outer([...document.querySelectorAll(userSel)]);
+  const last = replies[replies.length - 1];
+  let turn = last && (last.closest('[data-testid="copilot-message-reply-div"],[data-testid="copilot-message-div"]') || last.parentElement);
+  for (let i = 0; turn && i < 4 && !turn.querySelector('button,[role=button]'); i++) turn = turn.parentElement;   // up to its buttons
+  const nav = b => !!b.closest('nav,aside,header,[role=navigation],[role=banner],[role=complementary]');
+  const list = els => els.filter(vis).map(b => ({name: name(b).slice(0, 80), disabled: !!(b.disabled || b.getAttribute('aria-disabled') === 'true'),
+      menu: b.getAttribute('aria-haspopup') || '', in_reply: !!(turn && turn.contains(b)), in_sidebar: nav(b)}));
+  const notable = list([...document.querySelectorAll('button,[role=button],a')].filter(b => /new chat|try again|regenerate|retry|start over|new topic/i.test(name(b))));
+  const main = document.querySelector('main') || document.body;
+  return {title: document.title, url: location.href, users: users.length, replies: replies.length,
+          composer: [...document.querySelectorAll(editors)].some(vis),
+          reply_buttons: turn ? list([...turn.querySelectorAll('button,[role=button]')]) : [], notable_buttons: notable,
+          alerts: [...document.querySelectorAll('[role="alert"],[aria-live="assertive"]')].filter(vis).map(e => norm(e.textContent).slice(0, 300)).filter(Boolean),
+          page_text_end: norm(main.innerText).slice(-1500)};
+}"""
+# The '...' (more) button of the newest reply, marked so it can be clicked ONCE to read its menu.
+MORE_MARK_JS = "([asstSel]) => {" + OUTER_JS + r"""
+  const vis = e => !!(e && (e.offsetWidth || e.offsetHeight || e.getClientRects().length));
+  const norm = v => String(v || '').replace(/\s+/g, ' ').trim();
+  document.querySelectorAll('[data-ccs-more]').forEach(e => e.removeAttribute('data-ccs-more'));
+  const replies = outer([...document.querySelectorAll(asstSel)]), last = replies[replies.length - 1];
+  let turn = last && (last.closest('[data-testid="copilot-message-reply-div"],[data-testid="copilot-message-div"]') || last.parentElement);
+  for (let i = 0; turn && i < 4 && !turn.querySelector('button,[role=button]'); i++) turn = turn.parentElement;
+  if (!turn) return false;
+  const b = [...turn.querySelectorAll('button,[role=button]')].filter(vis).find(x => {
+    const n = norm(x.getAttribute('aria-label')) || norm(x.title) || norm(x.textContent);
+    return /^(more|more options|more actions)$/i.test(n) || n === '...' || n === '…'; });
+  if (!b) return false;
+  b.setAttribute('data-ccs-more', '1'); return true; }"""
 RETRY_JS = r"""() => {   // click "Try again" ONLY inside an upload-error alert (never the response Regenerate/Retry)
   const vis = e => !!(e && (e.offsetWidth || e.offsetHeight || e.getClientRects().length));
   for (const box of document.querySelectorAll('[role="alert"],[aria-live="assertive"],[class*="toast" i],[class*="messagebar" i]')) {
@@ -2693,6 +2732,30 @@ class CopilotTab:
     async def read_answer(self) -> dict:
         """Newest assistant reply of this chat: text, its code blocks, whether Copilot is still generating."""
         return await self._ev(ANSWER_JS, [USER_MSG, ASSISTANT_MSG])
+
+    @guarded
+    async def page_state(self) -> dict:
+        """Buttons, message box, alerts and title around the newest reply (read only)."""
+        return await self._ev(PAGE_STATE_JS, [USER_MSG, ASSISTANT_MSG, ", ".join(EDITORS)])
+
+    @guarded
+    async def more_menu(self):
+        """Open the newest reply's '...' button, read its menu items and close it with Escape - no item is ever
+        clicked.  None = this reply has no '...' button."""
+        if not await self._ev(MORE_MARK_JS, [ASSISTANT_MSG]):
+            return None
+        await self.cursor.click(self.page.locator('[data-ccs-more="1"]').first, timeout=5000)
+        items, deadline = [], time.monotonic() + 3
+        while time.monotonic() < deadline:
+            items = await self._ev(MENU_JS, 0) or []
+            if items:
+                break
+            await asyncio.sleep(0.1)
+        await self._close_menus()
+        if items:
+            return [{"name": m["title"] or m["text"], "disabled": m["disabled"], "submenu": bool(m["popup"])} for m in items]
+        await self.page.keyboard.press("Escape")      # opened something that is not a [role=menu]: close it anyway
+        return []
 
     @guarded
     async def send_followup(self, text: str):
@@ -3131,6 +3194,21 @@ RESULT_WORDS = ("Correct", "Incorrect", "Inconclusive")
 FIXUP_TEXT = ("Your previous answer did not follow the required result structure. Resend your exact same answer, unchanged "
               "in content, as one JSON object written as plain text on a single line (no code block, no markdown) with "
               "exactly the keys COPILOT_RESULT, JUSTIFICATION and A_B_COMPARISONS, as defined in the attached result contract.")
+# Added to the visible message when answers are collected: the attached result contract is the ONLY answer format.
+# (VDI run 2026-11-02: all three first answers used another key set taken from somewhere else in the attachments.)
+CONTRACT_REMINDER = ("ANSWER FORMAT - this overrides any other answer format, template or JSON keys in the attached files or above: "
+                     "finish your reply with ONE JSON object written as plain text on a single line (no code block), with exactly "
+                     "the keys COPILOT_RESULT (Correct, Incorrect or Inconclusive), JUSTIFICATION (text) and A_B_COMPARISONS "
+                     "(a list of rows, each with exactly ITEM, Customer_expectation, System_data and MATCH true/false), "
+                     "as defined in the attached result contract. No other keys.")
+REFUSAL_RE = re.compile(r"(can['’]?t|cannot|unable to|not able to|won['’]?t|not allowed to) (help|assist|provide|complete|process|"
+                        r"review|share|do that|comply)|sensitive (information|data|content)|personal (data|information)|"
+                        r"against (my|our|the) (policy|policies|guidelines)|i['’]m sorry", re.I)
+
+
+def looks_like_refusal(text: str) -> bool:
+    """A label for the report only (never decides a send): a reply without any JSON that reads like a refusal."""
+    return "{" not in (text or "") and bool(REFUSAL_RE.search(text or ""))
 
 
 def validate_result(obj: dict) -> list:
@@ -3171,6 +3249,15 @@ def validate_result(obj: dict) -> list:
     return problems
 
 
+def odd_verdict(verdict: str, rows: int, differences: int) -> str:
+    """A valid answer that still deserves a look (flagged in the daily report, never changed)."""
+    if verdict == "Inconclusive" and not rows:
+        return "CHECK: Inconclusive with no comparisons"
+    if verdict == "Inconclusive" and differences:
+        return f"CHECK: Inconclusive although {differences} difference(s) are listed"
+    return ""
+
+
 def json_objects(text: str) -> list:
     """Every JSON object inside a piece of text (plain text with or without words around it), in order."""
     decoder, found, i = json.JSONDecoder(), [], 0
@@ -3206,14 +3293,14 @@ def parse_answer(answer: dict):
     return None, [f"the reply has {looks} (the result must be one JSON object written as plain text)"]
 
 
-def save_result(rt: Runtime, case, status: str, obj, raw: str, tries: int, fixups: int, omitted: int) -> None:
+def save_result(rt: Runtime, case, status: str, obj, raw: str, tries: int, fixups: int, omitted: int, chat: str = "") -> None:
     """Local result files: <instruction id>.json (full answer) and one row in results.csv."""
     rows = (obj or {}).get("A_B_COMPARISONS") or []
     mismatches = sum(1 for r in rows if isinstance(r, dict) and r.get("MATCH") is False)
     done = now()
     write_atomic(rt.results / f"{case.id}.json", json.dumps(
         {"instruction_id": case.id, "status": status, "tries": tries, "fixups": fixups, "left_out_files": omitted,
-         "finished": done, "result": obj, "raw_text": raw}, indent=2))
+         "finished": done, "chat": chat, "result": obj, "raw_text": raw}, indent=2))
     line = [case.id, status, (obj or {}).get("COPILOT_RESULT", ""), len(rows), mismatches, tries, fixups, omitted, done]
 
     def append():
@@ -3236,6 +3323,8 @@ class Pending:
         self.case, self.tab, self.generation, self.fixups = case, tab, generation, fixups
         self.started, self.replies_before = time.monotonic(), 0
         self.last_text, self.stable_since, self.overdue = None, None, False
+        self.no_box_since, self.looked = None, 0.0     # message box gone since (a refusal can block the chat); last page look
+        self.seen = ""                                 # the last page state written to the responses file (no repeats)
 
 
 class Prepared:
@@ -3267,10 +3356,39 @@ class Runner:
         self.chip_shapes = []             # what attachment chips looked like when names did not match (names hidden), for the run report
         self.feed = None                  # pipeline mode: PipelineFeed - cases keep arriving, each with its own instructions
         self.stdin = None                 # the run's terminal reader (set by prepare_session)
+        self.transcripts = collections.defaultdict(list)   # case key -> every turn of its chat, for the responses file
+        self.chat = {}                    # case key -> the chat's own address once Copilot gave it one
 
     # -- helpers ------------------------------------------------------------------------------
     def rec(self, case, state, **fields):
         return self.journal.record(case.key, state, alias=case.alias, instruction_id=case.id, **fields)
+
+    def note(self, case, kind: str, **fields):
+        """One turn of this case's chat for the Copilot responses file (sent, reply, fix-up, page state)."""
+        self.transcripts[case.key].append({"at": now(), "kind": kind, **fields})
+
+    def keep_chat(self, case, url: str):
+        """The chat's own address (Copilot gives it after the first send): kept in the journal and the results, so
+        the chat can be found again - and an answer collected from it after a crash.  Never a reason to resend."""
+        if url and url.startswith("http") and url.split("?")[0].rstrip("/") != str(self.cfg.copilot_url).split("?")[0].rstrip("/") \
+                and self.chat.get(case.key) != url:
+            self.chat[case.key] = url
+            state = self.journal.cases.get(case.key, {}).get("state", "submitted")
+            self.rec(case, state, conversation_url=url)
+
+    async def look(self, p, menu: bool = True) -> dict:
+        """The chat page around the newest reply (buttons, '...' menu, message box) - read only; the '...' button is the
+        one thing clicked, to read its menu, and closed again with Escape."""
+        try:
+            async with self.fg_lock:
+                await p.tab.foreground()
+                state = await p.tab.page_state()
+                if menu:
+                    state["more_menu"] = await p.tab.more_menu()
+        except Exception as exc:                      # diagnostics only: a lost connection is met by the next real step
+            return {"error": safe_exc(self.redact, exc)}
+        self.keep_chat(p.case, state.get("url", ""))
+        return state
 
     def storage_alive(self):
         """Called before every new case: stop (never fall back) when S: or its share is gone."""
@@ -3529,8 +3647,11 @@ class Runner:
             if norm_ws(await tab.message_text()) != norm_ws(self.message):
                 raise AttemptFailed("composer text does not match the configured message")
         snap = await tab.snapshot()
-        if not judge_upload(snap, [p["name"] for p in plan])["ready"]:
+        names = [p["name"] for p in plan]
+        if not judge_upload(snap, names)["ready"]:
             raise AttemptFailed("attachment set no longer ready")
+        self.shown_at_send = [{"file": resolve_chip(c, names), "shown_as": c.get("label") or c.get("text") or ""} for c in snap["chips"]]
+        self.note_chips(case, snap, names, 0.0)        # every case's chips in the run report, not only mismatches
         if not files_unchanged(plan):
             raise AttemptFailed("documents changed during upload")
 
@@ -3561,6 +3682,9 @@ class Runner:
                  evidence={"user_message": True, "attachments_visible": bool(names),
                            "generating_seen": ev["generating"], "reply_seen": bool(ev["replies"])})
         self.mark_sent(case, "submitted")
+        self.note(case, "sent", attachments=list(expected), shown_at_send=getattr(self, "shown_at_send", []),
+                  in_sent_message=list(ev.get("names") or []), address=url)
+        self.keep_chat(case, url)
         return "submitted"
 
     async def reconcile(self, case, tab, window: float):
@@ -3659,6 +3783,8 @@ class Runner:
         finished = answer["replies"] > p.replies_before and not answer["generating"] and answer["text"].strip()
         if not finished:
             p.last_text = p.stable_since = None
+            if await self.blocked(p, answer):
+                return
             if p.overdue and not self.queue:          # nothing left to send: stop waiting, report it
                 self.finish_without_answer(p, "response_timeout", "no answer within the overdue limit")
             return
@@ -3680,11 +3806,55 @@ class Runner:
         else:
             p.tab, p.generation = tab, self.browser.generation
 
+    BLOCKED_SECONDS = 5          # message box gone this long (not generating) = Copilot blocked the chat
+    LOOK_EVERY_SECONDS = 4       # while no reply is finished: how often the page is looked at
+
+    async def blocked(self, p, answer) -> bool:
+        """No finished reply yet: a refusal can show buttons (Try again, New chat) without a normal reply, or remove the
+        message box altogether.  What is seen is recorded (once per change); a chat without a message box for
+        BLOCKED_SECONDS ends the case as refused_chat_blocked.  Nothing on the page is clicked."""
+        if answer["generating"] or time.monotonic() - p.looked < self.LOOK_EVERY_SECONDS:
+            return False
+        p.looked = time.monotonic()
+        try:
+            state = await p.tab.page_state()
+        except Exception:
+            return False
+        self.keep_chat(p.case, state.get("url", ""))
+        sig = json.dumps([state.get("composer"), state.get("notable_buttons"), state.get("alerts"), state.get("replies")], sort_keys=True)
+        if sig != p.seen and (not state.get("composer") or state.get("alerts")
+                              or any(not b["in_sidebar"] for b in state.get("notable_buttons") or [])):
+            p.seen = sig
+            self.note(p.case, "page", reason="no finished reply yet - what the chat shows", page=state)
+        if state.get("composer"):
+            p.no_box_since = None
+            return False
+        p.no_box_since = p.no_box_since or time.monotonic()
+        if time.monotonic() - p.no_box_since < self.BLOCKED_SECONDS:
+            return False
+        full = await self.look(p)
+        self.note(p.case, "blocked", reason="the chat has no message box any more - nothing was clicked", page=full)
+        self.finish_without_answer(p, "refused_chat_blocked", "Copilot refused and its chat has no message box any more "
+                                   "(see the Copilot responses file for its text and buttons) - nothing was clicked",
+                                   raw=state.get("page_text_end", ""))
+        return True
+
     async def judge(self, p, answer):
         obj, problems = parse_answer(answer)
+        text = answer.get("full") or answer["text"]
+        refusal = obj is None and looks_like_refusal(answer["text"])
+        state = await self.look(p)
+        self.note(p.case, "reply", text=text, valid=obj is not None and not problems, problems=problems,
+                  keys=sorted(obj) if isinstance(obj, dict) else [], looks_like_refusal=refusal, page=state)
         if obj is not None and not problems:
             return self.finish_valid(p, obj, answer["text"])
-        self.log("fixup", p.case.alias, note="answer structure problem: " + "; ".join(problems[:3]))
+        self.log("fixup", p.case.alias, note=("the reply looks like a refusal; " if refusal else "")
+                 + "answer structure problem: " + "; ".join(problems[:3])
+                 + (f" (keys returned: {', '.join(sorted(obj)[:12])})" if isinstance(obj, dict) else ""))
+        if not state.get("composer", True):
+            self.note(p.case, "blocked", reason="the reply removed the message box - no resend possible, nothing was clicked", page=state)
+            return self.finish_without_answer(p, "refused_chat_blocked", "Copilot refused and its chat has no message box any "
+                                              "more (see the Copilot responses file) - nothing was clicked", raw=answer["text"])
         if p.fixups < self.cfg.fixup_requests:
             await self.request_fixup(p, answer, problems)
         else:
@@ -3699,26 +3869,37 @@ class Runner:
             return await self.rebind(p)
         except UiError as exc:
             self.log("fixup", p.case.alias, note=f"could not send the fix-up request: {safe_exc(self.redact, exc)}")
+            self.note(p.case, "fixup", text=text, confirmed=False, problem=safe_exc(self.redact, exc))
             return
-        deadline = time.monotonic() + 30
+        deadline, confirmed = time.monotonic() + 30, False
         while time.monotonic() < deadline:               # confirm: one more user message in this chat
             try:
                 if (await p.tab.read_answer())["users"] > answer["users"]:
+                    confirmed = True
                     break
             except SenderError:
                 pass
             await asyncio.sleep(0.3)
         p.fixups += 1                                    # counted even if unconfirmed, so this always ends
         p.replies_before, p.last_text, p.stable_since = answer["replies"], None, None
-        self.rec(p.case, "fixup_sent", fixups=p.fixups, problems="; ".join(problems[:4]))
-        self.log("fixup", p.case.alias, request=f"{p.fixups}/{self.cfg.fixup_requests}", note="asked Copilot to resend in the right structure")
+        self.rec(p.case, "fixup_sent", fixups=p.fixups, problems="; ".join(problems[:4]), confirmed=confirmed)
+        state = {} if confirmed else await self.look(p)
+        self.note(p.case, "fixup", text=text, confirmed=confirmed, **({"page": state} if state else {}))
+        if not confirmed and state.get("composer") is False:   # the refusal blocked the chat: the resend could not arrive
+            return self.finish_without_answer(p, "refused_chat_blocked", "Copilot refused and the resend could not be sent: "
+                                              "the chat has no message box any more - nothing was clicked", raw=answer["text"])
+        self.log("fixup", p.case.alias, request=f"{p.fixups}/{self.cfg.fixup_requests}",
+                 note="asked Copilot to resend in the right structure" + ("" if confirmed else
+                      " - NOT confirmed: the request did not appear in the chat"))
 
     async def business_retry(self, p, problems, raw: str):
         """Fix-ups did not help: resubmit the SAME instruction ID in this tab refreshed to a new chat, within the
         same total-tries budget.  (The only case where a submitted ID is sent again: no valid answer exists.)"""
         case, key = p.case, p.case.key
         if self.attempts[key] >= self.cfg.max_attempts:
-            return self.finish_without_answer(p, "result_invalid", "no valid answer structure after all tries", raw=raw)
+            refused = any(t.get("looks_like_refusal") for t in self.transcripts.get(key, []))
+            return self.finish_without_answer(p, "result_invalid", "no valid answer structure after all tries"
+                                              + (" - the replies look like a refusal by Copilot" if refused else ""), raw=raw)
         try:
             async with self.fg_lock:
                 await p.tab.reset()
@@ -3735,9 +3916,13 @@ class Runner:
         rows = obj["A_B_COMPARISONS"]
         diff = sum(1 for r in rows if r["MATCH"] is False)
         omitted = self.journal.cases.get(case.key, {}).get("omitted", 0)
-        save_result(self.rt, case, "result_valid", obj, raw, self.attempts[case.key], p.fixups, omitted)
+        save_result(self.rt, case, "result_valid", obj, raw, self.attempts[case.key], p.fixups, omitted, self.chat.get(case.key, ""))
         self.rec(case, "result_valid", verdict=verdict, rows=len(rows), differences=diff, fixups=p.fixups)
         note = f"{len(rows)} comparison(s), {diff} difference(s)" + (f"; {omitted} file(s) were left out" if omitted else "")
+        odd = odd_verdict(verdict, len(rows), diff)
+        if odd:
+            note += "; " + odd
+            self.log("WARNING", case.alias, note=odd)
         self.results[case.key] = ("result_" + verdict.lower(), note)
         self.log("result_" + verdict.lower(), case.alias, comparisons=len(rows), differences=diff, fixups=p.fixups)
         del self.pending[case.key]
@@ -3745,7 +3930,7 @@ class Runner:
 
     def finish_without_answer(self, p, state: str, reason: str, raw: str = ""):
         case = p.case
-        save_result(self.rt, case, state, None, raw, self.attempts[case.key], p.fixups, 0)
+        save_result(self.rt, case, state, None, raw, self.attempts[case.key], p.fixups, 0, self.chat.get(case.key, ""))
         self.rec(case, state, reason=reason, fixups=p.fixups)
         self.results[case.key] = (state, reason)
         self.log(state, case.alias, note=reason)
@@ -3944,10 +4129,13 @@ class PipelineFeed:
             self.control.go()
             return
         names = {"part1": "System 1", "part2": "System 2"}
+        missing = self.plan.get("no_guidance") or []
         say("\n" + "=" * 96 + "\nSIGN IN EVERYWHERE, THEN PRESS ENTER HERE\n"
             "  - Systems Edge window: " + " and ".join(names[p] for p in self.parts)
             + (" (keep exactly ONE System 1 tab, showing My Inbox)" if "part1" in self.parts else "") + "\n"
-            "  - Copilot Edge window: signed in (already confirmed)\n" + "=" * 96)
+            "  - Copilot Edge window: signed in (already confirmed)\n"
+            + ("  - NOTE: no guidance file for Sub Worktype(s) " + ", ".join(f"'{s}'" for s in missing)
+               + " - those cases are held before anything is downloaded\n" if missing else "") + "=" * 96)
         while True:
             line = await stdin.line()
             if line is None:                       # no terminal: check by itself every 10 s
@@ -4006,8 +4194,11 @@ class PipelineFeed:
         for key, (state, reason) in results.items():
             case = by_key.get(key)
             if case:
+                url = journal.cases.get(key, {}).get("conversation_url", "")
                 out[case.id] = {"state": state, "reason": reason,
-                                "left_out_files": journal.cases.get(key, {}).get("omitted", 0)}
+                                "left_out_files": journal.cases.get(key, {}).get("omitted", 0),
+                                "chat": self.P.strip_query(url) if url.startswith("http") and
+                                        url.split("?")[0].rstrip("/") != self.ctx.cfg.copilot_url.split("?")[0].rstrip("/") else ""}
         self.P.write_json(self.paths.sub("status") / "part3-results.json", out)
 
 
@@ -4378,9 +4569,11 @@ preflight_blocked, submission_uncertain (never resent), cancelled, recovery_requ
 Invariants: at-most-once sending; one tab per case; tabs are brought to the front before work; files attach through the
 "+ -> Upload images and files" menu with the file chooser intercepted; a failed unsent attempt resets the SAME tab to a new chat.
 
-Privacy: this report is UNREDACTED on purpose (it stays on the VDI and is handed over by the user): real paths, instruction IDs,
-file names, URLs and full error texts appear. Secrets are the one exception: environment variables whose names look like
-credentials are hidden, and no cookie / token / .env content is ever read. The console and events-*.txt logs remain redacted
+Privacy: this report keeps the real paths, instruction IDs, file names and full error texts (it stays on the VDI and is handed
+over by the user), but only the machine facts needed for debugging: no environment-variable list, no user / computer / domain
+names, and every web address is cut before its '?' (parameter names kept, values replaced by …), because sign-in codes live
+there. No cookie / token / .env content is ever read. Copilot's full replies, the buttons around them and the '...' menu are in
+the copilot-responses-*.md file written beside this report. The console and events-*.txt logs remain redacted
 (case aliases such as case-1a2b3c); the table in section 5 maps every alias to its real instruction ID and folder. Timestamps are UTC (events) or local
 (console). "elapsed"/"seconds" fields are wall-clock seconds. Evidence level of everything here: observed on the VDI in this run.
 """
@@ -4406,8 +4599,34 @@ def _shape(name: str) -> dict:
             "has_space": " " in str(name), "non_ascii": any(ord(c) > 127 for c in str(name))}
 
 
+def strip_query(url) -> str:
+    """A web address for the reports: cut before '?' / '#' (sign-in codes live there); parameter names kept."""
+    from shared import pipeline as P
+    return P.strip_query(url)
+
+
 def _url_shape(url: str, red) -> str:
-    return str(url)
+    return strip_query(url)
+
+
+def edge_log_size(rt) -> int:
+    try:
+        return (rt.logs / "edge-stderr.log").stat().st_size
+    except OSError:
+        return 0
+
+
+def edge_lines_since(rt, offset: int, limit: int = 300) -> list:
+    """The Copilot Edge's own messages written during THIS run (the file is shared by every run), addresses cut."""
+    from shared import pipeline as P
+    try:
+        with open(rt.logs / "edge-stderr.log", "rb") as fh:
+            fh.seek(offset)
+            data = fh.read(4_000_000)
+    except OSError:
+        return []
+    lines = [P.strip_queries(x) for x in data.decode("utf-8", "replace").splitlines() if x.strip()]
+    return lines if len(lines) <= limit else lines[:limit // 3] + [f"... {len(lines) - limit} line(s) omitted ..."] + lines[-(limit - limit // 3):]
 
 
 class _Raw:
@@ -4415,9 +4634,6 @@ class _Raw:
     def __call__(self, text):
         return str(text)
     literal = __call__
-
-
-SECRET_NAME = re.compile(r"token|secret|passw|pwd|credential|cookie|auth|apikey|api_key|private|session_key|sas|bearer", re.I)
 
 
 def system_facts(cfg, rt, policy) -> dict:
@@ -4428,14 +4644,12 @@ def system_facts(cfg, rt, policy) -> dict:
              "processor": platform.processor(), "cpu_count": os.cpu_count(), "python": sys.version.replace("\n", " "),
              "python_flags": f"isolated={sys.flags.isolated} no_user_site={sys.flags.no_user_site} ignore_environment={sys.flags.ignore_environment} "
                              f"dont_write_bytecode={sys.flags.dont_write_bytecode}",
-             "python_executable": sys.executable, "sys_path": list(sys.path), "argv": list(sys.argv), "user": os.environ.get("USERNAME", ""),
-             "computer": os.environ.get("COMPUTERNAME", ""), "domain": os.environ.get("USERDOMAIN", ""),
-             "logon_server": os.environ.get("LOGONSERVER", ""), "client_name": os.environ.get("CLIENTNAME", ""), "playwright": playwright_version(), "pid": os.getpid(),
+             "python_executable": sys.executable, "sys_path": list(sys.path), "argv": list(sys.argv),
+             "playwright": playwright_version(), "pid": os.getpid(),
              "timezone": f"{time.tzname} utc_offset_seconds={-time.timezone}", "locale": str(locale.getlocale()),
              "stdout_encoding": getattr(sys.stdout, "encoding", None), "filesystem_encoding": sys.getfilesystemencoding(),
              "stdin_is_terminal": bool(getattr(sys.stdin, "isatty", lambda: False)()), "cwd": os.getcwd(), "script": os.path.abspath(__file__),
-             "environment": {k: ("<hidden: looks like a credential>" if SECRET_NAME.search(k) else v) for k, v in sorted(os.environ.items())},
-             "session_name": os.environ.get("SESSIONNAME", ""), "is_remote_session": os.environ.get("SESSIONNAME", "").upper().startswith("RDP")}
+             "is_remote_session": os.environ.get("SESSIONNAME", "").upper().startswith("RDP")}
     try:
         class MEM(ctypes.Structure):
             _fields_ = [("length", ctypes.c_ulong), ("load", ctypes.c_ulong), ("total", ctypes.c_ulonglong), ("avail", ctypes.c_ulonglong),
@@ -4545,7 +4759,18 @@ def write_run_report(ctx, journal, cases, runner, bfacts, started, start_seq, co
                f"- duration: {time.monotonic() - started:.1f}s | exit code: {code} ({'ok' if code == 0 else 'see errors'}) | cases in scope: {len(cases)}",
                f"- results by state: {dict(counts)}",
                f"- stopped by user: {runner.stop.is_set if runner else 'n/a'} | browser reconnects: {max(0, (bfacts or {}).get('connection_generation', 1) - 1)}",
-               f"- uncaught error: {'none' if crash is None else type(crash).__name__ + ': ' + red(str(crash)[:500])}", "",
+               f"- uncaught error: {'none' if crash is None else type(crash).__name__ + ': ' + red(str(crash)[:500])}",
+               f"- Copilot's full replies, buttons and '...' menus: {getattr(ctx, 'responses_name', '') or '(none this run)'}"]
+        feed = getattr(runner, "feed", None) if runner else None
+        workload = []
+        if feed is not None:
+            try:
+                workload = feed.P.daily_report(feed.paths, feed.plan, feed.control)
+                out += [f"- WHOLE WORKLOAD: {feed.P.workload_line(workload)} (every CSV row in section 11; the coordinator's "
+                        f"pipeline-report-{feed.paths.run.name}.md has what System 1 / System 2 saw)"]
+            except Exception as exc:                  # noqa: BLE001 - diagnostics only
+                out += [f"- whole workload: unavailable ({type(exc).__name__})"]
+        out += ["",
                "## 2. System and environment", "```json", redacted_json(system_facts(cfg, rt, ctx.policy), red), "```", "",
                "## 3. The tool and its settings", f"- script: {script.name} sha256[:16]={digest} size={size} bytes (compare with the repository to know which code ran)",
                f"- prompt version: {getattr(runner, 'prompt_version', None)}", "```json",
@@ -4563,12 +4788,29 @@ def write_run_report(ctx, journal, cases, runner, bfacts, started, start_seq, co
                 "Each entry: how many chips vs files, and for every chip its real label/text/title, whether it matched an expected file (doc#N) "
                 "or not, and its name shape (hash_like=true means a temporary hash-style name while loading).", "```json", redacted_json([{k: v for k, v in x.items() if k != "_key"} for x in shapes[-60:]], red.literal), "```", ""]
         errors = ctx.log.errors
-        out += ["## 7. Errors and tracebacks (frames: file:line function)", "```", red("\n\n".join(errors) if errors else "none recorded"), "```", ""]
+        abnormal = [e for e in ctx.log.events if e.get("phase") in ABNORMAL_PHASES]
+        out += ["## 7. Errors, holds and abnormal states",
+                "Every case that did not end with a clean verdict, every CSV row that needs you, then every warning / retry / "
+                "fix-up / block of the run, then the tracebacks of caught or uncaught errors (frames: file:line function).", ""]
+        out += [f"- {c.alias} ({c.id}): {results[c.key][0]} - {red(results[c.key][1] or '-')}"
+                for c in cases if c.key in results and results[c.key][0] not in DONE_STATES] or ["- every case of this run ended cleanly"]
+        out += [f"- CSV row {r['row']} {r['instruction_id']}: {r['outcome']} - {r['detail']}" for r in workload if feed.P.needs_you(r)]
+        out += ["", "```"] + [json.dumps(e, default=str) for e in abnormal[-400:]] + ["```", "", "```",
+                red("\n\n".join(errors) if errors else "no traceback recorded"), "```", ""]
         evs = ctx.log.events
         shown = evs if len(evs) <= 3000 else evs[:600] + [{"note": f"... {len(evs) - 2400} events omitted ..."}] + evs[-1800:]
         out += ["## 8. Full event timeline (the redacted structured log of this run, one JSON object per line)", "```json"]
         out += [json.dumps(e, default=str) for e in shown] + ["```", ""]
-        out += ["## 9. Last console lines", "```", red("\n".join(ctx.log.console[-120:])), "```"]
+        out += ["## 9. Last console lines", "```", red("\n".join(ctx.log.console[-120:])), "```", ""]
+        edge = edge_lines_since(rt, ctx.edge_offset) if getattr(ctx, "edge_offset", None) is not None else []
+        out += ["## 10. Copilot Edge messages during this run (its stderr log from this run's start; addresses cut before '?')",
+                "Chromium writes many harmless lines here (e.g. disk-cache or GPU notices); compare their times with the event timeline.",
+                "```", "\n".join(edge) or "(nothing written during this run)", "```", ""]
+        if feed is not None:
+            out += ["## 11. Whole workload - every CSV row (the same rows as the daily report CSV)", "",
+                    "| row | instruction ID | account | Sub Worktype | outcome | detail | Copilot chat |", "|---|---|---|---|---|---|---|"]
+            out += [f"| {r['row']} | {r['instruction_id']} | {r['client_account_number']} | {r['sub_worktype']} | {r['outcome']} | "
+                    f"{str(r['detail']).replace('|', '/')} | {r.get('copilot_chat', '')} |" for r in workload]
         text = red.literal("\n".join(out))          # final blanket pass: any registered path/ID/URL that slipped through
         path = path or rt.logs / f"run-report-{datetime.datetime.now():%Y%m%d-%H%M%S}.md"
         write_atomic(path, text)
@@ -4576,6 +4818,90 @@ def write_run_report(ctx, journal, cases, runner, bfacts, started, start_seq, co
     except Exception as exc:                  # noqa: BLE001 - the report is diagnostics only
         print(f"(run report could not be written: {type(exc).__name__})", flush=True)
         return None
+
+
+RESPONSES_GUIDE = """\
+Every Copilot chat of ONE run, case by case, in time order - written for a reviewing LLM that cannot see the VDI.
+For each case: what was sent (the files, in order, and how Copilot showed them), then every reply in full, whether it followed
+the result contract (and which keys it used instead), whether it reads like a refusal, the buttons Copilot showed around it
+(the reply's own buttons, notable ones anywhere such as New chat / Try again, and the items of its '...' menu - opened only to
+read them and closed with Escape; no button is ever clicked), whether the message box was still there, and every fix-up request
+with whether it really arrived. A refusal can show its buttons without a normal reply and without changing the tab title:
+look for 'page' entries. Web addresses are cut before '?'. The run report beside this file has timings and settings."""
+
+
+def _fence(text) -> list:
+    """A reply as a block that its own backticks cannot break."""
+    return ["~~~~text", str(text or "").replace("~~~~", "~ ~ ~ ~"), "~~~~"]
+
+
+def _buttons(state: dict) -> list:
+    if not state:
+        return []
+    if state.get("error"):
+        return [f"  - the page could not be read: {state['error']}"]
+    out = [f"  - message box present: {'yes' if state.get('composer') else 'NO'} | tab title: {state.get('title', '')!r} | "
+           f"address: {strip_query(state.get('url', ''))}"]
+    btn = lambda b: b["name"] + (" (disabled)" if b.get("disabled") else "") + (" [opens a menu]" if b.get("menu") else "")
+    out.append("  - reply's own buttons: " + (", ".join(btn(b) for b in state.get("reply_buttons") or []) or "(none found)"))
+    notable = [b for b in state.get("notable_buttons") or [] if not b.get("in_sidebar")]
+    if notable:
+        out.append("  - notable buttons on the page: " + ", ".join(btn(b) + (" (in the reply)" if b.get("in_reply") else "") for b in notable))
+    menu = state.get("more_menu")
+    out.append("  - '...' menu: " + ("(no '...' button on this reply)" if menu is None else
+                                     ", ".join(m["name"] + (" (disabled)" if m.get("disabled") else "") for m in menu) or "(opened, no items read)"))
+    if state.get("alerts"):
+        out.append("  - alerts: " + " | ".join(state["alerts"]))
+    return out
+
+
+def write_responses(ctx, runner, cases, path) -> str:
+    """copilot-responses-<time>.md beside the run report: every chat of the run, in full.  Never raises."""
+    try:
+        by_key = {c.key: c for c in cases}
+        keys = [k for k in by_key if runner.transcripts.get(k)] + [k for k in runner.transcripts if k not in by_key]
+        out = [f"# Copilot responses - {datetime.datetime.now():%Y-%m-%d %H:%M} - {len(keys)} chat(s)", "", RESPONSES_GUIDE, ""]
+        for key in keys:
+            c = by_key.get(key)
+            state, reason = runner.results.get(key, ("?", ""))
+            sub = ""
+            if c is not None and runner.feed is not None:
+                sub = (runner.feed.P.read_json(runner.feed.paths.cases / f"{c.id}.json") or {}).get("sub_worktype", "")
+            out += [f"## {c.alias if c else key} - instruction ID {c.id if c else '?'}" + (f" - Sub Worktype: {sub}" if sub else ""),
+                    f"- final: **{state}** - {reason or '-'}", f"- chat address: {strip_query(runner.chat.get(key, '')) or '(not known)'}", ""]
+            for n, t in enumerate(runner.transcripts[key], 1):
+                at = t["at"][11:19]
+                if t["kind"] == "sent":
+                    out += [f"### {n}. {at} case sent ({len(t['attachments'])} attachment(s), the base message + format reminder - see the run report)"]
+                    out += [f"  {i}. {name}" for i, name in enumerate(t["attachments"], 1)]
+                    if t.get("shown_at_send"):
+                        out.append("  - as Copilot showed them just before Send: " + "; ".join(
+                            f"{x['shown_as'] or '?'} -> {x['file']}" for x in t["shown_at_send"]))
+                    if t.get("in_sent_message"):
+                        out.append("  - names in the sent message: " + ", ".join(t["in_sent_message"]))
+                elif t["kind"] == "reply":
+                    verdict = ("valid (follows the result contract)" if t["valid"] else
+                               "NOT valid: " + "; ".join(t["problems"][:4]))
+                    out += [f"### {n}. {at} Copilot replied - {verdict}"
+                            + (" - LOOKS LIKE A REFUSAL" if t.get("looks_like_refusal") else "")]
+                    if t.get("keys") and not t["valid"]:
+                        out.append("  - JSON keys it used: " + ", ".join(t["keys"]))
+                    out += _buttons(t.get("page")) + [""] + _fence(t.get("text"))
+                elif t["kind"] == "fixup":
+                    out += [f"### {n}. {at} fix-up request sent - arrived in the chat: {'yes' if t.get('confirmed') else 'NO'}"]
+                    if t.get("problem"):
+                        out.append(f"  - could not be sent: {t['problem']}")
+                    out += _buttons(t.get("page")) + [""] + _fence(t.get("text"))
+                else:                                   # page / blocked
+                    out += [f"### {n}. {at} {t['kind']}: {t.get('reason', '')}"] + _buttons(t.get("page"))
+                    if (t.get("page") or {}).get("page_text_end"):
+                        out += ["  - end of the page text:"] + _fence(t["page"]["page_text_end"])
+                out.append("")
+        write_atomic(path, "\n".join(out))
+        return path.name
+    except Exception as exc:                  # noqa: BLE001 - diagnostics only
+        print(f"(Copilot responses file could not be written: {type(exc).__name__})", flush=True)
+        return ""
 
 
 def scan_queue(ctx, journal, listed):
@@ -4603,6 +4929,9 @@ async def run_async(ctx, journal, ledger, listed, message, pipeline_dir=None) ->
     feed = runner.feed = PipelineFeed(pipeline_dir, ctx, local_salt(ctx.rt)) if pipeline_dir else None
     cases = []
     code, results, crash, started, start_seq, bfacts = 0, {}, None, time.monotonic(), journal.seq, None
+    ctx.edge_offset = edge_log_size(ctx.rt)        # the run report shows only the Edge messages written from here on
+    stamp = f"{datetime.datetime.now():%Y%m%d-%H%M%S}"
+    responses = ctx.rt.logs / f"copilot-responses-{stamp}.md"
     intents = any(r.get("state") == "send_intent" for r in journal.cases.values())
     # Everything that does not depend on the queue starts at once: the cursor question, Edge (launch or join) + connection.
     CONSOLE["log"] = log
@@ -4682,15 +5011,20 @@ async def run_async(ctx, journal, ledger, listed, message, pipeline_dir=None) ->
             bfacts = None
         await runner.discard_prefetch()
         await browser.close()
-        ctx.reported = write_run_report(ctx, journal, cases, runner, bfacts, started, start_seq, code, crash, sys.argv[1:])
+        if runner.transcripts:
+            ctx.responses_name = write_responses(ctx, runner, cases, responses)
+        ctx.reported = write_run_report(ctx, journal, cases, runner, bfacts, started, start_seq, code, crash, sys.argv[1:],
+                                        path=ctx.rt.logs / f"run-report-{stamp}.md")
     results = runner.results
-    summarise(ctx, journal, cases, listed, results)
+    summarise(ctx, journal, cases, listed, results, feed)
     ok = ("submitted", "result_correct", "result_incorrect", "result_inconclusive")   # a valid verdict is a finished case
     unresolved = [k for k, (s, _) in results.items() if s not in ok or k in runner.partial]
     code = code or (1 if unresolved else 0)
     if ctx.reported:      # same file, now with the final exit code and the summary lines on the console
         ctx.reported = write_run_report(ctx, journal, cases, runner, bfacts, started, start_seq, code, crash, sys.argv[1:], path=ctx.reported)
-        print(f"Run report (redacted, for review): {ctx.reported}", flush=True)
+        print(f"Run report (for review): {ctx.reported}", flush=True)
+    if getattr(ctx, "responses_name", ""):
+        print(f"Copilot responses (every chat in full): {ctx.rt.logs / ctx.responses_name}", flush=True)
     return code
 
 
@@ -4933,9 +5267,12 @@ async def prepare_session(runner, browser, cfg, log, todo, asking=None, count=No
 
 
 DONE_STATES = ("submitted", "skipped_already_sent", "result_correct", "result_incorrect", "result_inconclusive")
+ABNORMAL_PHASES = {"WARNING", "attempt-failed", "deferred", "fixup", "resubmit", "preflight_blocked", "submission_uncertain",
+                   "failed_exhausted", "result_invalid", "response_timeout", "refused_chat_blocked", "upload-recovery",
+                   "send-error", "foreground", "prefetch", "paused", "stopped", "reconnect", "submitted_partial"}
 
 
-def summarise(ctx, journal, cases, listed, results):
+def summarise(ctx, journal, cases, listed, results, feed=None):
     rows, counts = [], collections.Counter()
     for c in cases:
         rec = journal.cases.get(c.key, {})
@@ -4950,8 +5287,15 @@ def summarise(ctx, journal, cases, listed, results):
     summary = {"finished": now(), "counts": dict(counts), "cases": rows}
     print("\nSUMMARY  " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
     for r in rows:
-        if r["state"] not in DONE_STATES:
+        if r["state"] not in DONE_STATES or "CHECK" in r["reason"]:
             print(f"  {r['case']}  {r['state']}  {r['reason']}")
+    if feed is not None:                          # the whole CSV, not only the cases that reached Copilot
+        try:
+            workload = feed.P.daily_report(feed.paths, feed.plan, feed.control)
+            summary["workload"] = {"line": feed.P.workload_line(workload), "rows": workload}
+            print("WHOLE WORKLOAD  " + summary["workload"]["line"] + " (each one is in the daily report below)")
+        except Exception:                         # noqa: BLE001 - the coordinator's daily report still lists every row
+            pass
     try:
         write_atomic(ctx.rt.logs / f"summary-{datetime.datetime.now():%Y%m%d-%H%M%S}.json", json.dumps(summary, indent=1))
     except PersistenceError:
@@ -5010,6 +5354,8 @@ def run_command(args) -> int:
             pass                                          # the real import reports any problem
     threading.Thread(target=preload, daemon=True).start()     # import cost overlaps the scans below
     message = load_message(Path(cfg.base_message_path))
+    if cfg.completion_mode == "json_result":            # the contract's format, visible in the message itself
+        message = message.rstrip() + "\n\n" + CONTRACT_REMINDER
     journal = Journal(ctx.rt, cfg.persist_retries)
     try:
         ledger = Ledger(ctx.rt.ledger, cfg.persist_retries)

@@ -18,6 +18,8 @@ The parts never call each other.  They only read and write the small files descr
       events\\<part>.jsonl        progress lines Part 3 shows on the one console
       held\\<id>.json             a case that will not be sent this run, and why
       logs\\                      Part 1 / Part 2 console output
+      diagnostics\\<part>\\        what each part saw, per case / account (read by the coordinator's pipeline report)
+  RUNTIME_ROOT\\logs\\captures\\<run id>\\   screenshots + page copies taken when a case fails or is held
 
 A case reaches CASES_ROOT only when it is complete (documents + Audit Trail + snapshot), in one rename from .work,
 so Part 3 never sees a half-downloaded case.
@@ -32,6 +34,7 @@ import re
 import time
 import uuid
 from pathlib import Path
+from urllib.parse import parse_qsl, urlsplit
 
 WORK_DIR = ".work"                      # inside CASES_ROOT (same share, so the hand-over is one rename)
 SNAPSHOT_SUFFIX = "_Account_Summary_Interested_Parties_and_Links.json"
@@ -87,6 +90,28 @@ def read_json(path: Path, default=None):
         return json.loads(Path(path).read_text("utf-8"))
     except (OSError, ValueError):
         return default
+
+
+def strip_query(url) -> str:
+    """A web address safe for reports: everything after '?' or '#' (where sign-in codes live) is cut; the parameter
+    NAMES stay so the address is still recognisable ('.../view?documentEntityId=…')."""
+    text = str(url or "")
+    try:
+        u = urlsplit(text)
+    except ValueError:
+        return text.split("?", 1)[0].split("#", 1)[0]
+    if not u.scheme and not u.netloc:
+        return text.split("?", 1)[0].split("#", 1)[0]
+    names = [k for k, _ in parse_qsl(u.query, keep_blank_values=True)]
+    return f"{u.scheme}://{u.netloc}{u.path}" + ("?" + "&".join(f"{k}=…" for k in names) if names else "")
+
+
+URL_IN_TEXT = re.compile(r"https?://[^\s\"'<>)\]]+")
+
+
+def strip_queries(text) -> str:
+    """Every web address inside a piece of text (a log line, a page excerpt) cut like strip_query."""
+    return URL_IN_TEXT.sub(lambda m: strip_query(m.group(0)), str(text or ""))
 
 
 # ---------------------------------------------------------------------------------------------- the daily CSV
@@ -195,11 +220,23 @@ class Paths:
     def sub(self, name: str) -> Path:
         return self.run / name
 
+    @property
+    def logs(self) -> Path:
+        """RUNTIME_ROOT\\logs: where the sender's run report lives - every file for the reviewing Copilot goes here."""
+        return self.runtime_root / "logs"
+
+    @property
+    def captures(self) -> Path:
+        return self.logs / "captures" / self.run.name
+
+    def diagnostics(self, part: str) -> Path:
+        return self.run / "diagnostics" / part
+
     def create(self) -> "Paths":
         for p in (self.downloads, self.cases, self.work, self.snapshots()):
             p.mkdir(parents=True, exist_ok=True)
         if self.run:
-            for name in ("control", "status", "events", "held", "logs"):
+            for name in ("control", "status", "events", "held", "logs", "diagnostics"):
                 (self.run / name).mkdir(parents=True, exist_ok=True)
         return self
 
@@ -344,3 +381,68 @@ def read_plan(paths: Paths) -> dict:
     if not plan:
         raise FileNotFoundError("this run has no plan.json")
     return plan
+
+
+# ---------------------------------------------------------------------------------------------- the daily report
+
+OUTCOMES = {
+    "result_correct": "sent - Copilot: Correct", "result_incorrect": "sent - Copilot: Incorrect",
+    "result_inconclusive": "sent - Copilot: Inconclusive", "submitted": "sent (answer not collected)",
+    "submitted_partial": "sent with files left out", "result_invalid": "sent - answer not in the required format",
+    "response_timeout": "sent - no answer in time", "submission_uncertain": "UNCERTAIN send - check the Copilot chat",
+    "refused_chat_blocked": "sent - Copilot refused and blocked the chat",
+    "preflight_blocked": "not sent - blocked", "failed_exhausted": "not sent - failed after all tries",
+    "not_sent_stopped": "not sent - run stopped", "skipped_already_sent": "already sent earlier",
+}
+REPORT_COLUMNS = ["row", "instruction_id", "client_account_number", "client_number", "process_status", "sub_worktype",
+                  "outcome", "detail", "left_out_files", "copilot_chat"]
+REVIEWED = ("sent - Copilot: Correct", "sent - Copilot: Incorrect", "sent - Copilot: Inconclusive")
+
+
+def daily_report(paths: Paths, plan: dict, control: Control) -> list:
+    """One row per CSV row, in CSV order: what happened to it this run and why."""
+    held = control.held()
+    sent = read_json(paths.sub("status") / "part3-results.json", {}) or {}
+    rows = []
+    for c in plan["skipped"]:
+        rows.append({"row": c["row_number"], "instruction_id": c["iid"], "client_account_number": c["account"],
+                     "client_number": c["client_number"], "process_status": c["status"],
+                     "sub_worktype": c["sub_worktype_csv"], "outcome": "skipped", "detail": c["reason"],
+                     "left_out_files": "", "copilot_chat": ""})
+    for c in plan["cases"]:
+        iid = c["iid"]
+        m = read_json(paths.downloads / f"{iid}.json") or {}
+        row = {"row": c["row_number"], "instruction_id": iid, "client_account_number": c["account"],
+               "client_number": c["client_number"], "process_status": c["status"],
+               "sub_worktype": m.get("sub_worktype") or c["sub_worktype_csv"], "outcome": "", "detail": "",
+               "left_out_files": "", "copilot_chat": ""}
+        if c["needs"] in ("done", "held"):
+            row.update(outcome="already sent earlier" if c["needs"] == "done" else "held", detail=c["note"])
+        elif iid in sent:
+            r = sent[iid]
+            row.update(outcome=OUTCOMES.get(r["state"], r["state"]), detail=r.get("reason", ""),
+                       left_out_files=r.get("left_out_files") or "", copilot_chat=r.get("chat", ""))
+        elif iid in held:
+            row.update(outcome="held", detail=held[iid]["reason"])
+        elif m:
+            row.update(outcome="not sent - run ended", detail="downloaded, not handed over or not sent yet")
+        else:
+            row.update(outcome="not reached - run ended", detail="")
+        if m.get("warnings"):
+            row["detail"] = "; ".join(filter(None, [row["detail"], *m["warnings"]]))
+        rows.append(row)
+    rows.sort(key=lambda r: r["row"])
+    return rows
+
+
+def needs_you(row: dict) -> bool:
+    """A row you have to look at: anything but a clean verdict, an earlier send or a skipped row."""
+    return row["outcome"] not in REVIEWED + ("already sent earlier", "skipped") or "CHECK" in str(row.get("detail", ""))
+
+
+def workload_line(rows: list) -> str:
+    """'Reviewed X of Y ...' - the one line that says whether the whole CSV was done."""
+    ended = [r for r in rows if r["outcome"] != "skipped"]
+    reviewed = sum(1 for r in ended if r["outcome"] in REVIEWED)
+    return (f"Reviewed {reviewed} of {len(ended)} 'Ended' case(s) ({len(rows)} CSV row(s), "
+            f"{len(rows) - len(ended)} skipped); {sum(1 for r in rows if needs_you(r))} need you")

@@ -101,7 +101,8 @@ def print_plan(plan: dict) -> None:
     if plan["no_guidance"]:
         print("  WARNING: no instructions file in the guidance folder yet for Sub Worktype(s): "
               + ", ".join(f"'{s}'" for s in plan["no_guidance"])
-              + "\n           those cases will be held unless System 1 shows a Sub Worktype that has one.")
+              + "\n           those cases are held before anything is downloaded, unless System 1 shows a Sub Worktype"
+                " that has one.")
 
 
 # ---------------------------------------------------------------------------------------------- the systems Edge
@@ -211,6 +212,10 @@ def main(argv=None) -> int:
         P.write_json(paths.plan, plan)
         print_plan(plan)
         control = P.Control(paths)
+        try:                                        # the pipeline report shows only this run's systems Edge lines
+            edge_offset = (paths.logs / "edge-systems-stderr.log").stat().st_size
+        except OSError:
+            edge_offset = 0
         if not any(c["needs"] in ("download", "send") for c in plan["cases"]):
             print("\nNothing to do in this run.")
             return finish(paths, plan, control, 0)
@@ -251,7 +256,7 @@ def main(argv=None) -> int:
                 if all(p.poll() is not None for p in procs.values()):
                     break
                 time.sleep(0.5)
-        return finish(paths, plan, control, code)
+        return finish(paths, plan, control, code, edge_offset)
     except P.CsvError as exc:
         print(f"CSV PROBLEM: {exc}.")
         return 2
@@ -266,18 +271,24 @@ def main(argv=None) -> int:
         return 130
 
 
-def finish(paths: P.Paths, plan: dict, control: P.Control, code: int) -> int:
-    """The daily report: on screen (what needs you) and as a CSV beside the run."""
+def finish(paths: P.Paths, plan: dict, control: P.Control, code: int, edge_offset=None) -> int:
+    """The daily report: on screen (what needs you) and as a CSV beside the run; and the pipeline report (what System 1
+    and System 2 saw) in RUNTIME_ROOT\\logs beside the sender's run report, for the reviewing Copilot."""
     rows = H.daily_report(paths, plan, control)
     report = H.write_report(rows, paths.runtime_root / "reports", paths.run.name)
     counts = {}
     for r in rows:
         counts[r["outcome"]] = counts.get(r["outcome"], 0) + 1
     print("\n" + "=" * 96 + "\nDAILY REPORT  " + ", ".join(f"{k}: {v}" for k, v in sorted(counts.items())))
+    print("  " + P.workload_line(rows))
     for r in rows:
-        if not r["outcome"].startswith("sent - Copilot") and r["outcome"] not in ("already sent earlier", "skipped"):
+        if P.needs_you(r):
             print(f"  row {r['row']:>4}  {r['instruction_id']:<32}  {r['outcome']}  {r['detail']}")
-    print(f"Full report (every CSV row): {report}\n" + "=" * 96, flush=True)
+    print(f"Full report (every CSV row): {report}")
+    detail = H.pipeline_report(paths, plan, rows, edge_offset)
+    if detail:
+        print(f"What System 1 / System 2 saw (for review): {detail}")
+    print("=" * 96, flush=True)
     return code
 
 

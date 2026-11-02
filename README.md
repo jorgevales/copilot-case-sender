@@ -68,14 +68,28 @@ stay in your local, git-ignored `sender_config.json`.
    - **Part 3** picks the case up within seconds. It attaches that type's `.md` + the result contract, then the
      snapshot, the Audit Trail and the documents (Received Documents order), sends once and collects the answer
      while the next case is still downloading.
-7. **The daily report**: on screen (everything that needs you) and as
+7. **The daily report**: on screen (a "Reviewed X of Y ... N need you" line, then everything that needs you) and as
    `RUNTIME_ROOT\reports\daily-report-<run>.csv`. One line per CSV row: sent + Copilot's verdict, held + why,
-   skipped + why, and left-out files.
+   skipped + why, left-out files and the Copilot chat's address. An answer that is valid but odd is marked
+   `CHECK:` (Inconclusive with no comparisons, or Inconclusive although differences are listed).
+
+**Files for the reviewing Copilot** (all in `RUNTIME_ROOT\logs`, attach them after a run):
+- `run-report-<time>.md`: the sender's run (settings, timings, every case, errors and abnormal states, the whole
+  workload, this run's Copilot Edge messages);
+- `copilot-responses-<time>.md`: every Copilot chat in full: what was sent, every reply, whether it followed the
+  contract (and which keys it used instead), whether it reads like a refusal, the buttons around the reply and the
+  items of its `...` menu, and every fix-up request with whether it arrived;
+- `pipeline-report-<run>.md`: what System 1 and System 2 saw: per case the search, the Sub Worktype, every document
+  with the way it was downloaded (or why not, with each request's status / type / size), per account the snapshot
+  (reused or saved, when), and this run's systems Edge messages;
+- `captures\<run>\`: a screenshot, the visible text and the page file wherever a case, a document window or a System 2
+  page failed.
+None of them lists environment variables or user / machine names, and every web address is cut before its `?`.
 
 **Held, never sent** (each with a plain reason in the report):
 - System 1 shows a different account than the CSV;
 - Part 1 failed the case twice;
-- no instructions file for its Sub Worktype;
+- no instructions file for its Sub Worktype - checked on the search result, **before anything is downloaded**;
 - no System 2 snapshot (failed after one retry);
 - a folder with the same name already in CASES_ROOT.
 
@@ -241,8 +255,15 @@ block are tolerated) and checks it strictly: exactly the 3 keys, the verdict exa
 each row exactly `ITEM`, `Customer_expectation`, `System_data`, `MATCH` (true/false), and the verdict must agree with the
 rows (`Correct` ⇒ every `MATCH` true; `Incorrect` ⇒ at least one false; both need at least one row).
 
+* **The format is in the message too:** the visible message ends with a short reminder of the three keys, saying it
+  overrides any other answer format in the attached files (on the VDI all three first answers used another key set).
 * **Not valid?** The tool immediately asks, in the same chat, for “your exact same answer, unchanged in content, in the
-  correct structure” and names what was wrong – up to `fixup_requests` (3) times.
+  correct structure” and names what was wrong – up to `fixup_requests` (3) times. It checks the request really appeared
+  in the chat and records it.
+* **Refusals:** a reply that reads like a refusal is marked as such in the responses file and is resent the same way.
+  If the refusal removed the message box (only "New chat" left), with or without a normal reply, the case ends as
+  `refused_chat_blocked` (“Copilot refused and blocked the chat”): its text and every button are recorded, **nothing is
+  clicked**, and the run goes on with the next case.
 * **Still not valid?** The same instruction ID is resubmitted in the **same tab refreshed to a new chat**, inside the same
   5-tries budget (the only case where a submitted ID is sent again: no valid answer exists). After the last try the case
   ends as `result_invalid`.
@@ -435,8 +456,10 @@ skipped, not failed.
 | Hand-over only when documents + Audit Trail + snapshot + Sub Worktype instructions are all there; held reasons; stop leaves `.work` alone; a crashed part counts as finished | **Tested here** |
 | Part 3 live queue: a case finished mid-run is sent; its own instructions + contract, then snapshot, Audit Trail, documents in order; over the limit the last documents are left out | **Tested here** (real Runner, fake page) |
 | Stop after a send: nothing new sent, the sent answer still collected; sign-in check names what is missing; pause → Enter → resume | **Tested here** |
-| Part 1 case logic: `.work` folder, account mismatch held without retry, one clean retry, stop between documents and Audit Trail, one-System-1-tab check | **Tested here** (scripted System 1 steps) |
-| Part 2: Access Denied vs expired sign-in vs normal page; Access Denied twice stops the run; expired → pause → fresh cookies; only System 2 cookies read | **Tested here** (synthetic pages) |
+| Part 1 case logic: `.work` folder, account mismatch held without retry, one clean retry, stop between documents and Audit Trail, one-System-1-tab check, no guidance = held before download | **Tested here** (scripted System 1 steps) |
+| Part 1 downloads: viewer address paired by document ID (position only when no address names an ID and counts match); a viewer page's own file fetched; a document window read without clicking inside it (its address, the file it shows, a download it starts, its own toolbar button only) | **Tested here** (fake responses / window; pairing run in Node). Real System 1 viewer: **needs your VDI** |
+| Part 2: Access Denied vs expired sign-in vs normal page; Access Denied twice stops the run; expired → pause → fresh cookies; only System 2 cookies read; the failing page kept with addresses cut | **Tested here** (synthetic pages) |
+| Copilot refusals: blocked chat (with and without a reply) ends the case, nothing clicked; refusal resent and confirmed; responses file with replies, buttons and `...` menu; odd verdicts flagged | **Tested here** (fake page). Real refusal page: **needs your VDI** |
 | One whole run with real processes (coordinator + stand-ins for the three parts): skipped row, held case, two cases sent, daily report | **Tested here** |
 | Real System 1 / System 2 pages, cookie read over DevTools, two Edges side by side, background switches | **Needs your VDI** |
 | 5 folders → 5 queue entries; `.edge-debug-9223` excluded (case variants) | **Tested here** |
@@ -477,5 +500,12 @@ At the end of every `run` (also after a crash, a stop, or a failure before the q
 tool works, case states, invariants, what to answer), then the outcome and exit code, OS / Python / Playwright / Edge versions, CPU,
 memory, disk, screen, time zone, remote-session hints, the script hash, **every setting**, storage facts, browser facts (launched or
 joined, reconnects, tabs with ready/visible state, model chosen), one block per case (attempts, routes, reasons, gaps between steps,
-document counts / sizes / name *shapes*), how the attachment chips looked when names did not match, errors with call frames, the full
-event timeline and the last console lines. It is deliberately **not redacted**: it contains the real paths, instruction IDs and folders, file names, URLs, chip labels, environment variables and full error tracebacks, so it stays on the VDI and the user hands it over. The only things never included are credentials: environment variables whose names look like secrets are hidden, and no cookie, token or `.env` content is read. The console and `events-*.txt` logs stay redacted.
+document counts / sizes / name *shapes*), how the attachment chips looked just before Send (every case), errors, holds and
+abnormal states (every case without a clean verdict, every CSV row that needs you, every warning / retry / fix-up, tracebacks),
+the full event timeline, the last console lines, the Copilot Edge's messages written during this run, and (pipeline runs) every
+CSV row of the whole workload. It keeps the real paths, instruction IDs and folders, file names, chip labels and full error
+tracebacks, so it stays on the VDI and the user hands it over. Left out on purpose: the environment-variable list, user /
+computer / domain names, and everything after `?` in web addresses (sign-in codes live there; the parameter names stay).
+No cookie, token or `.env` content is ever read. The console and `events-*.txt` logs stay redacted. Beside it:
+`copilot-responses-<time>.md` and (pipeline runs) `pipeline-report-<run>.md` + `captures\<run>\` - see "Files for the
+reviewing Copilot" above.

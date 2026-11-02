@@ -16,10 +16,10 @@ env, no system-drive writes), and the sign-in check / go / stop signals of share
 """
 from __future__ import annotations
 
-import argparse, asyncio, hashlib, html, json, os, re, shutil, sys, time, traceback
+import argparse, asyncio, collections, hashlib, html, json, os, re, shutil, sys, time, traceback
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 # Always import supporting modules from this script's own folder (embedded Python does not add it).
 # Never .resolve(): it turns a mapped drive (S:) into its UNC form.
@@ -66,6 +66,9 @@ BRAND_TEXT = ""       # regex of the brand control's text (back to My Inbox)
 BRAND_HTML = ""       # regex of its logo markup
 DEFAULT_ID = "00000000000000000000000000000000"
 WORK_ROOT = Path(".")  # CASES_ROOT\.work - set by configure()
+GUIDANCE_DIR = ""      # one <Sub Worktype>.md per type: no file = the case is held before anything is downloaded
+CONTRACT = ""          # the result contract (never taken for a Sub Worktype's instructions)
+CAPTURES = None        # RUNTIME_ROOT\logs\captures\<run>: screenshot + page copy when a case or a document fails
 BAD = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 POLL = 0.025
 
@@ -75,7 +78,7 @@ class CaseHeld(Exception):
 
 
 def configure(cfg):
-    global ENTRY, ORIGIN, APP_BASE, VIEWER_MARKER, BRAND_TEXT, BRAND_HTML, WORK_ROOT
+    global ENTRY, ORIGIN, APP_BASE, VIEWER_MARKER, BRAND_TEXT, BRAND_HTML, WORK_ROOT, GUIDANCE_DIR, CONTRACT
     ENTRY = cfg.system1_url
     u = urlparse(ENTRY)
     ORIGIN = f"{u.scheme}://{u.netloc}"
@@ -83,6 +86,41 @@ def configure(cfg):
     VIEWER_MARKER = getattr(cfg, "system1_viewer_marker", "") or ""
     BRAND_TEXT, BRAND_HTML = cfg.system1_brand_text or "(?!)", cfg.system1_brand_html or "(?!)"   # (?!) never matches
     WORK_ROOT = Path(cfg.cases_root) / P.WORK_DIR
+    GUIDANCE_DIR, CONTRACT = getattr(cfg, "guidance_dir", "") or "", getattr(cfg, "result_contract_path", "") or ""
+
+
+def guidance_problem(sub_system1, sub_csv):
+    """Why this case cannot be reviewed before anything is downloaded ('' = it can): no instructions file for its
+    Sub Worktype (System 1's value wins over the CSV's, as in the hand-over)."""
+    chosen,_=choose_sub_worktype(sub_system1,sub_csv)
+    if GUIDANCE_DIR and P.guidance_for(chosen,GUIDANCE_DIR,exclude=[CONTRACT]) is None:
+        return f"no instructions file for Sub Worktype '{chosen}' in the guidance folder - documents not downloaded"
+    return ''
+
+
+async def capture_page(page, label):
+    """For the reviewing Copilot, when something fails: a screenshot, the visible text and the page file of `page`
+    into CAPTURES (web addresses cut before '?').  Returns the file names; never raises."""
+    if CAPTURES is None or page is None:
+        return []
+    names=[]
+    try:
+        CAPTURES.mkdir(parents=True,exist_ok=True)
+        base=safe(label,'capture',max_length=90)
+        try:
+            await visual_screenshot(page,path=str(CAPTURES/f'{base}.png'),full_page=False,animations='disabled',caret='hide',timeout=10000)
+            names.append(f'{base}.png')
+        except Exception:
+            pass
+        title=await asyncio.wait_for(page.title(),5)
+        text=await asyncio.wait_for(page.evaluate("()=>document.body?document.body.innerText:''"),5)
+        (CAPTURES/f'{base}.txt').write_text(f'address: {P.strip_query(page.url)}\ntitle: {title}\n\n'+P.strip_queries(text)[:200000],encoding='utf-8')
+        names.append(f'{base}.txt')
+        (CAPTURES/f'{base}.html').write_text(P.strip_queries(await asyncio.wait_for(page.content(),10))[:3000000],encoding='utf-8')
+        names.append(f'{base}.html')
+    except Exception:
+        pass
+    return names
 
 
 def on_system1(page) -> bool:
@@ -281,11 +319,12 @@ async def detect_open_section(page):
       return '';
     }""")
 
-async def search_open(context,page,instruction_id,events):
+async def search_open(context,page,instruction_id,events,check_sub=None):
     """
     Submit the new instruction ID, wait a fixed 1.5 seconds for My Inbox to
     replace the previous filtered result, then click the only visible View.
-    No result-ID matching or other pre-click validation is performed.
+    No result-ID matching is performed.  `check_sub(sub)` may hold the case
+    (CaseHeld) on the result row's Sub WorkType BEFORE View is clicked.
     """
     page=await ensure_clean_inbox_search(page,timeout=60)
     field=page.locator('[data-bulk-search="1"]')
@@ -317,12 +356,19 @@ async def search_open(context,page,instruction_id,events):
       return {count:1,subWorkType:sub};
     }""")
     if result.get('count')!=1:
+        event(events,'search-result-not-single',views=result.get('count'),waitSeconds=1.5)
         raise RuntimeError(
-            f"Expected exactly one visible View 1.5 seconds after searching; found {result.get('count')}"
+            f"the ID search in My Inbox showed {result.get('count')} View button(s) 1.5 seconds after searching "
+            "(exactly one expected) - is the case in My Inbox? (Expected exactly one visible View; "
+            f"found {result.get('count')})"
         )
 
     sub=result.get('subWorkType') or 'Unknown Sub WorkType'
     event(events,'single-view-found-after-fixed-wait',subWorkType=sub,waitSeconds=1.5)
+    reason=check_sub(sub) if check_sub else ''
+    if reason:
+        event(events,'held-before-opening',reason=reason)
+        raise CaseHeld(reason)
     await page.eval_on_selector('[data-s4view="1"]','async e=>{ try{await window.__studio_visual_cursor_v1__?.previewElement(e)}catch{};e.click(); }')
 
     # Only wait for the instruction page to render. Identity validation remains
@@ -477,7 +523,9 @@ async def save_download(download, folder, preferred=None):
 
 async def document_rows(page):
     """Resolve Received Documents rows even when View is an icon-only span.  Viewer links are found by the private
-    `system1_viewer_marker` (none = every document goes through the UI route)."""
+    `system1_viewer_marker` (none = every document goes through the UI route).  A link belongs to the row whose
+    document ID it contains ('id'); only when no link names an ID and there are exactly as many links as rows are
+    they paired in page order ('position'); otherwise the row has no link ('none') and goes through the UI route."""
     return await page.evaluate(r"""(marker) => {
       const clean=v=>(v??'').toString().replace(/\s+/g,' ').trim();
       const rows=[...document.querySelectorAll('table.awInfoTable_table tbody tr, .awInfoTableGroup--body > .awInfoTableRow')];
@@ -500,9 +548,18 @@ async def document_rows(page):
       }
       const html=document.documentElement.outerHTML;
       const esc=s=>s.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
-      const urls=!marker?[]:[...html.matchAll(new RegExp('(?:&quot;|")url(?:&quot;|")\\s*:\\s*(?:&quot;|")([^"<]*'+esc(marker)+'[^"<]+)(?:&quot;|")','g'))]
-        .map(m=>m[1].replace(/&amp;/g,'&'));
-      out.forEach((x,i)=>{if(urls[i])x.viewerUrl=urls[i]});
+      const urls=!marker?[]:[...new Set([...html.matchAll(new RegExp('(?:&quot;|")url(?:&quot;|")\\s*:\\s*(?:&quot;|")([^"<]*'+esc(marker)+'[^"<]+)(?:&quot;|")','g'))]
+        .map(m=>m[1].replace(/&amp;/g,'&')))];
+      const plain=u=>{try{return decodeURIComponent(u).toLowerCase()}catch{return u.toLowerCase()}};
+      const owner=x=>x.documentId?urls.filter(u=>plain(u).includes(x.documentId.toLowerCase())):[];
+      const byId=out.some(x=>owner(x).length);
+      out.forEach((x,i)=>{
+        x.viewerUrlsOnPage=urls.length;
+        const own=owner(x);
+        if(own.length===1){x.viewerUrl=own[0];x.pairing='id'}
+        else if(!byId&&urls.length===out.length){x.viewerUrl=urls[i];x.pairing='position'}
+        else x.pairing=own.length>1?'several links name this ID':'none';
+      });
       return out;
     }""", VIEWER_MARKER)
 
@@ -538,99 +595,172 @@ async def save_document_forensics(page, folder, label, extra=None):
     (folder/f'{safe(label)}_{stamp}.html').write_text(data['html'],encoding='utf-8')
     await visual_screenshot(page,path=str(folder/f'{safe(label)}_{stamp}.png'),full_page=True,animations='disabled',caret='hide')
 
-async def direct_response_to_file(context, url, folder, preferred):
-    if not url or url in ('about:blank',''): return None
-    response=await context.request.get(url,timeout=15000)
-    if not response.ok:return None
-    content_type=response.headers.get('content-type','').lower()
-    # Never mistake the HTML viewer itself for the document.
-    if 'text/html' in content_type:return None
-    suffix=Path(urlparse(url).path).suffix
-    if not Path(preferred).suffix:
-        preferred += suffix or ('.pdf' if 'pdf' in content_type else '.bin')
-    target=unique(folder,preferred);target.write_bytes(await response.body());return target
+FILE_KINDS=((b'%PDF','pdf','.pdf'),(b'PK\x03\x04','office/zip','.zip'),(b'\x89PNG','png','.png'),(b'\xff\xd8\xff','jpg','.jpg'),
+            (b'GIF8','gif','.gif'),(b'II*\x00','tif','.tif'),(b'MM\x00*','tif','.tif'),(b'\xd0\xcf\x11\xe0','office/ole','.doc'),
+            (b'{\\rtf','rtf','.rtf'),(b'BM','bmp','.bmp'))
+FILE_URL_ATTRS=re.compile(r'<(?:iframe|embed|object|a|img|video|source)\b[^>]*?\b(?:src|data|href)\s*=\s*["\']([^"\']+)["\']',re.I)
 
 
-async def download_from_document_popup(context, popup, folder, preferred, events):
-    """A Received Documents View opens a viewer popup. Download from inside that popup."""
+def looks_like(body, content_type):
+    """What a response body is: 'html' (a viewer page, never saved as the document), a known file kind, or 'other'."""
+    head=bytes(body[:512])
+    for magic,kind,_ in FILE_KINDS:
+        if head.startswith(magic):return kind
+    low=head.lstrip().lower()
+    if 'text/html' in (content_type or '') or low.startswith(b'<!doctype html') or b'<html' in low:return 'html'
+    return 'other'
+
+
+def file_name(preferred, disposition, kind, url):
+    """The saved name: the row's document name; when it has no extension, the server's file name or the content kind."""
+    if Path(preferred).suffix:return preferred
+    m=re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)',disposition or '',re.I)
+    suffix=Path(unquote(m.group(1))).suffix if m else ''
+    suffix=suffix or Path(urlparse(url).path).suffix or next((x for _,k,x in FILE_KINDS if k==kind),'.bin')
+    return preferred+suffix
+
+
+async def fetch_file(context, url, folder, preferred, tries):
+    """GET `url` with the System 1 sign-in.  A real file is saved (path returned); a viewer page or an error is not
+    (None).  Every request is recorded in `tries` for the run report: status, type, size, what the body looks like."""
+    if not url or url in ('about:blank',''):return None,b''
+    url=ORIGIN+url if url.startswith('/') else url
+    rec={'address':P.strip_query(url)}
+    tries.append(rec)
     try:
-        await popup.wait_for_load_state('domcontentloaded',timeout=12000)
-    except Exception:
-        try: await popup.wait_for_load_state('commit',timeout=5000)
-        except Exception: pass
+        response=await context.request.get(url,timeout=20000)
+        body=await response.body()
+    except Exception as exc:
+        rec['error']=f'{type(exc).__name__}: {exc}'[:300]
+        return None,b''
+    ctype=response.headers.get('content-type','').lower();disp=response.headers.get('content-disposition','')
+    kind=looks_like(body,ctype)
+    rec.update(http=response.status,contentType=ctype[:80],disposition=disp[:160],bytes=len(body),looksLike=kind)
+    if not response.ok or kind=='html' or not body:
+        return None,body
+    target=unique(folder,file_name(preferred,disp,kind,url))
+    target.write_bytes(body)
+    rec['saved']=target.name
+    return target,body
 
-    end=time.monotonic()+15
-    last_controls=[]
-    while time.monotonic()<end:
-        try:
-            last_controls=await popup.evaluate(r"""()=>{const c=v=>(v??'').toString().replace(/\s+/g,' ').trim(),v=e=>{const s=getComputedStyle(e),r=e.getBoundingClientRect();return !!(r.width||r.height)&&s.display!='none'&&s.visibility!='hidden'};return[...document.querySelectorAll('button,a,[role=button],input[type=button],input[type=submit]')].filter(v).map((e,index)=>({index,text:c(e.innerText||e.value||e.textContent),title:e.title||'',aria:e.getAttribute('aria-label')||'',href:e.href||'',id:e.id||'',testId:e.getAttribute('data-appway-test-id')||'',html:e.outerHTML.slice(0,1200)}))}""")
-            if last_controls:break
-        except Exception:pass
-        await asyncio.sleep(.05)
 
-    # Prefer an explicit Download control, including icon-only buttons whose metadata says download.
-    candidates=[]
-    for control in last_controls:
-        descriptor=' '.join(str(control.get(k,'')) for k in ('text','title','aria','id','testId','html'))
-        if re.search(r'download|save',descriptor,re.I):candidates.append(control)
-    if not candidates:
-        # Some viewers display the real PDF directly in the popup.
-        direct=await direct_response_to_file(context,popup.url,folder,preferred)
-        if direct:return direct,'downloaded-from-popup-response'
-        raise RuntimeError('Document viewer popup opened but no Download control was found')
+def embedded_file_urls(html_text, base):
+    """Addresses a viewer page shows its document from (iframe / embed / object / download link), System 1's host only."""
+    out=[]
+    for raw in FILE_URL_ATTRS.findall(html_text or ''):
+        u=urljoin(base,html.unescape(raw))
+        if u.startswith(ORIGIN) and u!=base and u not in out and not re.search(r'\.(?:js|css|ico|svg|woff2?)(?:\?|$)',u,re.I):
+            out.append(u)
+    return out[:6]
 
-    for candidate in candidates:
-        marked=await popup.evaluate("""d=>{document.querySelectorAll('[data-s4-popup-download]').forEach(e=>e.removeAttribute('data-s4-popup-download'));const all=[...document.querySelectorAll('button,a,[role=button],input[type=button],input[type=submit]')];let e=(d.id&&document.getElementById(d.id))||(d.testId&&all.find(x=>x.getAttribute('data-appway-test-id')===d.testId))||(d.href&&all.find(x=>x.href===d.href))||all[d.index];if(!e)return false;e.setAttribute('data-s4-popup-download','1');return true}""",candidate)
-        if not marked:continue
-        existing=set(context.pages)
-        try:
-            async with popup.expect_download(timeout=10000) as info:
-                await visual_click(popup.locator('[data-s4-popup-download="1"]'),timeout=5000)
-            saved=await save_download(await info.value,folder,preferred)
-            return saved,'downloaded-from-document-popup'
-        except Exception:
-            await asyncio.sleep(.3)
-        # Download control can open a second popup instead of emitting a Playwright download.
-        nested=[p for p in context.pages if p not in existing and not p.is_closed()]
-        for child in nested:
-            try:
-                await child.wait_for_load_state('commit',timeout=5000)
-                saved=await direct_response_to_file(context,child.url,folder,preferred)
-                if saved:
-                    await child.close();return saved,'downloaded-from-nested-popup'
-            except Exception:pass
-    raise RuntimeError('Download control was clicked in the document popup but no file was captured')
+
+async def direct_response_to_file(context, url, folder, preferred):
+    """(Audit Trail) the file behind `url`, or None."""
+    saved,_=await fetch_file(context,url,folder,preferred,[])
+    return saved
 
 
 async def fast_direct_document(context, item, folder, semaphore):
-    """Download one document through its authenticated viewer URL."""
+    """Download one document through its viewer address, with the System 1 sign-in - nothing is clicked.  When that
+    address answers with a viewer page instead of the file, the file the page shows (iframe / embed / download link)
+    is fetched instead.  Every request is recorded in item['attempts']."""
     async with semaphore:
+        tries=item.setdefault('attempts',[])
         viewer=item.get('viewerUrl','')
         if not viewer:
-            return None,'no viewer URL'
-        if viewer.startswith('/'):
-            viewer=ORIGIN+viewer
-        preferred=item.get('documentName') or f"document_{item.get('index',0)+1}.pdf"
+            return None,f"no viewer address for this row (pairing: {item.get('pairing','none')})"
+        preferred=item.get('documentName') or f"document_{item.get('index',0)+1}"
+        saved,body=await fetch_file(context,viewer,folder,preferred,tries)
+        if saved:
+            return saved,'direct-viewer-download'
+        last=tries[-1] if tries else {}
+        if last.get('looksLike')=='html':
+            base=ORIGIN+viewer if viewer.startswith('/') else viewer
+            for u in embedded_file_urls(body.decode('utf-8','replace'),base):
+                saved,_=await fetch_file(context,u,folder,preferred,tries)
+                if saved:
+                    return saved,'direct-file-inside-viewer-page'
+            if CAPTURES is not None:              # the viewer page itself, for the report
+                try:
+                    CAPTURES.mkdir(parents=True,exist_ok=True)
+                    name=safe(f"viewer-page-{item.get('documentId') or item.get('index',0)+1}",max_length=90)+'.html'
+                    (CAPTURES/name).write_text(P.strip_queries(body.decode('utf-8','replace'))[:3000000],encoding='utf-8')
+                    item['viewerPageCopy']=name
+                except Exception:
+                    pass
+            return None,'the viewer address answered with a page, and no file was found inside it'
+        if 'error' in last:
+            return None,'direct request failed: '+last['error']
+        return None,f"the viewer address answered HTTP {last.get('http')} ({last.get('looksLike')}, {last.get('bytes')} bytes)"
+
+
+# The pop-up's OWN toolbar button: a real button (never a link inside the document) named exactly Download / Save.
+TOOLBAR_DOWNLOAD_JS=r"""()=>{
+  const clean=v=>(v??'').toString().replace(/\s+/g,' ').trim();
+  const visible=e=>{const s=getComputedStyle(e),r=e.getBoundingClientRect();return !!(r.width||r.height)&&s.display!=='none'&&s.visibility!=='hidden'};
+  document.querySelectorAll('[data-s4-toolbar-download]').forEach(e=>e.removeAttribute('data-s4-toolbar-download'));
+  const named=e=>[e.getAttribute('aria-label'),e.title,e.innerText||e.value||e.textContent].map(clean).find(Boolean)||'';
+  const all=[...document.querySelectorAll('button,[role=button],input[type=button],input[type=submit]')]
+    .filter(e=>visible(e)&&!e.closest('a[href]')&&/^(download|save)( (file|document|a copy))?$/i.test(named(e)));
+  if(!all.length)return {found:false,controls:[...document.querySelectorAll('button,[role=button],a[href]')].filter(visible).slice(0,40)
+    .map(e=>({tag:e.tagName.toLowerCase(),name:named(e).slice(0,80)}))};
+  all[0].setAttribute('data-s4-toolbar-download','1');return {found:true,name:named(all[0])};
+}"""
+
+
+async def read_document_popup(context, popup, folder, preferred, tries, downloads):
+    """The document window a View click opened.  Strict, in this order, and NOTHING inside the document is clicked:
+      1. the file at the window's own address (Edge's PDF viewer shows the PDF's address);
+      2. the file the window's page shows (embed / iframe / object / image), read from the page;
+      3. a download the window started by itself (Word, Excel ...);
+      4. ONE click on the window's own toolbar Download button, if it has one.
+    `downloads` collects downloads the window starts.  Returns (path or None, how / why not)."""
+    end=time.monotonic()+15
+    while popup.url in ('','about:blank') and time.monotonic()<end and not downloads:
+        await asyncio.sleep(.1)
+    try:
+        await popup.wait_for_load_state('domcontentloaded',timeout=10000)
+    except Exception:
+        pass
+    if downloads:
+        return await save_download(downloads[0],folder,preferred),'download-started-by-document-window'
+    saved,_=await fetch_file(context,popup.url,folder,preferred,tries)
+    if saved:
+        return saved,'file-at-document-window-address'
+    try:
+        shown=await popup.evaluate("()=>[...document.querySelectorAll('embed[src],iframe[src],object[data],img[src],video[src],source[src]')].map(e=>e.src||e.data).filter(Boolean)")
+    except Exception:
+        shown=[]
+    shown+=[f.url for f in popup.frames[1:] if f.url]
+    for u in dict.fromkeys(x for x in shown if x.startswith('http')):
+        saved,_=await fetch_file(context,u,folder,preferred,tries)
+        if saved:
+            return saved,'file-shown-in-document-window'
+    t=time.monotonic()+3
+    while not downloads and time.monotonic()<t:
+        await asyncio.sleep(.1)
+    if downloads:
+        return await save_download(downloads[0],folder,preferred),'download-started-by-document-window'
+    try:
+        button=await popup.evaluate(TOOLBAR_DOWNLOAD_JS)
+    except Exception as exc:
+        button={'found':False,'error':type(exc).__name__}
+    tries.append({'documentWindowToolbar':button})
+    if button.get('found'):
         try:
-            response=await context.request.get(viewer,timeout=20000)
-            if not response.ok:
-                return None,f'viewer HTTP {response.status}'
-            content_type=response.headers.get('content-type','').lower()
-            body=await response.body()
-            head=body[:500].lstrip().lower()
-            if 'text/html' in content_type or head.startswith(b'<!doctype html') or b'<html' in head:
-                return None,'viewer returned HTML'
-            if not Path(preferred).suffix:
-                preferred += '.pdf' if ('pdf' in content_type or body[:5]==b'%PDF-') else '.bin'
-            target=unique(folder,preferred)
-            target.write_bytes(body)
-            return target,'parallel-direct-viewer-download'
+            async with popup.expect_download(timeout=10000) as info:
+                await visual_click(popup.locator('[data-s4-toolbar-download="1"]'),timeout=5000)
+            return await save_download(await info.value,folder,preferred),'document-window-toolbar-download'
         except Exception as exc:
-            return None,f'direct viewer failed: {type(exc).__name__}: {exc}'
+            tries.append({'toolbarClick':f'{type(exc).__name__}: {exc}'[:300]})
+    return None,'the document window opened, but neither its address, the file it shows nor its own Download button gave the file'
 
 
 async def ui_fallback_document(context, page, item, folder, events):
-    """Use the proven icon and popup method only if direct retrieval fails."""
+    """Only when the direct route failed: click this row's View ONCE.  A file that downloads straight away is saved;
+    a document window is read by read_document_popup (strict - never clicked around in).  Every window this step
+    opened is closed again, whatever happens."""
+    tries=item.setdefault('attempts',[])
     current=await document_rows(page)
     match=next((x for x in current if item.get('documentId') and x.get('documentId')==item.get('documentId')),None)
     if not match:
@@ -639,20 +769,32 @@ async def ui_fallback_document(context, page, item, folder, events):
         return None,'row not found during UI fallback'
     if not await mark_document_view(page,match):
         return None,'View icon not resolved during UI fallback'
-    preferred=match.get('documentName') or f"document_{match.get('index',0)+1}.pdf"
-    popup=None
+    preferred=match.get('documentName') or f"document_{match.get('index',0)+1}"
+    before=set(context.pages)
+    popups,downloads=[],[]
+    on_popup=lambda p:(popups.append(p),p.on('download',downloads.append))
+    page.on('popup',on_popup);page.on('download',downloads.append)
     try:
-        async with page.expect_popup(timeout=6000) as popup_info:
-            await visual_click(page.locator('[data-s4-document-view="1"]'),timeout=4000,force=True)
-        popup=await popup_info.value
-        return await download_from_document_popup(context,popup,folder,preferred,events)
+        await visual_click(page.locator('[data-s4-document-view="1"]'),timeout=4000,force=True)
+        end=time.monotonic()+8
+        while not popups and not downloads and time.monotonic()<end:
+            await asyncio.sleep(.1)
+        if downloads and not popups:
+            return await save_download(downloads[0],folder,preferred),'ui-view-downloaded-directly'
+        if not popups:
+            return None,'View was clicked, but neither a download nor a document window appeared within 8 s'
+        saved,how=await read_document_popup(context,popups[0],folder,preferred,tries,downloads)
+        if not saved:
+            item['captures']=await capture_page(popups[0],f"document-window-{item.get('documentId') or item.get('index',0)+1}")
+        return saved,how
     except Exception as exc:
         return None,f'UI fallback failed: {type(exc).__name__}: {exc}'
     finally:
-        if popup:
+        page.remove_listener('popup',on_popup);page.remove_listener('download',downloads.append)
+        for p in [*popups,*(p for p in context.pages if p not in before)]:
             try:
-                if not popup.is_closed(): await popup.close()
-            except Exception: pass
+                if p is not page and not p.is_closed():await p.close()
+            except Exception:pass
 
 
 async def download_documents(context, page, folder, events):
@@ -665,42 +807,38 @@ async def download_documents(context, page, folder, events):
             raise RuntimeError('Received Documents table exists but no document rows were resolved; diagnostics saved')
         return []
 
-    event(events,'document-rows-resolved',count=len(discovered),documents=[
-        {'name':x.get('documentName',''),'id':x.get('documentId',''),'viewerUrl':x.get('viewerUrl','')}
-        for x in discovered])
+    event(events,'document-rows-resolved',count=len(discovered),
+          viewerAddressesOnPage=discovered[0].get('viewerUrlsOnPage',0),documents=[
+        {'name':x.get('documentName',''),'id':x.get('documentId',''),'pairing':x.get('pairing',''),
+         'viewerAddress':P.strip_query(x.get('viewerUrl',''))} for x in discovered])
 
     semaphore=asyncio.Semaphore(8)
-    direct_results=await asyncio.gather(*[
+    results=list(await asyncio.gather(*[
         fast_direct_document(context,item,folder,semaphore) for item in discovered
-    ])
-
-    results=list(direct_results)
-    fallback_indexes=[]
-    for index,(saved,status) in enumerate(results):
-        if saved:
-            event(events,'document-downloaded',file=saved.name,
-                  documentId=discovered[index].get('documentId',''),method='parallel-direct')
-        else:
-            fallback_indexes.append(index)
-
+    ]))
+    direct_failed={i:status for i,(saved,status) in enumerate(results) if not saved}
+    fallback_indexes=list(direct_failed)
     if fallback_indexes:
         event(events,'document-ui-fallback-started',count=len(fallback_indexes))
         for index in fallback_indexes:
             item=discovered[index]
             saved,status=await ui_fallback_document(context,page,item,folder,events)
             results[index]=(saved,status)
-            if saved:
-                event(events,'document-downloaded',file=saved.name,
-                      documentId=item.get('documentId',''),method='ui-popup-fallback')
 
     rows=[]
-    for item,(saved,status) in zip(discovered,results):
+    for index,(item,(saved,status)) in enumerate(zip(discovered,results)):
+        event(events,'document-result',file=saved.name if saved else '',name=item.get('documentName',''),
+              documentId=item.get('documentId',''),method=status if saved else '',
+              directRoute=direct_failed.get(index,'ok'),failure='' if saved else status,
+              attempts=item.get('attempts',[]),captures=item.get('captures',[]),viewerPageCopy=item.get('viewerPageCopy',''))
         rows.append({'source_text':'View','row_text':item.get('rowText',''),
-                     'saved_file':saved.name if saved else '','status':status})
+                     'saved_file':saved.name if saved else '','status':status,'name':item.get('documentName','')})
     failures=[row for row in rows if not row['saved_file']]
     if failures:
-        raise RuntimeError(f"Downloaded {len(rows)-len(failures)} of {len(rows)} Received Documents; failures: "+json.dumps(failures,ensure_ascii=False))
-    event(events,'all-received-documents-downloaded',count=len(rows),parallelism=8)
+        raise RuntimeError(f"Downloaded {len(rows)-len(failures)} of {len(rows)} Received Documents; not downloaded: "
+                           +"; ".join(f"{r['name'] or '(no name)'} ({r['status']})" for r in failures))
+    event(events,'all-received-documents-downloaded',count=len(rows),parallelism=8,
+          methods=dict(collections.Counter(r['status'] for r in rows)))
     return rows
 
 async def click_resolved(context, page, item, folder, attr, preferred):
@@ -836,12 +974,13 @@ class StopRun(Exception):
 
 async def process_instruction_once(context,page,case,batch_index,batch_total,attempt,control=None):
     iid=case['iid']
-    events=[];rows=[];meta={};sub=P.UNKNOWN_SUB;download_path=None;failure=None
+    events=[];rows=[];meta={};sub=P.UNKNOWN_SUB;download_path=None;failure=None;captures=[]
     started=time.monotonic()
     print(f'[{batch_index}/{batch_total}] {iid} - attempt {attempt}/2',flush=True)
     try:
         page=await wait_inbox(context,page)
-        page,sub,initial_section=await search_open(context,page,iid,events)
+        page,sub,initial_section=await search_open(context,page,iid,events,
+            check_sub=lambda s:guidance_problem(s,case.get('sub_worktype_csv','')))
 
         # Never trust identity text from Documents, History, Notes, or a stale prior case.
         # Force Overview and verify that its displayed Instruction ID is the exact ID requested
@@ -884,6 +1023,11 @@ async def process_instruction_once(context,page,case,batch_index,batch_total,att
         failure=str(exc) if isinstance(exc,CaseHeld) else f'{type(exc).__name__}: {exc}'
         event(events,'run-failed',error=failure)
         status='HELD' if isinstance(exc,CaseHeld) else 'STOPPED' if isinstance(exc,StopRun) else 'FAILED'
+        if status!='STOPPED':                      # what the System 1 tab showed at that moment, for the report
+            try:
+                captures=await capture_page(await live(context,page),f'{iid}-attempt{attempt}-{status.lower()}')
+            except Exception:
+                pass
         # Recover to My Inbox so one bad ID does not stop the remaining CSV rows.
         try:
             page=await return_to_my_inbox(context,page,events)
@@ -902,7 +1046,8 @@ async def process_instruction_once(context,page,case,batch_index,batch_total,att
         'audit':next((x['saved_file'] for x in rows if x.get('source_text')=='Audit Trail'),''),
         'files_downloaded':sum(bool(x.get('saved_file')) for x in rows),
         'download_path':str(download_path or ''),
-        'elapsed_seconds':round(time.monotonic()-started,2),'failure':failure or ''
+        'elapsed_seconds':round(time.monotonic()-started,2),'failure':failure or '',
+        'events':events,'captures':captures,
     }
     print(f'[{batch_index}/{batch_total}] attempt {attempt}/2 {status}: {iid}',flush=True)
     if status=='SUCCESS':
@@ -912,11 +1057,15 @@ async def process_instruction_once(context,page,case,batch_index,batch_total,att
     return page,result
 
 async def process_instruction(context,page,case,batch_index,batch_total,control=None):
-    """Run each instruction once, retrying exactly once only after failure (never after a hold or a stop)."""
+    """Run each instruction once, retrying exactly once only after failure (never after a hold or a stop).
+    result['tries'] keeps every attempt (its events and captures) for the report."""
+    tries=[]
     for attempt in (1,2):
         page,result=await process_instruction_once(
             context,page,case,batch_index,batch_total,attempt,control
         )
+        tries.append({k:result.get(k) for k in ('attempt','status','failure','elapsed_seconds','events','captures')})
+        result['tries']=tries
         if result['status'] in ('SUCCESS','HELD','STOPPED'):
             return page,result
         if control is not None and control.stopped():
@@ -982,7 +1131,20 @@ async def wait_for_go(context,control):
     return True
 
 
+def write_diagnostics(paths,case,result):
+    """What this part saw for one case (every attempt, every document request), for the coordinator's report."""
+    try:
+        P.write_json(paths.diagnostics('part1')/f"{case['iid']}.json",{
+            'iid':case['iid'],'csv_sub_worktype':case.get('sub_worktype_csv',''),'csv_account':case.get('account',''),
+            **{k:result.get(k) for k in ('status','failure','sub_worktype','account_number','folder','documents','audit',
+                                         'files_downloaded','elapsed_seconds')},
+            'tries':result.get('tries') or [],'written':P.now()})
+    except Exception:
+        pass                                       # diagnostics never decide anything
+
+
 async def run_pipeline(run_dir):
+    global CAPTURES
     import copilot_case_sender as sender            # Part 3's storage rules and fast Playwright start, reused as-is
     cfg=sender.load_config()
     policy,problems=sender.validate_config(cfg)
@@ -991,6 +1153,7 @@ async def run_pipeline(run_dir):
     sender.bootstrap_storage(cfg,policy)            # TEMP, caches, write guard: nothing on the system drive
     configure(cfg)
     paths=P.Paths(cfg.runtime_root,cfg.cases_root,run_dir)
+    CAPTURES=paths.captures
     control=P.Control(paths)
     todo=[c for c in P.read_plan(paths)['cases'] if c.get('needs')=='download']
     say=lambda text,level='minimal',iid='': control.event('part1',text,level,iid)
@@ -1031,6 +1194,7 @@ async def run_pipeline(run_dir):
                 (paths.downloads/f'{iid}.json').unlink(missing_ok=True)
                 say(f'{iid} downloading ({index}/{len(todo)})','detail',iid)
                 page,result=await process_instruction(context,page,case,index,len(todo),control)
+                write_diagnostics(paths,case,result)
                 if result['status']=='SUCCESS':
                     sub,warnings=choose_sub_worktype(result['sub_worktype'],case.get('sub_worktype_csv',''))
                     P.write_json(paths.downloads/f'{iid}.json',{

@@ -294,6 +294,20 @@ class FakeTab:
         self.users.append(text)
         self._reply()
 
+    async def page_state(self):                    # "no_box": once sent, the chat has no message box (a refusal blocked it)
+        self._alive()
+        box = not (self.b.get("no_box") and self.users)
+        btn = lambda n, **k: {"name": n, "disabled": False, "menu": "", "in_reply": True, "in_sidebar": False, **k}
+        return {"title": "Microsoft 365 Copilot", "url": "https://example.invalid/chat/conversation/" + self.target_id + "?auth=SECRET",
+                "users": len(self.users), "replies": len(self.replies), "composer": box,
+                "reply_buttons": [btn("Copy"), btn("More options", menu="menu")],
+                "notable_buttons": [btn("New chat", in_reply=False, in_sidebar=True)] + ([] if box else [btn("New chat")]),
+                "alerts": [], "page_text_end": self.replies[-1]["text"] if self.replies else ""}
+
+    async def more_menu(self):
+        self.w.events.append(("more-menu", self.target_id))
+        return [{"name": "Try again", "disabled": False, "submenu": False}, {"name": "Report", "disabled": False, "submenu": False}]
+
     async def evidence(self, needle):
         self._alive()
         flat = lambda t: "".join(c for c in t.lower() if c.isalnum())
@@ -606,8 +620,9 @@ def test_more_chips_than_files_still_fails_fast(env):
         run(r.wait_upload_ready(Tab(), types.SimpleNamespace(alias="c1", key="k"), exp))
 
 
-def test_run_report_is_unredacted_complete_and_hides_only_credential_looking_env_vars(env, monkeypatch):
+def test_run_report_keeps_real_case_values_but_no_environment_list_and_no_address_codes(env, monkeypatch):
     monkeypatch.setenv("MY_SERVICE_TOKEN", "hunter2-secret-value")
+    monkeypatch.setenv("COMPUTERNAME", "VDI-MACHINE-42")
     env.make_case(1, files=("secret_customer_file.pdf",))
     cases, _, _ = env.cases()
     r = env.runner()
@@ -629,8 +644,8 @@ def test_run_report_is_unredacted_complete_and_hides_only_credential_looking_env
                     "## 6. Attachment chips", "## 7. Errors", "## 8. Full event timeline", "## 9. Last console"):
         assert heading in text, heading
     assert "secret_customer_file.pdf" in text and str(env.cfg.cases_root) in text and "0123456789abcdef0123456789abcdef" in text
-    assert "hunter2-secret-value" not in text
-    assert "MY_SERVICE_TOKEN" in text
+    assert "hunter2-secret-value" not in text and "MY_SERVICE_TOKEN" not in text and "VDI-MACHINE-42" not in text
+    assert "0123456789abcdef?x=…" in text and "?x=1" not in text                 # the address stays, its code does not
     assert "boom at" in text
     assert "Traceback" in text
     assert "doc#1" in text and "RuntimeError" in text and "submitted" in text
@@ -1437,6 +1452,62 @@ def test_an_overdue_answer_is_flagged_never_resent_and_reported(env2):
     cases, r, results = run_json(env2, [{"gen_polls": 10 ** 6}], answer_overdue_minutes=0.0004)
     assert results[cases[0].key][0] == "response_timeout" and len(env2.world.sends) == 1
     assert any("answer overdue" in l for l in env2.out) and env2.journal.cases[cases[0].key]["state"] == "response_timeout"
+
+
+REFUSAL = "I'm sorry, but I can't help with this request because it involves sensitive personal information."
+
+
+def test_a_refusal_that_removes_the_message_box_is_recorded_never_clicked_and_never_resent(env2):
+    cases, r, results = run_json(env2, [{"answers": [REFUSAL], "no_box": True}])
+    tab = list(env2.world.tabs.values())[0]
+    assert results[cases[0].key][0] == "refused_chat_blocked" and not tab.followups and len(env2.world.sends) == 1
+    kinds = [t["kind"] for t in r.transcripts[cases[0].key]]
+    assert kinds == ["sent", "reply", "blocked"]
+    reply = r.transcripts[cases[0].key][1]
+    assert reply["looks_like_refusal"] and reply["page"]["composer"] is False and reply["page"]["more_menu"][0]["name"] == "Try again"
+    saved = json.loads((env2.rt.results / f"{cases[0].id}.json").read_text("utf-8"))
+    assert saved["status"] == "refused_chat_blocked" and saved["chat"].startswith("https://example.invalid/chat/conversation/")
+
+
+def test_a_refusal_is_resent_and_the_resend_is_confirmed(env2):
+    cases, r, results = run_json(env2, [{"answers": [REFUSAL, GOOD]}])
+    t = r.transcripts[cases[0].key]
+    assert results[cases[0].key][0] == "result_correct" and [x["kind"] for x in t] == ["sent", "reply", "fixup", "reply"]
+    assert t[1]["looks_like_refusal"] and t[2]["confirmed"] is True and t[3]["valid"]
+    assert env2.journal.cases[cases[0].key]["confirmed"] is True
+
+
+def test_a_chat_blocked_without_any_reply_is_detected_from_the_missing_message_box(env2, monkeypatch):
+    monkeypatch.setattr(S.Runner, "BLOCKED_SECONDS", 0.2)
+    monkeypatch.setattr(S.Runner, "LOOK_EVERY_SECONDS", 0)
+    cases, r, results = run_json(env2, [{"answers": [""], "no_box": True}])   # the refusal is no normal reply at all
+    assert results[cases[0].key][0] == "refused_chat_blocked" and len(env2.world.sends) == 1
+    kinds = [t["kind"] for t in r.transcripts[cases[0].key]]
+    assert kinds[0] == "sent" and "page" in kinds and kinds[-1] == "blocked"
+
+
+def test_the_responses_file_holds_every_reply_the_buttons_and_the_menu(env2):
+    cases, r, results = run_json(env2, [{"answers": [REFUSAL, GOOD]}])
+    path = env2.rt.logs / "copilot-responses-test.md"
+    ctx = types.SimpleNamespace(cfg=env2.cfg, rt=env2.rt)
+    assert S.write_responses(ctx, r, cases, path) == path.name
+    text = path.read_text("utf-8")
+    assert REFUSAL in text and "LOOKS LIKE A REFUSAL" in text and "arrived in the chat: yes" in text
+    assert "'...' menu: Try again, Report" in text and "reply's own buttons: Copy, More options [opens a menu]" in text
+    assert "SECRET" not in text and "instructions.md" in text and "result_correct" in text
+
+
+def test_odd_but_valid_verdicts_are_flagged_for_a_look():
+    assert S.odd_verdict("Inconclusive", 0, 0) == "CHECK: Inconclusive with no comparisons"
+    assert "4 difference(s)" in S.odd_verdict("Inconclusive", 7, 4)
+    assert S.odd_verdict("Incorrect", 5, 3) == "" and S.odd_verdict("Correct", 2, 0) == ""
+    assert S.looks_like_refusal(REFUSAL) and not S.looks_like_refusal('{"COPILOT_RESULT": "Correct"} sorry')
+
+
+def test_the_format_reminder_names_the_three_keys_and_overrides_other_formats():
+    for key in S.RESULT_KEYS + S.ROW_KEYS:
+        assert key in S.CONTRACT_REMINDER
+    assert "overrides any other answer format" in S.CONTRACT_REMINDER
 
 
 def test_a_slow_answer_is_waited_for_not_judged_early(env2):

@@ -37,6 +37,7 @@ requests=BeautifulSoup=Tag=HTTPAdapter=None
 PORT=9223; BASE=""; CHECK_URL=""; ACCOUNT_PAGE=""; PARTY_MARKER=""; LINKS_PAGE=""; ACCOUNT_COLUMN="Client Account Number"
 ACCOUNT_WORKERS=24; PARTY_WORKERS=40; CONNECTIONS=80
 TL=threading.local(); COOKIES=[]; UA="Mozilla/5.0"; COOKIE_GEN=0
+CAPTURES=None   # RUNTIME_ROOT\logs\captures\<run>: the page System 2 answered with when an account fails
 TITLE="Part 2 - System 2 snapshots"
 DENIED=re.compile(r"access\s+(is\s+)?denied|not\s+authori[sz]ed|forbidden|you\s+do\s+not\s+have\s+(the\s+)?(permission|access)",re.I)
 SIGNIN_URL=re.compile(r"login|logon|signin|sign-in|/sso/|oauth|saml",re.I)
@@ -107,8 +108,26 @@ def judge(r,s):
 def soup_get(url,params=None):
     GATE.check()
     r=session().get(url,params=params,timeout=(5,35),allow_redirects=True);r.encoding=r.apparent_encoding or "utf-8";s=BeautifulSoup(r.text,"html.parser")
-    judge(r,s)
+    try:
+        judge(r,s)
+    except Exception as e:
+        e.page=(r,s)                                # kept for capture(): what System 2 showed
+        raise
     return r,s
+def capture(label,exc):
+    """For the reviewing Copilot: the page System 2 answered with when `label` failed (addresses cut before '?')."""
+    page=getattr(exc,"page",None)
+    if CAPTURES is None or not page:return []
+    r,s=page;base=re.sub(r"[^A-Za-z0-9._-]+","_",f"system2-{label}")[:90]
+    try:
+        CAPTURES.mkdir(parents=True,exist_ok=True)
+        title=clean(s.title.get_text()) if s.title else ""
+        (CAPTURES/f"{base}.txt").write_text(f"HTTP {r.status_code}\naddress: {P.strip_query(r.url)}\ntitle: {title}\n"
+                                            f"error: {type(exc).__name__}: {exc}\n\n"+P.strip_queries(clean(s.get_text(" ",strip=True)))[:100000],encoding="utf-8")
+        (CAPTURES/f"{base}.html").write_text(P.strip_queries(r.text)[:3000000],encoding="utf-8")
+        return [f"{base}.txt",f"{base}.html"]
+    except Exception:
+        return []
 
 def payload(e):
     text=clean(e.get_text(" ",strip=True)); ta=e.find("textarea")
@@ -166,7 +185,12 @@ def party_descriptors(sections):
                 seen.add(u);q=parse_qs(urlparse(u).query);pid=(q.get("InterestedPartyid") or q.get("interestedpartyid") or [""])[0];out.append({"interestedPartyId":pid,"nameFromAccount":name,"url":u})
     return out
 def fetch_account(a,rows):
-    r,s=soup_get(ACCOUNT_PAGE.replace("{account}",quote(a,safe="")));sections=account_page(s);returned=sections["Account header"].get("Account Code",{}).get("value","").upper()
+    r,s=soup_get(ACCOUNT_PAGE.replace("{account}",quote(a,safe="")))
+    try:
+        sections=account_page(s)
+    except Exception as e:
+        e.page=(r,s);raise
+    returned=sections["Account header"].get("Account Code",{}).get("value","").upper()
     if returned and returned!=a:raise RuntimeError(f"Requested {a}, account-platform returned {returned}")
     matches=[{k:v for k,v in x.items() if not k.startswith("_")} for x in rows if x["_account"]==a]
     return {"metadata":{"requestedAccount":a,"retrievedUtc":datetime.now(timezone.utc).isoformat(),"sourceUrl":r.url,"httpStatus":r.status_code,"retrievalMethod":"parallel authenticated requests","pageTitle":clean(s.title.get_text()) if s.title else "","csvMatches":matches},"sections":sections,"_interestedPartyLinks":party_descriptors(sections)}
@@ -316,22 +340,30 @@ def check_system2():
         soup_get(CHECK_URL)
         return True,""
     except AccessDenied as exc:
-        return False,f"{exc} - check your access to System 2"
+        capture("sign-in-check",exc);return False,f"{exc} - check your access to System 2"
     except SessionExpired as exc:
-        return False,f"{exc} - sign in to System 2 in the systems Edge window"
+        capture("sign-in-check",exc);return False,f"{exc} - sign in to System 2 in the systems Edge window"
     except Exception as exc:
-        return False,f"System 2 could not be opened ({type(exc).__name__})"
+        capture("sign-in-check",exc);return False,f"System 2 could not be opened ({type(exc).__name__})"
+
+
+def snapshot_facts(path):
+    """When a snapshot file was made and how big it is (same-day reuse is decided by the day folder alone)."""
+    try:
+        st=path.stat();return {"file_time":datetime.fromtimestamp(st.st_mtime,timezone.utc).isoformat(timespec="seconds"),"bytes":st.st_size}
+    except OSError:
+        return {}
 
 
 def run_pipeline(run_dir):
-    global GATE,COOKIES,UA,COOKIE_GEN
+    global GATE,COOKIES,UA,COOKIE_GEN,CAPTURES
     import copilot_case_sender as sender            # Part 3's storage rules and DevTools helpers, reused as-is
     cfg=sender.load_config()
     policy,problems=sender.validate_config(cfg)
     if problems:raise RuntimeError("configuration problems: "+"; ".join(problems))
     sender.bootstrap_storage(cfg,policy)            # TEMP, caches, write guard: nothing on the system drive
     load_libs(); configure(cfg)
-    paths=P.Paths(cfg.runtime_root,cfg.cases_root,run_dir); control=P.Control(paths)
+    paths=P.Paths(cfg.runtime_root,cfg.cases_root,run_dir); control=P.Control(paths); CAPTURES=paths.captures
     say=lambda text,level="minimal": control.event("part2",text,level)
     plan=P.read_plan(paths); day=plan.get("day")    # the run's day, even if the run goes past midnight
     cases=[c for c in plan["cases"] if c.get("needs")=="download"]
@@ -351,6 +383,7 @@ def run_pipeline(run_dir):
     if len(todo)<len(accounts):
         say(f"{len(accounts)-len(todo)} account snapshot(s) already made today - reused")
     failed={}; written=0; started=time.perf_counter()
+    facts={a:{"state":"reused (made earlier today)",**snapshot_facts(paths.snapshot(a,day))} for a in accounts if a not in todo}
     try:
         if todo:
             COOKIES,UA=auth(sender); COOKIE_GEN+=1
@@ -372,6 +405,7 @@ def run_pipeline(run_dir):
                             pass
                         except Exception as e:
                             failed[a]=f"{type(e).__name__}: {e}"
+                            facts[a]={"state":"failed","error":failed[a],"captures":capture(a,e)}
                             say(f"account {a} FAILED after one retry: {type(e).__name__}")
                         if GATE.stopped():
                             for other in fs:other.cancel()
@@ -392,12 +426,18 @@ def run_pipeline(run_dir):
                         parties.append(pr.get(u,{"interestedPartyId":x.get("interestedPartyId",""),"nameFromAccount":x.get("nameFromAccount",""),"metadata":{"sourceUrl":u,"retrievalError":pe.get(u,"Unknown")}}));links.append(lr.get(lu,{"interestedPartyId":x.get("interestedPartyId",""),"nameFromAccount":x.get("nameFromAccount",""),"metadata":{"sourceUrl":lu,"retrievalError":le.get(lu,"Unknown")},"Customer Interested Parties":[],"Account Interested Parties":[]}))
                     try:
                         write_result(paths.snapshot(a,day),a,d,parties,links);written+=1
+                        facts[a]={"state":"saved this run","parties":len(parties),"party_pages_missing":missing,
+                                  **snapshot_facts(paths.snapshot(a,day))}
                         if missing:say(f"account {a}: snapshot saved, but {missing} party detail page(s) could not be read")
                     except Exception as e:
                         failed[a]=f"Output: {type(e).__name__}: {e}"
         say(f"finished: {written} snapshot(s) saved, {len(failed)} failed, in {time.perf_counter()-started:.0f}s")
     finally:
         P.write_json(paths.sub("status")/"part2-failed.json",failed)
+        try:
+            P.write_json(paths.diagnostics("part2")/"accounts.json",{"day":day,"accounts":facts,"denied":GATE.denied or "","written":P.now()})
+        except Exception:
+            pass
         control.finished("part2",saved=written,failed=len(failed),denied=GATE.denied or "")
     return 1 if failed or GATE.denied else 0
 

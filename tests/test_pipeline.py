@@ -261,6 +261,29 @@ def test_the_daily_report_has_one_line_per_csv_row(base):
     assert rows[0]["left_out_files"] == 3
     out = H.write_report(rows, base / "reports", "r1")
     assert out.read_text("utf-8-sig").splitlines()[0].startswith("row,instruction_id")
+    assert P.workload_line(rows) == "Reviewed 1 of 3 'Ended' case(s) (4 CSV row(s), 1 skipped); 2 need you"
+
+
+def test_the_pipeline_report_shows_what_system1_and_system2_saw(base):
+    paths, control = make_paths(base)
+    plan = plan_for(paths, (hexid(1), "AB100000"), (hexid(2), "AB200000"))
+    P.write_json(paths.diagnostics("part1") / f"{hexid(1)}.json", {
+        "iid": hexid(1), "status": "FAILED", "failure": "Downloaded 0 of 1", "sub_worktype": "Bank Details", "tries": [
+            {"attempt": 1, "status": "FAILED", "captures": [f"{hexid(1)}-attempt1-failed.png"], "events": [
+                {"at": "2026-11-02T12:00:00", "event": "document-result", "name": "a.pdf", "failure": "the document window opened",
+                 "directRoute": "the viewer address answered HTTP 403", "attempts": [{"address": "https://h/x?id=…", "http": 403}]}]}]})
+    P.write_json(paths.diagnostics("part2") / "accounts.json", {"accounts": {"AB100000": {"state": "reused (made earlier today)"}}})
+    control.event("part1", "case downloaded")
+    paths.captures.mkdir(parents=True)
+    (paths.captures / f"{hexid(1)}-attempt1-failed.png").write_bytes(b"png")
+    rows = H.daily_report(paths, plan, control)
+    out = H.pipeline_report(paths, plan, rows, None)
+    text = out.read_text("utf-8")
+    assert out.parent == paths.logs and out.name == f"pipeline-report-{paths.run.name}.md"
+    for part in ("Reviewed 0 of 2", "**FAILED**", "a.pdf: NOT DOWNLOADED - the document window opened",
+                 "direct route: the viewer address answered HTTP 403", '"http": 403', "reused (made earlier today)",
+                 "case downloaded", f"- {hexid(1)}-attempt1-failed.png", f"- {hexid(2)}: no record (not reached)"):
+        assert part in text, part
 
 
 # ---------------------------------------------------------------------------------------------- Part 3: the live feed
@@ -414,7 +437,10 @@ class P1Fakes:
         async def page_back(*a, **k):
             return "page"
 
-        async def search_open(context, page, iid, events):
+        async def search_open(context, page, iid, events, check_sub=None):
+            reason = check_sub(sub) if check_sub else ""
+            if reason:                                  # the real one holds BEFORE clicking View
+                raise mod.CaseHeld(reason)
             return page, sub, "Overview"
 
         async def verified(context, page, iid, events, timeout=45):
@@ -495,6 +521,112 @@ def test_part1_stops_between_documents_and_audit_trail_when_the_run_stops(base, 
     assert result["status"] == "STOPPED" and fakes.calls["audit"] == 0
 
 
+def test_part1_holds_a_case_without_guidance_before_anything_is_downloaded(base, monkeypatch):
+    paths, control = p1_setup(base)
+    g = base / "guidance"
+    g.mkdir()
+    (g / "Bank Details.md").write_text("x")
+    P1.configure(types.SimpleNamespace(system1_url="https://system1.example.invalid/app/inbox", system1_brand_text="Brand",
+                                       system1_brand_html="", cases_root=str(paths.cases_root), guidance_dir=str(g),
+                                       result_contract_path=""))
+    fakes = P1Fakes(P1, monkeypatch, sub="Unlisted Type")
+    case = {"iid": hexid(1), "account": "AB100000", "sub_worktype_csv": "Unlisted Type"}
+    _, result = T.run(P1.process_instruction(None, "page", case, 1, 1, control))
+    assert result["status"] == "HELD" and result["attempt"] == 1 and fakes.calls["audit"] == 0
+    assert "no instructions file for Sub Worktype 'Unlisted Type'" in result["failure"] and "not downloaded" in result["failure"]
+    assert not paths.work.exists() or not any(paths.work.iterdir())
+    fakes = P1Fakes(P1, monkeypatch, sub="Bank Details")                       # a type WITH guidance goes on as before
+    _, result = T.run(P1.process_instruction(None, "page", dict(case, sub_worktype_csv="x"), 1, 1, control))
+    assert result["status"] == "SUCCESS" and "events" in result["tries"][0]
+
+
+class Resp:
+    def __init__(self, body: bytes, status=200, ctype="application/pdf", disp=""):
+        self.status, self.ok, self._body = status, 200 <= status < 300, body
+        self.headers = {"content-type": ctype, **({"content-disposition": disp} if disp else {})}
+
+    async def body(self):
+        return self._body
+
+
+class Ctx:
+    """A browser context whose signed-in GET answers from a table (address -> Resp)."""
+    def __init__(self, table):
+        self.table, self.asked = table, []
+        ctx = self
+
+        class Request:
+            async def get(self, url, timeout=0):
+                ctx.asked.append(url)
+                return ctx.table.get(url) or Resp(b"not found", 404, "text/plain")
+        self.request = Request()
+
+
+def test_part1_direct_route_reads_the_file_inside_a_viewer_page_and_records_every_request(base):
+    paths, _ = p1_setup(base)
+    folder = base / "f"
+    folder.mkdir()
+    o = "https://system1.example.invalid"
+    ctx = Ctx({o + "/app/view?documentEntityId=1&token=SECRET": Resp(b"<!doctype html><iframe src='/files/1/content'></iframe>", ctype="text/html"),
+               o + "/files/1/content": Resp(b"PK\x03\x04 word", ctype="application/octet-stream",
+                                            disp='attachment; filename="Letter.docx"')})
+    item = {"documentName": "Letter", "viewerUrl": "/app/view?documentEntityId=1&token=SECRET", "pairing": "id"}
+    saved, how = T.run(P1.fast_direct_document(ctx, item, folder, asyncio.Semaphore(1)))
+    assert saved.name == "Letter.docx" and saved.read_bytes() == b"PK\x03\x04 word" and how == "direct-file-inside-viewer-page"
+    a = item["attempts"]
+    assert [x["looksLike"] for x in a] == ["html", "office/zip"] and a[0]["http"] == 200
+    assert "SECRET" not in json.dumps(a) and a[0]["address"].endswith("?documentEntityId=…&token=…")
+    item = {"documentName": "x.pdf", "viewerUrl": o + "/app/view?documentEntityId=2", "pairing": "position"}
+    saved, how = T.run(P1.fast_direct_document(ctx, item, folder, asyncio.Semaphore(1)))
+    assert saved is None and "HTTP 404" in how and item["attempts"][0]["http"] == 404
+    saved, how = T.run(P1.fast_direct_document(ctx, {"documentName": "y.pdf", "pairing": "none"}, folder, asyncio.Semaphore(1)))
+    assert saved is None and "no viewer address" in how and "pairing: none" in how
+
+
+class Popup:
+    """A document window: its address, what its page shows, and whether it has its own toolbar Download button."""
+    def __init__(self, url, shown=(), toolbar=False):
+        self.url, self.shown, self.toolbar, self.frames, self.clicked = url, list(shown), toolbar, [None], []
+
+    async def wait_for_load_state(self, *a, **k):
+        pass
+
+    async def evaluate(self, script, *a):
+        if script == P1.TOOLBAR_DOWNLOAD_JS:
+            return {"found": self.toolbar, "controls": [{"tag": "a", "name": "Terms (a link inside the document)"}]}
+        return list(self.shown)
+
+    def locator(self, sel):
+        self.clicked.append(sel)
+        raise AssertionError("nothing may be clicked in this test")
+
+
+def test_part1_document_window_is_read_without_clicking_inside_the_document(base):
+    paths, _ = p1_setup(base)
+    folder = base / "f"
+    folder.mkdir()
+    o = "https://system1.example.invalid"
+    ctx = Ctx({o + "/doc/7.pdf": Resp(b"%PDF-1.7"), o + "/blob/8": Resp(b"\x89PNG..", ctype="image/png")})
+    win = Popup(o + "/doc/7.pdf")                                           # Edge's PDF viewer: the window shows the PDF's address
+    saved, how = T.run(P1.read_document_popup(ctx, win, folder, "Form.pdf", [], []))
+    assert saved.name == "Form.pdf" and how == "file-at-document-window-address" and not win.clicked
+    win = Popup(o + "/viewer/8", shown=[o + "/blob/8"])                    # an image shown inside a viewer page
+    ctx.table[o + "/viewer/8"] = Resp(b"<html><a href='/elsewhere'>link</a></html>", ctype="text/html")
+    saved, how = T.run(P1.read_document_popup(ctx, win, folder, "scan", [], []))
+    assert saved.name == "scan.png" and how == "file-shown-in-document-window" and not win.clicked
+    win, tries = Popup(o + "/viewer/9"), []
+    ctx.table[o + "/viewer/9"] = Resp(b"<html>document with links</html>", ctype="text/html")
+    saved, how = T.run(P1.read_document_popup(ctx, win, folder, "z.pdf", tries, []))
+    assert saved is None and "neither its address" in how and not win.clicked   # no toolbar button: links are never tried
+    assert tries[-1]["documentWindowToolbar"]["found"] is False and o + "/elsewhere" not in ctx.asked
+
+
+def test_strip_query_keeps_parameter_names_only():
+    assert P.strip_query("https://h.example/a/b?code=SECRET&state=x#frag") == "https://h.example/a/b?code=…&state=…"
+    assert P.strip_query("https://h.example/a") == "https://h.example/a"
+    assert "SECRET" not in P.strip_queries("GET https://h.example/cb?token=SECRET failed (see https://h.example/x?y=SECRET2)")
+
+
 def test_system1_sub_worktype_wins_over_the_csv_and_the_difference_is_reported():
     assert P1.choose_sub_worktype("Bank Details", "bank details") == ("Bank Details", [])
     sub, warn = P1.choose_sub_worktype("Bank Details", "Change of Address")
@@ -558,6 +690,24 @@ def test_part2_tells_access_denied_from_an_expired_sign_in_from_a_normal_page(p2
         p2.judge(*page(p2, "<title>Sign in</title><body>Enter your password</body>", url="https://login.example.invalid/"))
     with pytest.raises(RuntimeError, match="HTTP 500"):
         p2.judge(*page(p2, "<body>Logout</body>", status=500))
+
+
+def test_part2_keeps_the_page_system2_answered_with_when_an_account_fails(p2, base, monkeypatch):
+    html = "<html><title>Access Denied</title><body>Request https://system2.example.invalid/cb?ticket=SECRET refused</body></html>"
+    r, s = page(p2, html, status=403, url="https://system2.example.invalid/account?id=AB1&sso=SECRET")
+    r.text, r.apparent_encoding = html, "utf-8"
+    monkeypatch.setattr(p2, "GATE", types.SimpleNamespace(check=lambda: None))
+    monkeypatch.setattr(p2, "session", lambda: types.SimpleNamespace(get=lambda *a, **k: r))
+    monkeypatch.setattr(p2, "BeautifulSoup", lambda text, parser: s)
+    with pytest.raises(p2.AccessDenied) as err:
+        p2.soup_get("https://system2.example.invalid/account?id=AB1")
+    monkeypatch.setattr(p2, "CAPTURES", base / "captures")
+    names = p2.capture("AB1", err.value)
+    assert names == ["system2-AB1.txt", "system2-AB1.html"]
+    text = (base / "captures" / "system2-AB1.txt").read_text("utf-8")
+    assert "HTTP 403" in text and "Access Denied" in text and "SECRET" not in text and "?id=…&sso=…" in text
+    assert "SECRET" not in (base / "captures" / "system2-AB1.html").read_text("utf-8")
+    assert p2.capture("AB2", RuntimeError("no page kept")) == []
 
 
 class FakeControl:
