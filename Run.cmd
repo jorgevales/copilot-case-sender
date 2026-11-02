@@ -1,10 +1,14 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
-title Copilot Case Sender
-rem Double-click to send the queue, or run:  Run.cmd setup | check | plan | run
-rem Keep this file and copilot_case_sender.py together in a folder on S:.
-rem The only thing asked here is where python.exe is (saved once in local_python.cmd, never committed).
-rem Everything else is asked by "setup" and saved in sender_config.json.
+title Daily review - System 1 + System 2 + Copilot
+rem Double-click = the daily review (Part 1 System 1 documents + Part 2 System 2 snapshots + Part 3 Copilot, together).
+rem   Run.cmd run         the daily review (same as double-click; asks for the daily CSV)
+rem   Run.cmd setup       paste/edit your paths, URLs and options (saved in sender_config.json)
+rem   Run.cmd check       validate everything without sending (add --browser to also test Edge)
+rem   Run.cmd plan        dry run of what is in CASES_ROOT now
+rem   Run.cmd send-only   Part 3 alone: send the case folders already in CASES_ROOT (general review guidance)
+rem Keep this folder together on S:.  The only thing asked here is where python.exe is (saved once in local_python.cmd,
+rem never committed).
 
 set "SENDER_PY="
 if exist "%~dp0local_python.cmd" call "%~dp0local_python.cmd"
@@ -28,7 +32,12 @@ if not exist "%SENDER_PY%" (echo That file was not found. & set "SENDER_PY=" & g
 rem Shown at once: loading Python and the script from S: takes a few seconds before the script can print anything.
 echo Starting...
 rem -B no bytecode files, -E ignore PYTHON* variables, -s no user site packages (embedded Python rules).
-"%SENDER_PY%" -B -E -s "%~dp0copilot_case_sender.py" %*
+set "TARGET=%~dp0orchestrator\run_pipeline.py"
+if /i "%~1"=="setup" set "TARGET=%~dp03_copilot_sender\copilot_case_sender.py"
+if /i "%~1"=="check" set "TARGET=%~dp03_copilot_sender\copilot_case_sender.py"
+if /i "%~1"=="plan" set "TARGET=%~dp03_copilot_sender\copilot_case_sender.py"
+if /i "%~1"=="send-only" set "TARGET=%~dp03_copilot_sender\copilot_case_sender.py"
+"%SENDER_PY%" -B -E -s "%TARGET%" %*
 set "SENDER_EXIT=%ERRORLEVEL%"
 echo.
 if "%SENDER_EXIT%"=="0" (echo Finished.) else (echo Ended with code %SENDER_EXIT% - read the message above.)

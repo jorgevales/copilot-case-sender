@@ -1,12 +1,18 @@
-# Copilot Case Sender
+# Daily statics review — System 1 documents + System 2 snapshots + Copilot
 
-Sends instruction-ID case folders to Microsoft 365 Copilot through your installed Microsoft Edge: **one fresh
-conversation per case**, the case's documents plus one shared **review guidance** file (`review_guidance.md`) attached, your `base_message`
-typed into the composer, **sent once**, outcome saved before the next case starts.
+Three parts work **at the same time**, so Copilot can review case 1 while System 1 is still downloading case 2:
 
-Everything is in `copilot_case_sender.py` (read top to bottom, sections are numbered). `Run.cmd` launches it.
-Tests live in `tests/`. All paths below are **symbolic labels** (`CASES_ROOT`, `RUNTIME_ROOT`, …) – the real
-ones are typed once during setup and stay in your local, git-ignored `sender_config.json`.
+| Folder | Part | What it does | Where it works |
+|---|---|---|---|
+| `1_system1_documents/` | **Part 1** | Per case: every Received Document + the Audit Trail from System 1 | the ONE System 1 tab of the **systems Edge** (port 9223) |
+| `2_system2_snapshots/` | **Part 2** | All account snapshots from System 2, in bulk (usually done before case 1) | signed-in requests with the systems Edge's cookies (no tab) |
+| `3_copilot_sender/` | **Part 3** | Sends each complete case to Copilot, one fresh chat, sent once, answer read back | the **Copilot Edge** (port 9333) |
+| `orchestrator/` | Coordinator | Asks for the CSV, starts everything, hands complete cases over, writes the daily report | no browser |
+| `shared/pipeline.py` | Contract | The small files the parts use to work together (read its header) | — |
+| `guidance/` | Instructions | `result_contract.md` + one `<Sub Worktype>.md` per type (your real ones live in `guidance_dir`) | — |
+
+All paths below are **symbolic labels** (`CASES_ROOT`, `RUNTIME_ROOT`, …): the real ones are typed once in setup and
+stay in your local, git-ignored `sender_config.json`.
 
 > **Do not do** (each one brings back an ~80 s startup delay or breaks a storage rule; see
 > [Startup on the network drive](#startup-on-the-network-drive)):
@@ -19,19 +25,91 @@ ones are typed once during setup and stay in your local, git-ignored `sender_con
 
 ## Quick start (Windows, no admin rights)
 
-1. Put `Run.cmd` and `copilot_case_sender.py` together in a folder on `S:`.
-2. Double-click `Run.cmd`. It asks once for `PYTHON_EXECUTABLE` (paste the path, quotes are fine; it also looks
-   for a `python\python.exe` beside it) and then starts `setup`.
-3. `setup` asks you to paste: `CASES_ROOT`, the **Review guidance** `.md` file, the `base_message` file, the **Result contract**
-   `.md` (Enter = no answer collection), `PYTHON_EXECUTABLE`,
-   `EDGE_EXECUTABLE`, `RUNTIME_ROOT` (and optionally a Node.js `node.exe`). Pressing Enter keeps a shown default;
-   a folder pasted where a file is expected is searched for the expected name. Re-run `Run.cmd setup` any time to edit.
-4. `Run.cmd check` validates everything (nothing is sent). `Run.cmd plan` shows the queue and any blocked cases.
-   `Run.cmd run` (or just double-clicking) sends. The first run opens a dedicated Edge window: **sign in to
-   Copilot there manually, once** (the tool never touches sign-in or MFA).
+1. Keep this whole folder together on `S:`.
+2. Double-click `Run.cmd`. It asks once for `PYTHON_EXECUTABLE` (paste the path; quotes are fine) and starts `setup`
+   the first time.
+3. `setup` asks for: `CASES_ROOT`, the **guidance folder** (one `<Sub Worktype>.md` per type), the `base_message` file,
+   the **result contract**, `PYTHON_EXECUTABLE`, `EDGE_EXECUTABLE` and `RUNTIME_ROOT`. Then, **once**, it asks for the
+   pages the tool connects to (your original Part 1 / Part 2 scripts have each one):
+   - **System 1, where the case documents are downloaded from:** its inbox page (My Inbox), the document viewer
+     marker (optional; without it documents are opened one by one, which is slower) and the brand control
+     pattern(s).
+   - **System 2, where the account snapshots are retrieved from:** a page that shows "logout" when signed in, the
+     account summary page (with `{account}`), the text that marks a party profile link, and the party links page
+     (with `{party}`).
 
-First launch installs the pinned `playwright` into `RUNTIME_ROOT\deps` (see *Dependencies*). It happens before
-any case is processed, never during the case loop.
+   These stay only in your local, git-ignored `sender_config.json`. **No System 1 / System 2 address is written in
+   the code.** Enter keeps a shown value. Run `Run.cmd setup` again at any time to edit.
+4. `Run.cmd check` validates everything (nothing is sent). The first run installs the pinned packages (`playwright`,
+   `requests`, `beautifulsoup4`) into `RUNTIME_ROOT\deps`.
+
+## A daily run (`Run.cmd` / `Run.cmd run`)
+
+1. **The CSV.** Paste its path (the last one is offered). It needs the columns `instruction id` (the old
+   `instrcution id` spelling also works), `Client Account Number`, `Client Number`, `Process Status` and
+   `Sub Worktype`. Only **Ended** rows are reviewed. Every other row (Voided, blank, an invalid ID, a duplicate, no
+   account) is listed under **SKIPPED** with its reason before anything starts.
+2. **The plan.** For each Ended row: *download and send*, *complete already* (send only), *already sent earlier*
+   (sent-ledger), or *held* (for example, a folder for that ID already in CASES_ROOT that this tool did not make).
+   Sub Worktypes without an instructions file are warned about.
+3. **Two Edges open.** The **systems Edge** (System 1 + System 2, its own remembered profile) and the **Copilot
+   Edge** (its own remembered profile). Two profiles are needed because Edge locks a profile to one running Edge.
+   Both remember your sign-ins between days.
+4. **Questions** (Part 3, in this console): moving cursor? Then the Copilot model.
+5. **Sign in everywhere, then press Enter.** Part 1 checks there is exactly ONE System 1 tab showing My Inbox; Part 2
+   checks the System 2 page shows "logout"; Copilot is already confirmed. If something is missing it is named, and
+   you press Enter again. After this you can walk away.
+6. **Everything runs together:**
+   - **Part 2** fetches every account snapshot in bulk (same-day snapshots are reused).
+   - **Part 1** downloads case after case into the hidden `CASES_ROOT\.work\<id> - <ACCOUNT>`.
+   - **The coordinator** moves a case into CASES_ROOT the moment it is complete: documents + Audit Trail +
+     snapshot + an instructions file for its Sub Worktype. It copies the snapshot in and renames the folder in one
+     step, so Copilot never sees a half-downloaded case.
+   - **Part 3** picks the case up within seconds. It attaches that type's `.md` + the result contract, then the
+     snapshot, the Audit Trail and the documents (Received Documents order), sends once and collects the answer
+     while the next case is still downloading.
+7. **The daily report**: on screen (everything that needs you) and as
+   `RUNTIME_ROOT\reports\daily-report-<run>.csv`. One line per CSV row: sent + Copilot's verdict, held + why,
+   skipped + why, and left-out files.
+
+**Held, never sent** (each with a plain reason in the report):
+- System 1 shows a different account than the CSV;
+- Part 1 failed the case twice;
+- no instructions file for its Sub Worktype;
+- no System 2 snapshot (failed after one retry);
+- a folder with the same name already in CASES_ROOT.
+
+**Stops and pauses**
+- **System 2 Access Denied** (after one retry) **stops everything safely**: no new downloads, no new sends. A send
+  already clicked is confirmed, and answers already sent are still collected.
+- **System 2 sign-in expired**: a pause. The console asks you to sign in again in the systems Edge and press Enter.
+- **Ctrl+C**: stops the sender safely (twice = at once); the other parts stop through the same signal.
+- **Running again the same day continues**: complete cases are not downloaded again, unfinished `.work` cases are
+  redone, snapshots are reused, and nothing in the sent-ledger is sent again.
+
+**Where things are** (all on S:, nothing on the system drive):
+- `RUNTIME_ROOT\pipeline\runs\<run>\`: the plan, signals, `logs\part1.log` / `part2.log`, held cases;
+- `pipeline\downloads\`, `pipeline\cases\`, `pipeline\snapshots\<day>\`: the hand-over files (see `shared/pipeline.py`);
+- `profile-systems\` and `profile\`: the two Edge profiles (sign-in data: never share them).
+
+**Evidence**: *Locally verified* with fake System 1 / System 2 / Copilot pages and real processes (`tests/`). Still
+*Proposed* until confirmed on the VDI:
+- the real System 1/2 pages through the new joins;
+- the cookie read over DevTools;
+- the Access-Denied page wording;
+- the background-window switches on the systems Edge.
+
+`Run.cmd send-only` is Part 3 alone, as before the pipeline. It sends the folders already in CASES_ROOT with one
+general review guidance file (`instructions_path`).
+
+---
+
+# Part 3 — Copilot sender (details)
+
+Everything below describes `3_copilot_sender/copilot_case_sender.py` (read top to bottom; its sections are numbered).
+In the pipeline each case's instructions file is its Sub Worktype's `.md`. With `send-only` it is the one shared
+**review guidance** file (`review_guidance.md`). In both, the documents are attached, your `base_message` is typed,
+the case is **sent once**, and the outcome is saved before the next case starts.
 
 ## What it does, per case
 
@@ -149,7 +227,7 @@ prompt, file bulk-assignment, and **pipelining** of the next case's inventory. S
 
 ### V2: the answer contract and result collection
 
-`review_guidance.md` tells Copilot *what to analyse and how*; **`result_contract.md`** (shipped in this repo as a strict
+The instructions file (review guidance or Sub Worktype `.md`) tells Copilot *what to analyse and how*; **`result_contract.md`** (shipped in `guidance/` as a strict
 template – edit it freely) tells it *exactly what to answer*. Both are attached to every case (2 fixed files, so up to 18
 case documents under the 20 limit). Your `base_message` should tell Copilot to answer only as the contract defines.
 
@@ -347,10 +425,20 @@ never part of shareable output.
 set SENDER_TEST_ROOT=<a folder on approved storage>
 <PYTHON_EXECUTABLE> -B -m pytest -p no:cacheprovider tests
 ```
-Needs `pytest`; refuses to run without `SENDER_TEST_ROOT` (never uses system Temp).
+Needs `pytest`; refuses to run without `SENDER_TEST_ROOT` (never uses system Temp). `tests/test_sender.py` = Part 3,
+`tests/test_pipeline.py` = the pipeline. The Part 2 tests need `requests` + `beautifulsoup4`; without them they are
+skipped, not failed.
 
 | Check | Status |
 |---|---|
+| Daily CSV: only Ended reviewed, every other row listed with its reason, column spellings, `;` CSVs | **Tested here** |
+| Hand-over only when documents + Audit Trail + snapshot + Sub Worktype instructions are all there; held reasons; stop leaves `.work` alone; a crashed part counts as finished | **Tested here** |
+| Part 3 live queue: a case finished mid-run is sent; its own instructions + contract, then snapshot, Audit Trail, documents in order; over the limit the last documents are left out | **Tested here** (real Runner, fake page) |
+| Stop after a send: nothing new sent, the sent answer still collected; sign-in check names what is missing; pause → Enter → resume | **Tested here** |
+| Part 1 case logic: `.work` folder, account mismatch held without retry, one clean retry, stop between documents and Audit Trail, one-System-1-tab check | **Tested here** (scripted System 1 steps) |
+| Part 2: Access Denied vs expired sign-in vs normal page; Access Denied twice stops the run; expired → pause → fresh cookies; only System 2 cookies read | **Tested here** (synthetic pages) |
+| One whole run with real processes (coordinator + stand-ins for the three parts): skipped row, held case, two cases sent, daily report | **Tested here** |
+| Real System 1 / System 2 pages, cookie read over DevTools, two Edges side by side, background switches | **Needs your VDI** |
 | 5 folders → 5 queue entries; `.edge-debug-9223` excluded (case variants) | **Tested here** |
 | Spaces, Unicode, pasted quotes | **Tested here** |
 | `S:` ≡ UNC identity (injected mapping), unrelated share, prefix-vs-component, mismatched mapping | **Tested here** (synthetic) |

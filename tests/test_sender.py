@@ -28,7 +28,7 @@ ROOT = os.environ.get("SENDER_TEST_ROOT")
 if not ROOT:
     pytest.exit("Set SENDER_TEST_ROOT to a folder on approved storage; tests never use the system Temp.", 2)
 
-SRC = Path(__file__).resolve().parent.parent / "copilot_case_sender.py"
+SRC = Path(__file__).resolve().parent.parent / "3_copilot_sender" / "copilot_case_sender.py"
 spec = importlib.util.spec_from_file_location("sender", SRC)
 S = importlib.util.module_from_spec(spec)
 sys.modules["sender"] = S

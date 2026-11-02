@@ -5,36 +5,59 @@ User is a medium beginner: plain language, minimal jargon, don't push or publish
 
 ## What this project is
 
-A Windows tool that sends **case folders** to Microsoft 365 Copilot through a dedicated, manually signed-in Edge window
-(Playwright over CDP), then reads Copilot's answer back as strict JSON. Per case: one fresh Copilot chat, the case documents
-plus a shared `review_guidance.md` attached, `base_message` typed, **sent exactly once**, outcome saved before the next case.
-It is the rewrite ("2") of the older "Automatic daily statics review" runner (old audit workflow, merged PDFs, permissive
-Edge flags were dropped on purpose; see README last section).
+The daily statics review as ONE pipeline of three parts that run at the same time (agreed design 2026-11-02):
+**Part 1** downloads each case's System 1 documents + Audit Trail (UI, one tab, systems Edge on port 9223), **Part 2**
+fetches every account's System 2 snapshot in bulk (requests with the systems Edge's cookies), **Part 3** sends each
+complete case to Microsoft 365 Copilot (its own Edge, port 9333) and reads the strict-JSON answer back. A coordinator
+hands a case over the moment it is complete, so Copilot works on case 1 while System 1 downloads case 2.
+Part 3 is the rewrite ("2") of the older "Automatic daily statics review" runner (see README last section).
 
-Real runs happen on the FNZ VDI, with everything on the `S:` drive. Local copies are for development and tests only.
+Real runs happen on the work VDI, with everything on the `S:` drive. Local copies are for development and tests only.
+Parts 1 and 2 started from sanitized copies of the user's VDI scripts. The repo is PUBLIC: every page address, host and
+brand pattern of System 1/2 lives only in the git-ignored config (pasted once in setup) - never put one in the code.
 
 ## Files
 
-| File | Role |
+| Path | Role |
 |---|---|
-| `copilot_case_sender.py` | The whole program (~3,300 lines, stdlib + pinned `playwright==1.64.1` installed at first launch). |
-| `Run.cmd` | Launcher; asks once for embedded `python.exe`, saves it in `local_python.cmd`, runs `python -B -E -s copilot_case_sender.py %*`. |
-| `result_contract.md` | Strict answer format attached to every case (template, editable). |
+| `Run.cmd` | Launcher: `run` (default) → `orchestrator/run_pipeline.py`; `setup / check / plan / send-only` → the sender. Asks once for embedded `python.exe` (`local_python.cmd`); always `-B -E -s`. |
+| `orchestrator/run_pipeline.py` | Coordinator: CSV → skipped list → plan → opens the systems Edge → starts Parts 1+2 (background, no console) → runs Part 3 in the console → daily report. |
+| `orchestrator/handover.py` | No browser: `build_plan`, `Handover.step` (complete case → snapshot copied in → one rename from `.work` into CASES_ROOT → `pipeline\cases\<id>.json`), `daily_report`. |
+| `shared/pipeline.py` | THE contract (stdlib only): CSV reader, guidance lookup, `Paths`, `Control` (go/check/stop/pause/resume/feed-closed/events/held files). Read its header first. |
+| `1_system1_documents/system1_documents.py` | Part 1 (original UI logic kept; joins Edge, works only on System 1's host, uses the sender's `start_driver`/`bootstrap_storage`). + `studio_visual_cursor.py`. |
+| `2_system2_snapshots/system2_snapshots.py` | Part 2 (original parsers kept; cookies via `cdp_call` Storage.getCookies, Access Denied → stop, expired → pause). |
+| `3_copilot_sender/copilot_case_sender.py` | Part 3, the sender (~4,900 lines). Pipeline mode: `run --pipeline <run dir>` with `PipelineFeed` (section 9b). |
+| `guidance/` | `result_contract.md` template + README (real `<Sub Worktype>.md` files live in `guidance_dir`). |
 | `README.md` | Full user/design documentation. Authoritative for behaviour; read the relevant section before changing logic. |
-| `tests/test_sender.py` | 72 tests using fake page / fake Playwright. Needs `SENDER_TEST_ROOT` env var (a folder on approved storage), never system Temp. |
-| `.gitignore` | Excludes `sender_config.json`, `local_python.cmd`, `sender_runtime/`, logs, `.venv/`, `.env`. |
+| `tests/test_sender.py`, `tests/test_pipeline.py` | 147 tests (fake pages, real processes for one whole run). Need `SENDER_TEST_ROOT`; Part 2 tests need requests+bs4 (else skipped). |
+| `.gitignore` | Excludes `sender_config.json` (at the top level), `local_python.cmd`, `sender_runtime/`, logs, `.venv/`, `.env`. |
 
-Commands: `Run.cmd setup | check | plan | run` (`run --detail minimal|full`).
+Commands: `Run.cmd [run] | setup | check | plan | send-only` (`--detail minimal|full`).
 Tests: `set SENDER_TEST_ROOT=<folder>` then `<python> -B -m pytest -p no:cacheprovider tests`.
 
-## Code map (`copilot_case_sender.py`, numbered sections)
+## Pipeline rules that must not break
+
+- Copilot (Part 3) only ever sees COMPLETE cases: Part 1 writes into `CASES_ROOT\.work` (excluded by discovery), the
+  coordinator moves a folder in only with documents + Audit Trail + snapshot + a Sub Worktype guidance file.
+- Missing anything = held with a plain reason (daily report), never sent half-done or with the wrong instructions.
+- Only Process Status "Ended" is reviewed; every other row is listed as skipped. System 1's Sub Worktype wins over the CSV's (warned).
+- Two Edges, two persistent profiles (Edge locks a profile to one instance): systems (9223) and Copilot (9333).
+  Part 1 touches only tabs on System 1's host; Part 2 has no tab.
+- Nothing starts before the user's Enter + every part's own sign-in check (`PipelineFeed.confirm_ready`).
+- System 2 Access Denied after one retry = shared stop (no new downloads/sends; answers already sent still collected).
+  Expired System 2 sign-in = pause, resumed by Enter on the sender's console.
+- Parts talk ONLY through `shared/pipeline.py` files. Parts 1/2 reuse the sender's storage bootstrap and driver start
+  (never their own Playwright start path: the ~80 s UNC startup must not come back).
+
+## Code map (`3_copilot_sender/copilot_case_sender.py`, numbered sections)
 
 1. BASICS (l.47) · 2. PATH POLICY (195; `PathPolicy`: `S:` ≡ its UNC share = one approved storage) · 3. CONFIG (318) ·
 4. STORAGE, REDACTION, LOGGING (539) · 5. STATE: append-only journal + `sent_instructions.txt` ledger (722) ·
 6. CASES: discovery, inventory, attachment plan (843) · 7. DEPENDENCIES (1054) ·
 8. BROWSER: `EdgeBrowser` + `CopilotTab` page adapter (1110) · 8b. VISUAL CURSOR: optional `VisualCursor`, one shared
 instance at `CopilotTab.cursor`; every `CopilotTab` click/hover/fill and tab switch goes through it (off = the plain call) · 9. TRANSACTION, QUEUE, RETRIES: `Runner` (1768) ·
-10. COMMANDS: `setup/check/plan/run` + `main()` (2464).
+9b. PIPELINE FEED: `PipelineFeed` (live queue, per-case instructions/order, sign-in check, relay, results) + `scan_pipeline` ·
+10. COMMANDS: `setup/check/plan/run/send-only` + `main()`. (Line numbers above are from before the pipeline; search by name.)
 
 Graphify highlights (497 nodes, 955 edges, 29 communities, no import cycles): god nodes are `CopilotTab` (40 edges),
 `run()` (34), `Runner` (32), `guarded()` (23), `EdgeBrowser` (20), `SenderError` (17; `UiError`, `AttemptFailed` inherit it),
@@ -72,7 +95,11 @@ usually means updating `FakeTab` too. Full graph: `graphify-out/` in this folder
 
 ## Status
 
-- Git repo on `main`, in sync with `origin/main`, last commit `9e8e0f2` "V2: result contract, plain-text JSON answers, background collection, fix-ups". No remote pushes without the user's say-so.
+- Git repo on `main` (origin `copilot-case-sender`). 2026-11-02: restructured into the 3-part pipeline; the user asked
+  for commit + push to main for this rebuild. Otherwise no remote pushes without the user's say-so.
+- Pipeline: *Locally verified* only (fakes + real processes). Real System 1/2 pages, the DevTools cookie read, the
+  Access-Denied wording and the two-Edge setup on the VDI are *Proposed* until the user runs it there.
+- Best Edge/VDI/S: knowledge (driver startup, quota, non-admin): the workspace's `VDI and S Drive Knowledge\` folder (Playwright file).
 - Live-tested on a personal Microsoft 365 Copilot profile with synthetic files (about 7–15 s per case, V2 verdicts read back). Still **needs confirmation on the real VDI**: real `WNetGetUniversalNameW` on `S:`, embedded `._pth` + wheels, replace/lock on the share, unresponsive-renderer path, `.crdownload` location.
 - Carry-over from the old project (see memory `automatic-daily-review-project`): the Edge debug endpoint not answering in 60 s on the VDI, and the plan to later run on any environment, not only `S:`. Whether this rewrite fixes it is unconfirmed; `EdgeBrowser.connect` is now a racing handshake (no restarts; attempts join at `RACE_GAPS`, alternating WebSocket/HTTP, first to connect wins, winner route remembered in `state\connect-route.txt` and printed as `WINNER: ...`); the old 3/6/12/20/30 s ladder is gone (`handshake_timeouts` is no longer read).
 

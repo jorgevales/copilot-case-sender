@@ -52,8 +52,10 @@ from urllib.parse import quote, urlparse
 # --------------------------------------------------------------------------------------------
 
 EXCLUDED_DIR = ".edge-debug-9223"  # browser profile that may sit beside the cases; never case content
+WORK_DIR = ".work"                 # Part 1's unfinished downloads (pipeline): never a case until moved out of it
 CASE_RE = re.compile(r"^(?P<id>[0-9a-fA-F]{32})(?:\s+-\s+(?P<ref>.*))?$")
-REQUIREMENTS = ["playwright==1.64.1"]  # pinned; pip resolves its own small dependencies
+REQUIREMENTS = ["playwright==1.64.1",   # pinned; pip resolves their own small dependencies
+                "requests==2.32.4", "beautifulsoup4==4.13.4"]   # Part 2 (System 2 snapshots)
 PIP_WHEEL_JSON = "https://pypi.org/pypi/pip/json"
 
 
@@ -332,6 +334,7 @@ def probe_dir(directory: Path) -> str:
 
 DEFAULTS = {
     "cdp_port": 9333, "result_contract_path": "", "copilot_url": "https://m365.cloud.microsoft/chat", "requested_model": "",
+    "instructions_path": "",          # one general review guidance file: 'send-only' runs (the pipeline uses guidance_dir)
     "recursive_documents": False,
     "completion_mode": "json_result",   # "json_result" = collect + validate Copilot's JSON answer; "submission_only" = V1 (send only)
     "node_executable": "", "dependency_directory": "", "approved_root": "", "approved_unc_root": "",
@@ -365,16 +368,32 @@ DEFAULTS = {
     "diagnostics_capture": False,     # screenshots/HTML are SENSITIVE, local-only, off by default
     "visual_cursor": "ask",           # moving cursor in Edge: "ask" at every run, "on" always, "off" never
     "visual_cursor_options": {},      # look and timing overrides, see VISUAL_DEFAULTS (section 8b)
+    # The daily pipeline (Run.cmd run): Part 1 System 1 documents + Part 2 System 2 snapshots + this sender.
+    "guidance_dir": "",               # one <Sub Worktype>.md per type: the instructions attached for that type
+    # System 1 = where the case documents are downloaded from.  Pages are pasted once in setup (never in the code).
+    "system1_url": "",                # its inbox page (My Inbox); Part 1 works only on pages under this address
+    "system1_viewer_marker": "",      # text that marks a document's viewer link ("" = documents opened one by one)
+    "system1_brand_text": "",         # regex: the top-left brand control's text (Part 1 clicks it to go back to My Inbox)
+    "system1_brand_html": "",         # regex: the same control's logo markup, used when the text does not match
+    # System 2 = where the account snapshots are retrieved from.
+    "system2_url": "",                # a page that shows 'logout' when signed in (the sign-in check)
+    "system2_account_page": "",       # the account summary page, {account} where the account number goes
+    "system2_party_marker": "",       # text found in the links to a linked party's profile page
+    "system2_party_links_page": "",   # the page listing a party's other customers/accounts, {party} where its ID goes
+    "systems_cdp_port": 9223,         # Edge for System 1 + 2 (its own remembered profile); Copilot stays on cdp_port
+    "last_csv_path": "",              # the daily CSV used last time (offered as the default)
 }
-REQUIRED = ["cases_root", "instructions_path", "base_message_path", "python_executable",
-            "edge_executable", "runtime_root"]
-PATH_KEYS = REQUIRED + ["result_contract_path", "node_executable", "dependency_directory", "approved_root", "approved_unc_root",
-                        "driver_cache_dir"]
+REQUIRED = ["cases_root", "base_message_path", "python_executable", "edge_executable", "runtime_root"]
+PATH_KEYS = REQUIRED + ["instructions_path", "result_contract_path", "node_executable", "dependency_directory", "approved_root",
+                        "approved_unc_root", "driver_cache_dir", "guidance_dir", "last_csv_path"]
 HERE = Path(os.path.abspath(__file__)).parent   # never .resolve(): it turns a mapped drive (S:) into its UNC form
+PROJECT = HERE.parent                           # the tool's top folder: Run.cmd, sender_config.json, guidance/, shared/
+if str(PROJECT) not in sys.path:                # embedded Python does not add the script folder: shared/ is found here
+    sys.path.insert(0, str(PROJECT))
 
 
 def config_path() -> Path:
-    return Path(os.environ.get("SENDER_CONFIG") or HERE / "sender_config.json")
+    return Path(os.environ.get("SENDER_CONFIG") or PROJECT / "sender_config.json")
 
 
 def load_config(required: bool = True):
@@ -430,14 +449,22 @@ def ask(prompt: str, default: str = "", optional: bool = False) -> str:
     return clean_path(answer) if answer else default
 
 
+def ask_text(prompt: str, default: str = "", optional: bool = False) -> str:
+    """Like ask() for URLs and patterns: kept exactly as typed (no %VAR% expansion, no quote stripping)."""
+    suffix = f" [{default}]" if default else (" (Enter to skip)" if optional else "")
+    try:
+        answer = input(f"{prompt}{suffix}: ").strip()
+    except EOFError:
+        raise SenderError("setup needs an interactive console") from None
+    return answer or default
+
+
 def setup_command() -> int:
     """Paste-your-paths setup.  Re-running keeps current values (Enter) so settings can be edited
     without touching source code.  Quotes around pasted paths are removed automatically."""
     cfg = load_config(required=False)
     cur = vars(cfg)
     print("SETUP - paste each path (quotes are fine). Press Enter to keep the value shown.\n")
-    script_dir = HERE
-
     def ask_dir(key, label, create=False, default=""):
         while True:
             value = ask(label, cur.get(key) or default)
@@ -454,10 +481,13 @@ def setup_command() -> int:
             print("  That file was not found - try again.")
 
     cur["cases_root"] = ask_dir("cases_root", "Folder that contains the instruction-ID case folders (CASES_ROOT)")
-    cur["instructions_path"] = ask_file("instructions_path", "Path of the Review guidance .md file (review_guidance.md)",
-                                        "review_guidance.md")
+    cur["guidance_dir"] = ask_dir("guidance_dir", "Folder with one instructions file per Sub Worktype (<Sub Worktype>.md)",
+                                  default=str(PROJECT / "guidance"))
+    value = ask("Path of a general Review guidance .md - only for 'Run.cmd send-only' (Enter = none)",
+                cur.get("instructions_path") or "", True)
+    cur["instructions_path"] = str(resolve_file(value, "review_guidance.md") or "") if value else ""
     cur["base_message_path"] = ask_file("base_message_path", "Path of the base_message Markdown file", "base_message.md")
-    template = HERE / "result_contract.md"
+    template = PROJECT / "guidance" / "result_contract.md"
     value = ask("Path of the Result contract .md - the strict JSON answer format (Enter = do not collect answers)",
                 cur.get("result_contract_path") or (str(template) if template.is_file() else ""), True)
     cur["result_contract_path"] = str(resolve_file(value, "result_contract.md") or "") if value else ""
@@ -466,7 +496,27 @@ def setup_command() -> int:
     edge = next((str(p) for p in exe_candidates("edge") if p.is_file()), "")
     cur["edge_executable"] = ask_file("edge_executable", "Installed msedge.exe", "msedge.exe", edge)
     cur["runtime_root"] = ask_dir("runtime_root", "Runtime folder on S: for all tool files (RUNTIME_ROOT; created if missing)",
-                                  create=True, default=str(script_dir / "sender_runtime"))
+                                  create=True, default=str(PROJECT / "sender_runtime"))
+    print("\nThe pages the daily pipeline connects to - pasted once, kept only in this computer's sender_config.json.\n"
+          "Your original Part 1 / Part 2 scripts have each value.\n\n"
+          "SYSTEM 1 - where the case documents are downloaded from (Part 1)")
+    cur["system1_url"] = ask_text("  Its inbox page address (the page that shows My Inbox)", cur.get("system1_url") or "")
+    cur["system1_viewer_marker"] = ask_text(
+        "  Document viewer marker: the text that names the viewer page in a document's link (the part of the\n"
+        "  document link in your original script's Received Documents step; Enter = none, documents are then opened\n"
+        "  one by one - slower)",
+        cur.get("system1_viewer_marker") or "", True).replace("\\", "")
+    cur["system1_brand_text"] = ask_text("  Brand control text pattern (the top-left logo's name, as in your original script)",
+                                         cur.get("system1_brand_text") or "")
+    cur["system1_brand_html"] = ask_text("  Logo markup pattern (Enter = none)", cur.get("system1_brand_html") or "", True)
+    print("\nSYSTEM 2 - where the account snapshots are retrieved from (Part 2)")
+    cur["system2_url"] = ask_text("  A page address that shows 'logout' when you are signed in", cur.get("system2_url") or "")
+    cur["system2_account_page"] = ask_text("  Account summary page address, with {account} where the account number goes",
+                                           cur.get("system2_account_page") or "")
+    cur["system2_party_marker"] = ask_text("  Text found in the links to a linked party's profile page",
+                                           cur.get("system2_party_marker") or "")
+    cur["system2_party_links_page"] = ask_text("  A party's links page address, with {party} where the party ID goes",
+                                               cur.get("system2_party_links_page") or "")
     node = next((str(p) for p in exe_candidates("node") if p.is_file()), "")
     value = ask("Node.js node.exe (optional; Enter = use the copy bundled with Playwright)", cur.get("node_executable") or node, True)
     cur["node_executable"] = str(resolve_file(value, "node.exe") or "") if value else ""
@@ -481,8 +531,8 @@ def setup_command() -> int:
                 cur.get("visual_cursor") or "ask").strip().lower()
     cur["visual_cursor"] = shown if shown in ("ask", "on", "off") else "ask"
     if ask("Change optional settings (port, URL, model, recursion, limits)? y/N", "n").lower().startswith("y"):
-        for key in ("cdp_port", "copilot_url", "requested_model", "recursive_documents", "max_attachments", "over_limit_mode", "warm_tabs",
-                    "dependency_directory", "approved_root", "approved_unc_root"):
+        for key in ("cdp_port", "systems_cdp_port", "copilot_url", "requested_model", "recursive_documents", "max_attachments",
+                    "over_limit_mode", "warm_tabs", "dependency_directory", "approved_root", "approved_unc_root"):
             value = ask(f"  {key}", str(cur.get(key, "")), True)
             default = DEFAULTS[key]
             cur[key] = (value.lower() in ("1", "true", "y", "yes") if isinstance(default, bool)
@@ -509,7 +559,8 @@ def validate_config(cfg):
     except PathError as exc:
         return None, [str(exc)]
     for key, kind in (("cases_root", "dir"), ("runtime_root", "dir"), ("instructions_path", "file"),
-                      ("base_message_path", "file"), ("result_contract_path", "file"), ("dependency_directory", "dir")):
+                      ("base_message_path", "file"), ("result_contract_path", "file"), ("dependency_directory", "dir"),
+                      ("guidance_dir", "dir")):
         value = getattr(cfg, key)
         if not value:
             continue
@@ -721,7 +772,8 @@ def use_colour() -> bool:
 MINIMAL_PHASES = {"queue", "start", "startup", "submitted", "submitted_partial", "submission_uncertain", "preflight_blocked",
                   "failed_exhausted", "WARNING", "at-limit", "attempt-failed", "deferred", "released", "paused",
                   "stopped", "login", "session", "model", "reconnect", "recovered", "dependencies", "fixup", "resubmit",
-                  "result_correct", "result_incorrect", "result_inconclusive", "result_invalid", "response_timeout"}
+                  "result_correct", "result_incorrect", "result_inconclusive", "result_invalid", "response_timeout",
+                  "system1", "system2", "handover", "pipeline"}         # pipeline: Part 1 / Part 2 / hand-over progress
 
 
 class Log:
@@ -804,7 +856,7 @@ def register_redactions(red: Redactor, cfg, policy: PathPolicy | None) -> None:
               "base_message_path": "BASE_MESSAGE_FILE", "python_executable": "PYTHON_EXECUTABLE",
               "edge_executable": "EDGE_EXECUTABLE", "node_executable": "NODE_EXECUTABLE",
               "dependency_directory": "DEPENDENCY_DIR", "approved_root": "APPROVED_ROOT",
-              "approved_unc_root": "APPROVED_UNC_ROOT", "driver_cache_dir": "DRIVER_CACHE_DIR"}
+              "approved_unc_root": "APPROVED_UNC_ROOT", "driver_cache_dir": "DRIVER_CACHE_DIR", "guidance_dir": "GUIDANCE_DIR"}
     for key, label in labels.items():
         red.add(getattr(cfg, key, ""), label)
     if policy and policy.unc_root:
@@ -967,7 +1019,7 @@ def discover(cfg, policy: PathPolicy, salt: str, red: Redactor):
         raise StorageError("CASES_ROOT could not be listed (storage unavailable?)") from exc
     cases, unrecognised, excluded = [], [], 0
     for entry in entries:
-        if entry.name.casefold() == EXCLUDED_DIR.casefold():  # first thing: never touched, even to stat
+        if entry.name.casefold() in (EXCLUDED_DIR.casefold(), WORK_DIR):  # first thing: never touched, even to stat
             excluded += 1
             continue
         try:
@@ -1165,9 +1217,10 @@ def ensure_dependencies(cfg, rt: Runtime, log) -> None:
     """Install the pinned Playwright into the private dependency folder when missing.
     Uses the configured interpreter; every cache/target/temp stays under RUNTIME_ROOT."""
     want = REQUIREMENTS[0].split("==")[1]
-    if (rt.deps / f"playwright-{want}.dist-info").is_dir():       # fast path: one lookup instead of scanning every sys.path folder
+    missing = [r for r in REQUIREMENTS if not (rt.deps / "{}-{}.dist-info".format(*r.split("=="))).is_dir()]
+    if not missing:                   # fast path: one lookup per package instead of scanning every sys.path folder
         return
-    if playwright_version() == want:
+    if missing == REQUIREMENTS[:1] and playwright_version() == want:
         return
     log("dependencies", note="first launch: installing pinned packages into the private dependency folder")
     py = cfg.python_executable
@@ -1197,7 +1250,8 @@ def ensure_dependencies(cfg, rt: Runtime, log) -> None:
     write_atomic(rt.logs / "dependency-install.log", result.stdout + "\n" + result.stderr)
     import importlib
     importlib.invalidate_caches()
-    if result.returncode or playwright_version() != want:
+    if result.returncode or playwright_version() != want or any(
+            not (rt.deps / "{}-{}.dist-info".format(*r.split("=="))).is_dir() for r in REQUIREMENTS):
         raise SenderError("dependency install failed (details in RUNTIME_ROOT/logs/dependency-install.log; "
                           "compatible wheels may be unavailable for this Python version/architecture)")
 
@@ -1638,11 +1692,20 @@ def cdp_http(port: int, path: str, timeout: float = 1.5, method: str = "GET"):
 def cdp_page_eval(ws_url: str, port: int, expression: str, timeout: float = 3.0):
     """Evaluate one expression in a page over its own DevTools WebSocket (stdlib only: a minimal RFC 6455 client).
     Used before Playwright is connected, to know which tabs are ready.  Loopback + our port only.  None on any failure."""
+    reply = cdp_call(ws_url, port, "Runtime.evaluate", {"expression": expression, "returnByValue": True}, timeout)
+    return (reply or {}).get("result", {}).get("value")
+
+
+def cdp_call(ws_url: str, port: int, method: str, params: dict, timeout: float = 3.0, target: str = "page"):
+    """One DevTools command over a page's (target="page") or the browser's (target="browser") own WebSocket, stdlib
+    only.  Returns the command's result object.  Loopback + our port only.  None on any failure.  Part 2 reads the
+    System 2 sign-in cookies this way (Storage.getCookies) instead of starting a second Playwright driver."""
     import base64
     import socket
     import struct
     u = urlparse(ws_url)
-    if u.scheme != "ws" or u.hostname not in ("127.0.0.1", "localhost") or u.port != port or not u.path.startswith("/devtools/page/"):
+    if u.scheme != "ws" or u.hostname not in ("127.0.0.1", "localhost") or u.port != port \
+            or not u.path.startswith(f"/devtools/{target}/"):
         return None
     try:
         with socket.create_connection(("127.0.0.1", port), timeout=timeout) as sock:
@@ -1659,8 +1722,7 @@ def cdp_page_eval(ws_url: str, port: int, expression: str, timeout: float = 3.0)
             if b" 101 " not in head.split(b"\r\n", 1)[0]:
                 return None
             buf = head.split(b"\r\n\r\n", 1)[1]
-            body = json.dumps({"id": 1, "method": "Runtime.evaluate",
-                               "params": {"expression": expression, "returnByValue": True}}).encode()
+            body = json.dumps({"id": 1, "method": method, "params": params}).encode()
             mask = os.urandom(4)
             size = len(body)
             frame = bytes([0x81]) + (bytes([0x80 | size]) if size < 126 else
@@ -1688,7 +1750,7 @@ def cdp_page_eval(ws_url: str, port: int, expression: str, timeout: float = 3.0)
                     if b0 & 0x80:
                         reply = json.loads(message)
                         if reply.get("id") == 1:
-                            return reply.get("result", {}).get("result", {}).get("value")
+                            return reply.get("result")
                         message = b""
                 elif (b0 & 0x0F) == 0x8:
                     return None
@@ -3203,6 +3265,8 @@ class Runner:
         self.fg_lock = asyncio.Lock()     # only ONE party (sender or collector) works in the front tab at a time
         self.queue, self.queue_closed = None, False
         self.chip_shapes = []             # what attachment chips looked like when names did not match (names hidden), for the run report
+        self.feed = None                  # pipeline mode: PipelineFeed - cases keep arriving, each with its own instructions
+        self.stdin = None                 # the run's terminal reader (set by prepare_session)
 
     # -- helpers ------------------------------------------------------------------------------
     def rec(self, case, state, **fields):
@@ -3218,11 +3282,15 @@ class Runner:
 
     async def prepare(self, case: Case, want_tab: bool) -> Prepared:
         """Inventory + plan (thread, so the event loop keeps serving the current upload), then a fresh tab."""
+        if case.blocked:                   # pipeline cases join the queue directly (discovery's own blocks never get here)
+            return Prepared(case, blocked=case.blocked)
         try:
             await asyncio.to_thread(inventory, case, self.cfg, self.policy)
             if case.problems:
                 return Prepared(case, blocked="; ".join(case.problems))
-            plan, left_out = build_plan(case, self.instr, self.cfg, self.policy)
+            if self.feed is not None:      # Sub Worktype instructions + snapshot, Audit Trail, documents first
+                self.feed.arrange(case)
+            plan, left_out = build_plan(case, self.feed.instr(case) if self.feed else self.instr, self.cfg, self.policy)
         except Blocked as exc:
             return Prepared(case, blocked=str(exc))
         tab = None
@@ -3688,13 +3756,24 @@ class Runner:
         self.queue, self.queue_closed, deferred, total = queue, False, set(), len(queue)
         same_reason = collections.Counter()
         collector = asyncio.ensure_future(self.collect_loop()) if self.collecting() else None
+        feed, polled = self.feed, 0.0
         try:
-            while queue or self.pending:
+            while queue or self.pending or (feed is not None and not feed.done):
                 self.stop.check()
                 if collector and collector.done():
                     collector.result()                    # a collector failure (e.g. reconnect budget) stops the run
-                if not queue:                             # only answers are outstanding
-                    await asyncio.sleep(0.3)
+                if feed is not None and feed.stopping():  # stop safely: nothing new is sent, answers are still collected
+                    for c in queue:
+                        self.results.setdefault(c.key, ("not_sent_stopped", feed.stop_reason()))
+                    queue.clear()
+                elif feed is not None and (not queue or time.monotonic() - polled > 2):
+                    polled = time.monotonic()            # pipeline: cases that became complete since the last look
+                    for c in await asyncio.to_thread(feed.poll):
+                        if self.sent_ids.get(c.id) is None:
+                            queue.append(c)
+                            total += 1
+                if not queue:                             # only answers are outstanding (or the next case is still on its way)
+                    await asyncio.sleep(0.3 if feed is None else 1.0)
                     continue
                 case = queue.popleft()
                 self.storage_alive()
@@ -3776,6 +3855,173 @@ class Runner:
 
 
 # --------------------------------------------------------------------------------------------
+# 9b. PIPELINE FEED (Run.cmd run): cases arrive while Part 1 is still downloading the next ones
+# --------------------------------------------------------------------------------------------
+
+CHECK_SECONDS = 60          # how long the sign-in check waits for Part 1 / Part 2 to answer
+
+
+class PipelineFeed:
+    """This sender's side of the daily pipeline (the whole contract is in shared/pipeline.py).
+
+    The queue is not one scan at start: the coordinator hands a case over once it is complete (its folder moved from
+    CASES_ROOT\\.work into CASES_ROOT + RUNTIME_ROOT\\pipeline\\cases\\<id>.json) and `poll` picks it up within seconds.
+    Each case gets ITS Sub Worktype's instructions file + the result contract, and its files go in the order
+    snapshot, Audit Trail, documents - so what is left out over max_attachments is always the last documents.
+    A stop (e.g. System 2 Access Denied) empties the queue; answers already sent are still collected."""
+
+    def __init__(self, run_dir, ctx, salt: str):
+        from shared import pipeline as P
+        self.P, self.ctx, self.salt = P, ctx, salt
+        self.paths = P.Paths(ctx.cfg.runtime_root, ctx.cfg.cases_root, run_dir)
+        self.control = P.Control(self.paths)
+        self.plan = P.read_plan(self.paths)
+        self.wanted = [c["iid"] for c in self.plan["cases"] if c.get("needs") in ("download", "send")]
+        self.parts = [p for p in ("part1", "part2") if self.plan.get("parts", {}).get(p)]
+        self.contract = (doc_of(Path(ctx.cfg.result_contract_path))
+                         if ctx.cfg.completion_mode == "json_result" and ctx.cfg.result_contract_path else None)
+        self.seen, self.instr_of, self.order_of, self.cases = set(), {}, {}, []
+        self.closed = False
+
+    # -- the queue ------------------------------------------------------------------------------
+    @property
+    def done(self) -> bool:
+        """No case will arrive any more: everything handed over was polled, or the run is stopping."""
+        return self.closed or bool(self.stopping())
+
+    def stopping(self):
+        return self.control.stopped()
+
+    def stop_reason(self) -> str:
+        return "run stopped before this case was sent: " + str((self.control.stopped() or {}).get("reason", ""))
+
+    def expected(self, sent) -> int:
+        return len([i for i in self.wanted if i not in sent])
+
+    def poll(self) -> list:
+        """Cases handed over since the last call, as Case objects (redaction aliases registered like discover())."""
+        closed = self.control.feed_closed()        # read FIRST: a case handed over just before closing is still seen
+        out, red, policy = [], self.ctx.red, self.ctx.policy
+        for iid in self.wanted:
+            if iid in self.seen:
+                continue
+            m = self.P.read_json(self.paths.cases / f"{iid}.json")
+            path = Path(self.ctx.cfg.cases_root) / m["folder"] if m else None
+            if not path or not path.is_dir():
+                continue
+            self.seen.add(iid)
+            case = Case(path.name, path, policy.ident(path), self.salt)
+            red.add(case.name, case.alias)
+            red.add(case.id, case.alias)
+            red.ids[case.alias] = case.id
+            red.add(case.ref, case.alias + "-ref")
+            try:
+                policy.check(case.path, "case folder")
+                fixed = [doc_of(policy.check(m.get("guidance") or "", "Sub Worktype instructions"))]
+            except (PathError, OSError) as exc:
+                case.blocked, fixed = (str(exc) if isinstance(exc, PathError) else
+                                       "the Sub Worktype instructions file could not be read"), []
+            self.instr_of[case.key] = fixed + ([self.contract] if self.contract else [])
+            self.order_of[case.key] = list(m.get("order") or [])
+            out.append(case)
+            self.cases.append(case)
+        self.closed = closed
+        return out
+
+    def instr(self, case) -> list:
+        return self.instr_of.get(case.key) or []
+
+    def arrange(self, case) -> None:
+        """Snapshot, Audit Trail, then documents in System 1's Received Documents order; anything else after, by name."""
+        rank = {name.casefold(): i for i, name in enumerate(self.order_of.get(case.key, []))}
+        case.docs.sort(key=lambda d: (rank.get(d.rel.casefold(), len(rank)), d.rel.casefold()))
+
+    # -- sign-in check, progress, pauses -------------------------------------------------------
+    async def confirm_ready(self, stdin, log, stop) -> None:
+        """Nothing starts until you press Enter AND every part confirms its own system: Part 1 sees exactly one System 1
+        tab showing My Inbox, Part 2 opens a System 2 page that shows 'logout'.  Copilot is already confirmed here."""
+        if not self.parts:
+            self.control.go()
+            return
+        names = {"part1": "System 1", "part2": "System 2"}
+        say("\n" + "=" * 96 + "\nSIGN IN EVERYWHERE, THEN PRESS ENTER HERE\n"
+            "  - Systems Edge window: " + " and ".join(names[p] for p in self.parts)
+            + (" (keep exactly ONE System 1 tab, showing My Inbox)" if "part1" in self.parts else "") + "\n"
+            "  - Copilot Edge window: signed in (already confirmed)\n" + "=" * 96)
+        while True:
+            line = await stdin.line()
+            if line is None:                       # no terminal: check by itself every 10 s
+                await stop.sleep(10)
+            stop.check()
+            seq = await asyncio.to_thread(self.control.request_check)
+            say("Checking " + " and ".join(names[p] for p in self.parts) + " ...")
+            answers, t0 = {}, time.monotonic()
+            while len(answers) < len(self.parts) and time.monotonic() - t0 < CHECK_SECONDS:
+                for part in self.parts:
+                    if part not in answers:
+                        a = await asyncio.to_thread(self.control.check_answer, part, seq)
+                        if a is None and await asyncio.to_thread(self.control.is_finished, part):
+                            a = {"ok": False, "problem": f"Part {part[-1]} has stopped (see its log in the run folder)"}
+                        if a:
+                            answers[part] = a
+                await stop.sleep(0.5)
+            problems = [f"{names[p]}: " + (answers[p]["problem"] if p in answers else "no answer yet (still starting?)")
+                        for p in self.parts if not answers.get(p, {}).get("ok")]
+            if not problems:
+                await asyncio.to_thread(self.control.go)
+                log("pipeline", note="everything is signed in - documents, snapshots and sending start now")
+                return
+            say("Not ready yet:\n  - " + "\n  - ".join(problems) + "\nFix this in Edge, then press Enter again.")
+
+    async def relay(self, log, stdin) -> None:
+        """Part 1 / Part 2 / hand-over progress on this one console, a stop announced once, and a pause (e.g. System 2
+        sign-in expired) answered by your Enter here.  Runs until cancelled."""
+        asked, said_stop, prompt = 0, False, None
+        phases = {"part1": "system1", "part2": "system2", "coordinator": "handover"}
+        while True:
+            for ev in await asyncio.to_thread(self.control.new_events):
+                phase = phases.get(ev.get("part"), "pipeline") + ("-detail" if ev.get("level") == "detail" else "")
+                log(phase, note=ev.get("text", ""))
+            pause = await asyncio.to_thread(self.control.paused)
+            if pause and pause["seq"] > asked and (prompt is None or prompt.done()):
+                asked = pause["seq"]
+                log("WARNING", note=f"{pause['reason']} - sign in again in the systems Edge window, then press Enter here")
+                prompt = asyncio.ensure_future(self._resume_on_enter(stdin, pause["seq"], log))
+            stopped = await asyncio.to_thread(self.control.stopped)
+            if stopped and not said_stop:
+                said_stop = True
+                log("WARNING", note=f"STOPPING: {stopped.get('reason', '')} - no new downloads or sends; "
+                                    "answers already sent are still collected")
+            await asyncio.sleep(0.5)
+
+    async def _resume_on_enter(self, stdin, seq: int, log) -> None:
+        if await stdin.line() is not None:
+            await asyncio.to_thread(self.control.resume, seq)
+            log("pipeline", note="continuing after your Enter")
+
+    def write_results(self, results: dict, journal) -> None:
+        """This run's outcome per instruction ID, for the coordinator's daily report."""
+        by_key = {c.key: c for c in self.cases}
+        out = {}
+        for key, (state, reason) in results.items():
+            case = by_key.get(key)
+            if case:
+                out[case.id] = {"state": state, "reason": reason,
+                                "left_out_files": journal.cases.get(key, {}).get("omitted", 0)}
+        self.P.write_json(self.paths.sub("status") / "part3-results.json", out)
+
+
+def scan_pipeline(ctx, journal, listed, feed):
+    """Pipeline start: every folder is still discovered (an interrupted send or an uncollected answer of an earlier
+    run is looked at as before), but the queue is only what has been handed over for THIS run's CSV."""
+    cases, _other, _excluded = discover(ctx.cfg, ctx.policy, local_salt(ctx.rt), ctx.red)
+    todo = [c for c in feed.poll() if c.id not in listed]
+    ctx.log("queue", note=f"{len(todo)} case(s) complete and ready now; {feed.expected(listed) - len(todo)} more "
+                          "on their way from System 1 / System 2")
+    return cases, todo, [feed.contract] if feed.contract else []
+
+
+# --------------------------------------------------------------------------------------------
 # 10. COMMANDS
 # --------------------------------------------------------------------------------------------
 
@@ -3783,6 +4029,13 @@ def prompt_version(cfg, message: str) -> str:
     stats = [os.stat(path) for path in (cfg.instructions_path, cfg.result_contract_path) if path]
     parts = "|".join(f"{st.st_size}|{st.st_mtime_ns}" for st in stats)
     return hashlib.sha256(f"{parts}|{message}".encode()).hexdigest()[:12]
+
+
+def general_guidance(cfg) -> str:
+    """The one review guidance file of 'send-only' runs (the pipeline attaches a Sub Worktype file per case instead)."""
+    if not cfg.instructions_path:
+        raise SenderError("send-only needs a general review guidance file - run 'Run.cmd setup' and give its path")
+    return cfg.instructions_path
 
 
 def context(cfg, need_runtime: bool = True):
@@ -3954,7 +4207,7 @@ def plan_command(args) -> int:
         ledger = Ledger(ctx.rt.ledger, ctx.cfg.persist_retries)
         listed = sync_ledger(journal, ledger, ctx.log)
         cases, other, excluded = discover(ctx.cfg, ctx.policy, local_salt(ctx.rt), ctx.red)
-        instr = [doc_of(ctx.policy.check(ctx.cfg.instructions_path, "review guidance"))]
+        instr = [doc_of(ctx.policy.check(general_guidance(ctx.cfg), "review guidance"))]
         if ctx.cfg.completion_mode == "json_result":
             instr.append(doc_of(ctx.policy.check(ctx.cfg.result_contract_path, "result contract")))
         print(f"{len(cases)} case folder(s), {excluded} excluded browser-profile folder(s), "
@@ -4112,7 +4365,7 @@ async def choose_model(entries, default, cfg, stdin, log):
 # --------------------------------------------------------------------------------------------
 
 REPORT_GUIDE = """\
-This file describes ONE run of copilot_case_sender.py on the FNZ VDI. It was written for a reviewing LLM that cannot see the VDI:
+This file describes ONE run of copilot_case_sender.py on the work VDI. It was written for a reviewing LLM that cannot see the VDI:
 read it, work out what happened and why, and answer with (1) a diagnosis per problem, (2) concrete changes to the code or settings
 that would fix it, (3) anything this report did not capture that you would need next time.
 
@@ -4329,7 +4582,7 @@ def scan_queue(ctx, journal, listed):
     """Case discovery -> (cases, todo, instr).  Runs in a thread while Edge starts and the cursor question is open."""
     cfg = ctx.cfg
     cases, other, excluded = discover(cfg, ctx.policy, local_salt(ctx.rt), ctx.red)
-    instr = [doc_of(ctx.policy.check(cfg.instructions_path, "review guidance"))]
+    instr = [doc_of(ctx.policy.check(general_guidance(cfg), "review guidance"))]
     if cfg.completion_mode == "json_result":
         instr.append(doc_of(ctx.policy.check(cfg.result_contract_path, "result contract")))
     todo, done = classify([c for c in cases if not c.blocked], ctx, journal, listed)
@@ -4341,12 +4594,13 @@ def scan_queue(ctx, journal, listed):
     return cases, todo, instr
 
 
-async def run_async(ctx, journal, ledger, listed, message) -> int:
+async def run_async(ctx, journal, ledger, listed, message, pipeline_dir=None) -> int:
     cfg, log = ctx.cfg, ctx.log
     stop = Stopper()
     browser = EdgeBrowser(cfg, ctx.rt, ctx.policy, log, stop)
     runner = Runner(cfg, ctx.rt, ctx.policy, journal, ledger, log, stop, browser, ctx.red, message, [])
     runner.prompt_version = prompt_version(cfg, message)
+    feed = runner.feed = PipelineFeed(pipeline_dir, ctx, local_salt(ctx.rt)) if pipeline_dir else None
     cases = []
     code, results, crash, started, start_seq, bfacts = 0, {}, None, time.monotonic(), journal.seq, None
     intents = any(r.get("state") == "send_intent" for r in journal.cases.values())
@@ -4355,14 +4609,18 @@ async def run_async(ctx, journal, ledger, listed, message) -> int:
     FOCUS.start()                                   # from now on Edge never keeps the keyboard from your app
     asking = ask_cursor(cfg, log)
     early = None if intents else asyncio.ensure_future(browser.start(launch=True))   # reconcile must look before any launch
-    topup = pretour = None
+    topup = pretour = relay = None
     try:
-        cases, todo, runner.instr = await asyncio.to_thread(scan_queue, ctx, journal, listed)
+        if feed:
+            cases, todo, runner.instr = await asyncio.to_thread(scan_pipeline, ctx, journal, listed, feed)
+        else:
+            cases, todo, runner.instr = await asyncio.to_thread(scan_queue, ctx, journal, listed)
         by_key = {c.key: c for c in cases}
-        wanted = max(1, min(int(cfg.warm_tabs), len([c for c in todo if runner.sent_ids.get(c.id) is None]) or 1))
+        coming = feed.expected(runner.sent_ids) if feed else len([c for c in todo if runner.sent_ids.get(c.id) is None])
+        wanted = max(1, min(int(cfg.warm_tabs), coming or 1))
         browser.want_tabs = wanted
         browser.want.set()
-        if early and todo:      # missing Copilot tabs start loading over the plain HTTP endpoint, before Playwright is connected
+        if early and (todo or coming):   # missing Copilot tabs start loading over the plain HTTP endpoint, before Playwright is connected
             topup = asyncio.ensure_future(browser.http_topup(wanted, early))
             pretour = asyncio.ensure_future(browser.http_tour(wanted, early))   # ... and are visited from that moment on
         if intents:
@@ -4376,16 +4634,20 @@ async def run_async(ctx, journal, ledger, listed, message) -> int:
         if early:
             async with progress(lambda: f"connecting to Edge: {browser.phase}"):
                 await early
-        elif (todo or resumable) and browser.context is None:
+        elif (todo or resumable or coming) and browser.context is None:
             await browser.start(launch=True)
         if topup:
             await asyncio.gather(topup, return_exceptions=True)   # an optimisation only: prepare_tabs opens whatever is still missing
         todo = [c for c in todo if runner.sent_ids.get(c.id) is None]
-        if todo:
-            await prepare_session(runner, browser, cfg, log, todo, asking)
+        if todo or (feed and coming):
+            await prepare_session(runner, browser, cfg, log, todo, asking, count=wanted if feed else None)
+        if feed:
+            terminal = runner.stdin = runner.stdin or DeferredStdin(asking)   # ONE reader of the keyboard for the run
+            relay = asyncio.ensure_future(feed.relay(log, terminal))
+            await feed.confirm_ready(terminal, log, stop)
         if resumable:
             await runner.resume(by_key)
-        if todo or runner.pending:
+        if todo or runner.pending or (feed and coming):
             await runner.run(collections.deque(todo))
         results = runner.results
     except Stopped:
@@ -4402,10 +4664,16 @@ async def run_async(ctx, journal, ledger, listed, message) -> int:
         code = code or 1
         raise
     finally:
-        for task in (early, topup, pretour):            # failed before the connection finished: never leave it running
+        for task in (early, topup, pretour, relay):     # failed before the connection finished: never leave it running
             if task and not task.done():
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
+        if feed:
+            cases = feed.cases                          # this run's cases (the daily report covers every CSV row)
+            try:
+                feed.write_results(runner.results, journal)
+            except OSError:
+                pass
         log.release()
         await CopilotTab.cursor.teardown()              # drawings removed from every tab; Edge itself stays open
         try:
@@ -4611,15 +4879,16 @@ class DeferredStdin:
             self.real.drain()
 
 
-async def prepare_session(runner, browser, cfg, log, todo, asking=None):
+async def prepare_session(runner, browser, cfg, log, todo, asking=None, count=None):
     """All needed tabs open at once -> sign-in -> model list (asked as soon as ONE tab shows it) while every other tab
-    gets ready -> nothing is sent until all tabs are ready.  The model is set in each tab as part of its own send."""
-    count = max(1, min(int(cfg.warm_tabs), len(todo)))
+    gets ready -> nothing is sent until all tabs are ready.  The model is set in each tab as part of its own send.
+    `count` (pipeline): tabs for the cases still to come, when none is complete yet."""
+    count = max(1, min(int(cfg.warm_tabs), count or len(todo)))
     tabs = await browser.prepare_tabs(count)       # existing Copilot tabs + blank tabs + new ones, all loading together
     # Edge work never waits for the cursor question: sign-in, tour and readiness run now; the cursor turns on/off the
     # moment you answer, and only the terminal (Enter fallback, model question) waits for that answer.
     cursor_on = asyncio.ensure_future(apply_cursor(cfg, asking)) if asking else None
-    stdin = DeferredStdin(asking)
+    stdin = runner.stdin = DeferredStdin(asking)
     tour = TabTour(browser, cfg, tabs)             # visits every still-loading tab (<= 1 s each) until all are ready
     handoff = getattr(browser, "tour_handoff", None)
     if handoff is not None:
@@ -4745,7 +5014,7 @@ def run_command(args) -> int:
     try:
         ledger = Ledger(ctx.rt.ledger, cfg.persist_retries)
         listed = sync_ledger(journal, ledger, ctx.log)
-        return asyncio.run(run_async(ctx, journal, ledger, listed, message))
+        return asyncio.run(run_async(ctx, journal, ledger, listed, message, getattr(args, "pipeline", None)))
     except BaseException as exc:
         if not getattr(ctx, "reported", None):       # failed before/outside the run loop: still leave a report
             ctx.log.trace(exc, "startup")
@@ -4771,8 +5040,11 @@ def main(argv=None) -> int:
     sub.add_parser("plan", help="dry run: show the queue and any blocked cases")
     r = sub.add_parser("run", help="send the queue (default)")
     r.add_argument("--detail", choices=("minimal", "full"), help="console detail for this run (overrides the setting)")
+    r.add_argument("--pipeline", metavar="RUN_DIR", help=argparse.SUPPRESS)   # started by orchestrator/run_pipeline.py only
+    o = sub.add_parser("send-only", help="send the case folders already in CASES_ROOT with the general review guidance")
+    o.add_argument("--detail", choices=("minimal", "full"), help="console detail for this run (overrides the setting)")
     args = p.parse_args(argv)
-    command = args.command or "run"
+    command = {"send-only": "run"}.get(args.command, args.command) or "run"
     try:
         if command == "setup":
             return setup_command()
