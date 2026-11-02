@@ -221,6 +221,8 @@ def pipeline_report(paths: P.Paths, plan: dict, rows: list, edge_offset=None) ->
                 out.append(f"  - attempt {t.get('attempt')}: {t.get('status')}" + (f" - {t['failure']}" if t.get("failure") else ""))
                 out += [f"    - capture: {x}" for x in t.get("captures") or []]
                 out += _document_lines(t.get("events") or [])
+                if t.get("trace"):
+                    out += ["    - error trace (file:line of every step):", "```"] + P.strip_queries(t["trace"]).splitlines() + ["```"]
         snaps = P.read_json(paths.diagnostics("part2") / "accounts.json") or {}
         out += ["", "## 3. Part 2 - System 2 snapshots, per account" + (f" (DENIED: {snaps['denied']})" if snaps.get("denied") else "")]
         out += [f"- {a}: " + json.dumps(v, ensure_ascii=False, default=str)[:600] for a, v in (snaps.get("accounts") or {}).items()] \

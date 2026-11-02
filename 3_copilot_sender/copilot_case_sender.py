@@ -4756,7 +4756,7 @@ def write_run_report(ctx, journal, cases, runner, bfacts, started, start_seq, co
             digest, size = "?", 0
         out = [f"# Run report - {datetime.datetime.now():%Y-%m-%d %H:%M:%S} (local) - exit code {code}", "", "## 0. How to read this report", REPORT_GUIDE,
                "## 1. Outcome", f"- command line: {red(' '.join(argv))}",
-               f"- duration: {time.monotonic() - started:.1f}s | exit code: {code} ({'ok' if code == 0 else 'see errors'}) | cases in scope: {len(cases)}",
+               f"- duration: {time.monotonic() - started:.1f}s | exit code: {code} ({'ok' if code == 0 else 'see errors'}) | cases that reached Copilot: {len(cases)}",
                f"- results by state: {dict(counts)}",
                f"- stopped by user: {runner.stop.is_set if runner else 'n/a'} | browser reconnects: {max(0, (bfacts or {}).get('connection_generation', 1) - 1)}",
                f"- uncaught error: {'none' if crash is None else type(crash).__name__ + ': ' + red(str(crash)[:500])}",
@@ -4793,7 +4793,8 @@ def write_run_report(ctx, journal, cases, runner, bfacts, started, start_seq, co
                 "Every case that did not end with a clean verdict, every CSV row that needs you, then every warning / retry / "
                 "fix-up / block of the run, then the tracebacks of caught or uncaught errors (frames: file:line function).", ""]
         out += [f"- {c.alias} ({c.id}): {results[c.key][0]} - {red(results[c.key][1] or '-')}"
-                for c in cases if c.key in results and results[c.key][0] not in DONE_STATES] or ["- every case of this run ended cleanly"]
+                for c in cases if c.key in results and results[c.key][0] not in DONE_STATES] or [
+                    "- every case that reached Copilot ended cleanly" if cases else "- no case reached Copilot in this run"]
         out += [f"- CSV row {r['row']} {r['instruction_id']}: {r['outcome']} - {r['detail']}" for r in workload if feed.P.needs_you(r)]
         out += ["", "```"] + [json.dumps(e, default=str) for e in abnormal[-400:]] + ["```", "", "```",
                 red("\n\n".join(errors) if errors else "no traceback recorded"), "```", ""]

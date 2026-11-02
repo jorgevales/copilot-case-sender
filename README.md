@@ -88,7 +88,8 @@ None of them lists environment variables or user / machine names, and every web 
 
 **Held, never sent** (each with a plain reason in the report):
 - System 1 shows a different account than the CSV;
-- Part 1 failed the case twice;
+- Part 1 failed the case twice (a program error - a mistake in the code, not a page problem - is not retried; its full
+  trace is in the pipeline report, and the same one on a second case stops Part 1: the rest are listed as not reached);
 - no instructions file for its Sub Worktype - checked on the search result, **before anything is downloaded**;
 - no System 2 snapshot (failed after one retry);
 - a folder with the same name already in CASES_ROOT.
@@ -457,6 +458,8 @@ skipped, not failed.
 | Part 3 live queue: a case finished mid-run is sent; its own instructions + contract, then snapshot, Audit Trail, documents in order; over the limit the last documents are left out | **Tested here** (real Runner, fake page) |
 | Stop after a send: nothing new sent, the sent answer still collected; sign-in check names what is missing; pause → Enter → resume | **Tested here** |
 | Part 1 case logic: `.work` folder, account mismatch held without retry, one clean retry, stop between documents and Audit Trail, one-System-1-tab check, no guidance = held before download | **Tested here** (scripted System 1 steps) |
+| Part 1 whole document step end to end (direct, document window, straight download; windows closed, listeners removed); program error not retried with its trace; the same program error on 2 cases stops Part 1, the rest listed as not reached | **Tested here** (scripted browser) |
+| Code check: no call passes a keyword already given by position (the bug that failed every case on the VDI, 2026-11-02) | **Tested here** (`tests/test_code_checks.py`) |
 | Part 1 downloads: viewer address paired by document ID (position only when no address names an ID and counts match); a viewer page's own file fetched; a document window read without clicking inside it (its address, the file it shows, a download it starts, its own toolbar button only) | **Tested here** (fake responses / window; pairing run in Node). Real System 1 viewer: **needs your VDI** |
 | Part 2: Access Denied vs expired sign-in vs normal page; Access Denied twice stops the run; expired → pause → fresh cookies; only System 2 cookies read; the failing page kept with addresses cut | **Tested here** (synthetic pages) |
 | Copilot refusals: blocked chat (with and without a reply) ends the case, nothing clicked; refusal resent and confirmed; responses file with replies, buttons and `...` menu; odd verdicts flagged | **Tested here** (fake page). Real refusal page: **needs your VDI** |

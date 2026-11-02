@@ -77,6 +77,12 @@ class CaseHeld(Exception):
     """This case must not be sent (e.g. System 1 shows another account than the CSV): no retry, reported as held."""
 
 
+# A mistake in this program, not a page problem: it fails the same way every time, so it is never retried, its full
+# trace goes to the report, and the same one on two cases in a row stops Part 1 (VDI 2026-11-02: one TypeError failed
+# every case twice).
+PROGRAM_ERRORS = (TypeError, AttributeError, NameError, KeyError, IndexError, ImportError)
+
+
 def configure(cfg):
     global ENTRY, ORIGIN, APP_BASE, VIEWER_MARKER, BRAND_TEXT, BRAND_HTML, WORK_ROOT, GUIDANCE_DIR, CONTRACT
     ENTRY = cfg.system1_url
@@ -146,7 +152,8 @@ def safe(v, fallback="Unknown", max_length=96):
     keep = max(12, max_length-len(suffix)-len(digest)-1)
     return f"{stem[:keep].rstrip()}_{digest}{suffix}"
 
-def event(items, name, **details):
+def event(items, name, /, **details):
+    """Positional-only: a detail may itself be called `name` or `items` (VDI 2026-11-02: name=... crashed every case)."""
     items.append({"at": now(), "event": name, **details})
     print(name, flush=True)
 def unique(folder, name):
@@ -974,7 +981,7 @@ class StopRun(Exception):
 
 async def process_instruction_once(context,page,case,batch_index,batch_total,attempt,control=None):
     iid=case['iid']
-    events=[];rows=[];meta={};sub=P.UNKNOWN_SUB;download_path=None;failure=None;captures=[]
+    events=[];rows=[];meta={};sub=P.UNKNOWN_SUB;download_path=None;failure=None;captures=[];trace='';program_error=False
     started=time.monotonic()
     print(f'[{batch_index}/{batch_total}] {iid} - attempt {attempt}/2',flush=True)
     try:
@@ -1021,8 +1028,13 @@ async def process_instruction_once(context,page,case,batch_index,batch_total,att
         status='SUCCESS'
     except Exception as exc:
         failure=str(exc) if isinstance(exc,CaseHeld) else f'{type(exc).__name__}: {exc}'
-        event(events,'run-failed',error=failure)
         status='HELD' if isinstance(exc,CaseHeld) else 'STOPPED' if isinstance(exc,StopRun) else 'FAILED'
+        if status=='FAILED':                       # file:line of every frame, for the report
+            trace=''.join(traceback.format_exception(type(exc),exc,exc.__traceback__))[-6000:]
+            program_error=isinstance(exc,PROGRAM_ERRORS)
+            if program_error:
+                failure='PROGRAM ERROR (not retried) - '+failure
+        event(events,'run-failed',error=failure)
         if status!='STOPPED':                      # what the System 1 tab showed at that moment, for the report
             try:
                 captures=await capture_page(await live(context,page),f'{iid}-attempt{attempt}-{status.lower()}')
@@ -1047,7 +1059,7 @@ async def process_instruction_once(context,page,case,batch_index,batch_total,att
         'files_downloaded':sum(bool(x.get('saved_file')) for x in rows),
         'download_path':str(download_path or ''),
         'elapsed_seconds':round(time.monotonic()-started,2),'failure':failure or '',
-        'events':events,'captures':captures,
+        'events':events,'captures':captures,'trace':trace,'program_error':program_error,
     }
     print(f'[{batch_index}/{batch_total}] attempt {attempt}/2 {status}: {iid}',flush=True)
     if status=='SUCCESS':
@@ -1057,16 +1069,16 @@ async def process_instruction_once(context,page,case,batch_index,batch_total,att
     return page,result
 
 async def process_instruction(context,page,case,batch_index,batch_total,control=None):
-    """Run each instruction once, retrying exactly once only after failure (never after a hold or a stop).
-    result['tries'] keeps every attempt (its events and captures) for the report."""
+    """Run each instruction once, retrying exactly once only after failure (never after a hold, a stop or a program
+    error).  result['tries'] keeps every attempt (its events, captures and error trace) for the report."""
     tries=[]
     for attempt in (1,2):
         page,result=await process_instruction_once(
             context,page,case,batch_index,batch_total,attempt,control
         )
-        tries.append({k:result.get(k) for k in ('attempt','status','failure','elapsed_seconds','events','captures')})
+        tries.append({k:result.get(k) for k in ('attempt','status','failure','elapsed_seconds','events','captures','trace')})
         result['tries']=tries
-        if result['status'] in ('SUCCESS','HELD','STOPPED'):
+        if result['status'] in ('SUCCESS','HELD','STOPPED') or result.get('program_error'):
             return page,result
         if control is not None and control.stopped():
             result['status']='STOPPED'
@@ -1143,6 +1155,53 @@ def write_diagnostics(paths,case,result):
         pass                                       # diagnostics never decide anything
 
 
+async def run_cases(context,page,todo,paths,control,say,counts):
+    """Every case of the run in CSV order; counts['done'/'held'] stay right even if this raises."""
+    bugs=collections.Counter()             # program error text -> cases it failed
+    for index,case in enumerate(todo,1):
+        if control.stopped():
+            say(f'stopped before {len(todo)-index+1} case(s) were downloaded')
+            break
+        iid=case['iid']
+        if reusable_download(paths,iid):
+            say(f'{iid} already downloaded by an earlier run - kept',iid=iid)
+            counts['done']+=1
+            continue
+        (paths.downloads/f'{iid}.json').unlink(missing_ok=True)
+        say(f'{iid} downloading ({index}/{len(todo)})','detail',iid)
+        page,result=await process_instruction(context,page,case,index,len(todo),control)
+        write_diagnostics(paths,case,result)
+        if result['status']=='SUCCESS':
+            sub,warnings=choose_sub_worktype(result['sub_worktype'],case.get('sub_worktype_csv',''))
+            P.write_json(paths.downloads/f'{iid}.json',{
+                'iid':iid,'account':P.norm_account(result['account_number']),'folder':result['folder'],
+                'sub_worktype':sub,'sub_worktype_system1':result['sub_worktype'],
+                'sub_worktype_csv':case.get('sub_worktype_csv',''),'warnings':warnings,
+                'documents':result['documents'],'audit':result['audit'],'finished':P.now()})
+            counts['done']+=1
+            say(f"{iid} downloaded: {len(result['documents'])} document(s) + Audit Trail "
+                f"in {result['elapsed_seconds']:.0f}s ({index}/{len(todo)})",iid=iid)
+            for w in warnings:
+                say(f'{iid} WARNING: {w}',iid=iid)
+        elif result['status']=='STOPPED':
+            say(f'{iid} left unfinished in .work (run stopping)',iid=iid)
+            break
+        else:
+            counts['held']+=1
+            control.hold(iid,'System 1: '+result['failure'],'part1')
+            say(f"{iid} NOT downloaded: {result['failure']}",iid=iid)
+            if result.get('program_error'):
+                bugs[result['failure']]+=1
+                if bugs[result['failure']]>=2:  # every later case would fail the same way
+                    rest=todo[index:]
+                    for c in rest:
+                        control.hold(c['iid'],'System 1: not reached - Part 1 stopped on a program error: '+result['failure'],'part1')
+                    counts['held']+=len(rest)
+                    say(f"PART 1 STOPPED: the same program error on 2 cases - {len(rest)} case(s) not reached. "
+                        f"{result['failure']} (full trace in the pipeline report)")
+                    break
+
+
 async def run_pipeline(run_dir):
     global CAPTURES
     import copilot_case_sender as sender            # Part 3's storage rules and fast Playwright start, reused as-is
@@ -1161,7 +1220,7 @@ async def run_pipeline(run_dir):
     t0=time.monotonic()
     pw,where,secs=await sender.start_driver(sender.load_playwright()[0],log,bool(cfg.node_executable),refresh=False)
     say(f'Playwright ready in {secs:.1f}s ({where})','detail')
-    done=held=0
+    counts={'done':0,'held':0}
     try:
         browser=None
         while browser is None:                     # the coordinator has just opened the systems Edge
@@ -1182,44 +1241,13 @@ async def run_pipeline(run_dir):
             mine=[p for p in context.pages if on_system1(p)]   # the one System 1 tab the sign-in check confirmed
             page=await open_or_recover_inbox(context,mine[0] if mine else None)
             page.set_default_timeout(4000)
-            for index,case in enumerate(todo,1):
-                if control.stopped():
-                    say(f'stopped before {len(todo)-index+1} case(s) were downloaded')
-                    break
-                iid=case['iid']
-                if reusable_download(paths,iid):
-                    say(f'{iid} already downloaded by an earlier run - kept',iid=iid)
-                    done+=1
-                    continue
-                (paths.downloads/f'{iid}.json').unlink(missing_ok=True)
-                say(f'{iid} downloading ({index}/{len(todo)})','detail',iid)
-                page,result=await process_instruction(context,page,case,index,len(todo),control)
-                write_diagnostics(paths,case,result)
-                if result['status']=='SUCCESS':
-                    sub,warnings=choose_sub_worktype(result['sub_worktype'],case.get('sub_worktype_csv',''))
-                    P.write_json(paths.downloads/f'{iid}.json',{
-                        'iid':iid,'account':P.norm_account(result['account_number']),'folder':result['folder'],
-                        'sub_worktype':sub,'sub_worktype_system1':result['sub_worktype'],
-                        'sub_worktype_csv':case.get('sub_worktype_csv',''),'warnings':warnings,
-                        'documents':result['documents'],'audit':result['audit'],'finished':P.now()})
-                    done+=1
-                    say(f"{iid} downloaded: {len(result['documents'])} document(s) + Audit Trail "
-                        f"in {result['elapsed_seconds']:.0f}s ({index}/{len(todo)})",iid=iid)
-                    for w in warnings:
-                        say(f'{iid} WARNING: {w}',iid=iid)
-                elif result['status']=='STOPPED':
-                    say(f'{iid} left unfinished in .work (run stopping)',iid=iid)
-                    break
-                else:
-                    held+=1
-                    control.hold(iid,'System 1: '+result['failure'],'part1')
-                    say(f"{iid} NOT downloaded: {result['failure']}",iid=iid)
+            await run_cases(context,page,todo,paths,control,say,counts)
         finally:
             await cursor.close()
     finally:
         await pw.stop()                            # disconnects only: the systems Edge stays open as it is
-        control.finished('part1',downloaded=done,held=held)
-    say(f'finished: {done} case(s) downloaded, {held} not downloaded')
+        control.finished('part1',downloaded=counts['done'],held=counts['held'])
+    say(f"finished: {counts['done']} case(s) downloaded, {counts['held']} not downloaded")
     return 0
 
 

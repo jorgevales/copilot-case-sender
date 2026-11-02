@@ -600,6 +600,124 @@ class Popup:
         self.clicked.append(sel)
         raise AssertionError("nothing may be clicked in this test")
 
+    def on(self, event, fn):
+        pass
+
+    def is_closed(self):
+        return getattr(self, "closed", False)
+
+    async def close(self):
+        self.closed = True
+
+
+class Download:
+    def __init__(self, data, name):
+        self.data, self.suggested_filename = data, name
+
+    async def save_as(self, path):
+        Path(path).write_bytes(self.data)
+
+
+class S1Page:
+    """System 1's case page: its Received Documents rows (what document_rows reads) and what a View click does."""
+    def __init__(self, ctx, rows, on_view):
+        self.ctx, self.rows, self.on_view, self.marked = ctx, rows, on_view, None
+        self.listeners, self.context = collections.defaultdict(list), type("NoCursor", (), {})()   # no visual cursor here
+
+    async def evaluate(self, script, arg=None):
+        if "data-s4-document-view" in script:       # mark_document_view
+            self.marked = arg
+            return True
+        return [dict(r) for r in self.rows]          # document_rows
+
+    def on(self, event, fn):
+        self.listeners[event].append(fn)
+
+    def remove_listener(self, event, fn):
+        self.listeners[event].remove(fn)
+
+    def fire(self, event, value):
+        for fn in list(self.listeners[event]):
+            fn(value)
+
+    def locator(self, sel):
+        page = self
+
+        class L:
+            def __init__(self):
+                self.page = page
+
+            async def click(self, **k):
+                page.on_view(page, page.marked)
+        return L()
+
+
+def test_part1_whole_document_step_direct_window_and_straight_download(base):
+    """The real download_documents end to end (only the browser is scripted): this is the step that crashed on the VDI."""
+    paths, _ = p1_setup(base)
+    folder = base / "f"
+    folder.mkdir()
+    o = "https://system1.example.invalid"
+    ctx = Ctx({o + "/view/a": Resp(b"%PDF-a"), o + "/view/b": Resp(b"<html>viewer, nothing inside</html>", ctype="text/html"),
+               o + "/files/b.pdf": Resp(b"%PDF-b")})
+    windows = []
+
+    def on_view(page, row):
+        if row["documentId"] == "id-b":              # a document window showing the PDF (Edge's viewer)
+            win = Popup(o + "/files/b.pdf")
+            windows.append(win)
+            ctx.pages.append(win)
+            page.fire("popup", win)
+        else:                                       # a Word file: downloads straight away
+            page.fire("download", Download(b"PK\x03\x04", "c.docx"))
+    rows = [{"index": 0, "documentName": "A.pdf", "documentId": "id-a", "viewerUrl": o + "/view/a", "pairing": "id", "viewerUrlsOnPage": 2},
+            {"index": 1, "documentName": "B.pdf", "documentId": "id-b", "viewerUrl": o + "/view/b", "pairing": "id", "viewerUrlsOnPage": 2},
+            {"index": 2, "documentName": "C.docx", "documentId": "id-c", "pairing": "none", "viewerUrlsOnPage": 2}]
+    page = S1Page(ctx, rows, on_view)
+    ctx.pages = [page]
+    events = []
+    out = T.run(P1.download_documents(ctx, page, folder, events))
+    assert [r["saved_file"] for r in out] == ["A.pdf", "B.pdf", "C.docx"]
+    assert [r["status"] for r in out] == ["direct-viewer-download", "file-at-document-window-address", "ui-view-downloaded-directly"]
+    results = [e for e in events if e["event"] == "document-result"]
+    assert [e["name"] for e in results] == ["A.pdf", "B.pdf", "C.docx"] and results[0]["directRoute"] == "ok"
+    assert "page" in results[1]["directRoute"] and "no viewer address" in results[2]["directRoute"]
+    assert windows and all(w.closed for w in windows) and not any(w.clicked for w in windows)
+    assert not page.listeners["popup"] and not page.listeners["download"]          # listeners removed again
+
+
+def test_part1_a_program_error_is_not_retried_and_keeps_its_trace(base, monkeypatch):
+    paths, control = p1_setup(base)
+    fakes = P1Fakes(P1, monkeypatch)
+
+    async def broken(context, page, folder, events):
+        raise TypeError("event() got multiple values for argument 'name'")
+    monkeypatch.setattr(P1, "download_documents", broken)
+    case = {"iid": hexid(1), "account": "AB100000", "sub_worktype_csv": "x"}
+    _, result = T.run(P1.process_instruction(None, "page", case, 1, 1, control))
+    assert result["status"] == "FAILED" and result["attempt"] == 1 and len(result["tries"]) == 1 and fakes.calls["audit"] == 0
+    assert result["failure"].startswith("PROGRAM ERROR (not retried) - TypeError")
+    assert "Traceback" in result["tries"][0]["trace"] and "test_pipeline.py" in result["tries"][0]["trace"]
+
+
+def test_part1_stops_when_the_same_program_error_hits_a_second_case(base, monkeypatch):
+    paths, control = p1_setup(base)
+    bug = "PROGRAM ERROR (not retried) - TypeError: boom"
+    outcome = {hexid(1): bug, hexid(2): "no instructions file for Sub Worktype 'X'", hexid(3): bug}
+
+    async def fake(context, page, case, i, n, control):
+        return page, {"status": "FAILED" if outcome[case["iid"]] == bug else "HELD", "failure": outcome[case["iid"]],
+                      "program_error": outcome[case["iid"]] == bug, "tries": []}
+    monkeypatch.setattr(P1, "process_instruction", fake)
+    said, counts = [], {"done": 0, "held": 0}
+    todo = [{"iid": hexid(n), "sub_worktype_csv": "x"} for n in range(1, 6)]
+    T.run(P1.run_cases(None, "page", todo, paths, control, lambda text, *a, **k: said.append(text), counts))
+    held = control.held()
+    assert counts == {"done": 0, "held": 5} and set(held) == {hexid(n) for n in range(1, 6)}
+    assert "not reached - Part 1 stopped on a program error" in held[hexid(4)]["reason"]
+    assert any(s.startswith("PART 1 STOPPED") and "2 case(s) not reached" in s for s in said)
+    assert not any(hexid(4) in s and "downloading" in s for s in said)
+
 
 def test_part1_document_window_is_read_without_clicking_inside_the_document(base):
     paths, _ = p1_setup(base)
