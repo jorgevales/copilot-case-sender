@@ -382,6 +382,7 @@ DEFAULTS = {
     "system2_party_marker": "",       # text found in the links to a linked party's profile page
     "system2_party_links_page": "",   # the page listing a party's other customers/accounts, {party} where its ID goes
     "system2_detail_pages": {},       # the nine account-detail pages (shared.pipeline.DETAIL_SECTIONS), {account} in each
+    "system2_customer_summary_page": "",  # the customer summary page (Charity Commission Number), {customer} = Client Number
     "systems_cdp_port": 9223,         # Edge for System 1 + 2 (its own remembered profile); Copilot stays on cdp_port
     "last_csv_path": "",              # the daily CSV used last time (offered as the default)
 }
@@ -530,6 +531,9 @@ def setup_command() -> int:
     print("  The nine account-detail pages, each with {account} where the account number goes:")
     pages = cur.get("system2_detail_pages") or {}
     cur["system2_detail_pages"] = {name: ask_text(f"    {name} page address", pages.get(name) or "") for name in DETAIL_SECTIONS}
+    cur["system2_customer_summary_page"] = ask_text(
+        "  Customer summary page address (it shows the Charity Commission Number), with {customer} where the\n"
+        "  CSV's Client Number goes", cur.get("system2_customer_summary_page") or "")
     node = next((str(p) for p in exe_candidates("node") if p.is_file()), "")
     value = ask("Node.js node.exe (optional; Enter = use the copy bundled with Playwright)", cur.get("node_executable") or node, True)
     cur["node_executable"] = str(resolve_file(value, "node.exe") or "") if value else ""

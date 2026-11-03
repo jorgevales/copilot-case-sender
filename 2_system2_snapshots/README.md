@@ -33,7 +33,34 @@ repository is public):
 - `system2_party_marker`: the text in the party profile links;
 - `system2_party_links_page`: with `{party}`;
 - `system2_detail_pages`: the nine account-detail pages, each with `{account}` (setup asks for them one by one; the
-  run does not start while one is missing).
+  run does not start while one is missing);
+- `system2_customer_summary_page`: with `{customer}` where the CSV's Client Number goes; required, and on the same
+  host as `system2_url` (the run does not start otherwise). Its address is never printed, logged or written.
+
+**Charity Commission Number** (2026-11-03). The complete account profile may also hold a customer-level
+`Client Charity Commission Number` in each matching `Account Summary → metadata → csvMatches` row:
+- read from the separately configured customer summary page, for the row's **CSV Client Number as given** (trimmed,
+  leading zeros kept; no account-summary fallback, a row with a blank Client Number gets no request);
+- requested **once per Client Number per run**, however many rows or accounts share it, in the same 40-worker pool and
+  through the same session, retry, pause, Access-Denied stop and stop signal as every other page;
+- the answer must stay on the configured page (a redirect is rejected, never merged). The page is not checked
+  against the customer number (it does not show one);
+- read from the visible `Additional Info` panel, visible row `Charity Commission Number` (spacing, case and a trailing
+  colon ignored; hidden panels / rows / cells, buttons and editable controls ignored; a static display wins), as text
+  exactly as shown;
+- the key goes **right after `Client Number`**, on every row of that customer and only there; nothing else in a row
+  changes and no row is added. `""` only when the field is on the page and blank; when the field is not shown or the
+  page was not captured, the key is left out;
+- `metadata.customerAdditionalInfo` records each Client Number's result: `captureStatus` (`Captured` /
+  `Blank on Register` / `Not available` / `Not captured (...)`), `completeness` (`outcome`, `panelFound`,
+  `fieldFound`) and `sourceReference: "configured customer summary page"` (no address);
+- **optional**: a page not captured never holds a case. The snapshot is saved, the console says so, and a same-day
+  re-run fetches that account again (also any snapshot made before this change);
+- read back after writing: rows unchanged in number and order, the key's place, exact text and customer, else the
+  file is set aside as `.incomplete.json`;
+- `diagnostics\part2\accounts.json` holds counts only (`customer_summary_pages_requested` / `_reused` /
+  `charity_numbers_extracted` / `_confirmed_blank` / `charity_number_fields_not_shown` / `customer_summary_pages_failed`),
+  never a number, a customer or an address. Private routes stay in the git-ignored config.
 
 **Nine account-detail pages** (2026-11-03): `01 Personal Details`, `02 Contact Details`, `03 Correspondence Details`,
 `04 Trading Details`, `05 Banking Details`, `06 Other Details`, `07 Suspended Activity`, `08 Future Dated

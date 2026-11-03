@@ -51,16 +51,21 @@ def pipeline_problems(cfg) -> list:
                       ("system2_account_page", "System 2 account summary page address"),
                       ("system2_party_marker", "System 2 party profile link text"),
                       ("system2_party_links_page", "System 2 party links page address"),
+                      ("system2_customer_summary_page", "System 2 customer summary page address"),
                       ("guidance_dir", "guidance folder (one .md per Sub Worktype)")):
         if not getattr(cfg, key, ""):
             out.append(f"{what} is not set")
-    for key in ("system1_url", "system2_url", "system2_account_page", "system2_party_links_page"):
+    for key in ("system1_url", "system2_url", "system2_account_page", "system2_party_links_page", "system2_customer_summary_page"):
         u = urlparse(getattr(cfg, key, "") or "")
         if getattr(cfg, key, "") and (u.scheme not in ("https", "http") or not u.netloc):
             out.append(f"{key} is not a web address")
-    for key, slot in (("system2_account_page", "{account}"), ("system2_party_links_page", "{party}")):
+    for key, slot in (("system2_account_page", "{account}"), ("system2_party_links_page", "{party}"),
+                      ("system2_customer_summary_page", "{customer}")):
         if getattr(cfg, key, "") and slot not in getattr(cfg, key):
             out.append(f"{key} must contain {slot} where the value goes")
+    customer, home = urlparse(getattr(cfg, "system2_customer_summary_page", "") or ""), urlparse(getattr(cfg, "system2_url", "") or "")
+    if customer.netloc and home.netloc and customer.netloc.lower() != home.netloc.lower():
+        out.append("system2_customer_summary_page must be on the same host as system2_url (the System 2 sign-in)")
     pages = getattr(cfg, "system2_detail_pages", None) or {}
     for name in P.DETAIL_SECTIONS:                  # every account-detail page is mandatory for a complete snapshot
         page = pages.get(name, "") if isinstance(pages, dict) else ""

@@ -39,7 +39,8 @@ stay in your local, git-ignored `sender_config.json`.
      pattern(s).
    - **System 2, where the account snapshots are retrieved from:** a page that shows "logout" when signed in, the
      account summary page (with `{account}`), the text that marks a party profile link, the party links page
-     (with `{party}`), and the nine account-detail pages (each with `{account}`).
+     (with `{party}`), the nine account-detail pages (each with `{account}`) and the customer summary page (with
+     `{customer}`, for the Charity Commission Number; see `2_system2_snapshots/README.md`).
 
    These stay only in your local, git-ignored `sender_config.json`. **No System 1 / System 2 address is written in
    the code.** Enter keeps a shown value. Run `Run.cmd setup` again at any time to edit.

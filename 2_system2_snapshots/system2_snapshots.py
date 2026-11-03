@@ -16,11 +16,13 @@ script: every parser, route, field label, the 24/40 worker pools and the output 
   - any other failed account is retried once, then reported (its cases are held, never sent without a snapshot);
   - a party/link page is requested once (the original's eager setdefault could submit duplicates);
   - the nine account-detail pages (2026-11-03) go through the same requests, retry, pause, stop and party pool; the
-    snapshot is written only when every one of them was read or positively confirmed empty.
+    snapshot is written only when every one of them was read or positively confirmed empty;
+  - the customer summary page (2026-11-03) of each CSV Client Number, once per run, in the same pool: its Charity
+    Commission Number goes into the CSV match rows of that customer (optional - a page not captured holds nothing).
 """
 from __future__ import annotations
 
-import argparse,json,os,re,sys,threading,time,traceback
+import argparse,hashlib,json,os,re,sys,threading,time,traceback
 from concurrent.futures import CancelledError,ThreadPoolExecutor,as_completed
 from datetime import datetime,timezone
 from html import unescape as html_unescape
@@ -39,7 +41,8 @@ requests=BeautifulSoup=Tag=NavigableString=HTTPAdapter=None
 # System 2's pages are pasted once in setup and kept only in the local config - never written in this code.
 PORT=9223; BASE=""; CHECK_URL=""; ACCOUNT_PAGE=""; PARTY_MARKER=""; LINKS_PAGE=""; ACCOUNT_COLUMN="Client Account Number"
 DETAIL_PAGES={}   # {P.DETAIL_SECTIONS name: address with {account}}
-ACCOUNT_WORKERS=24; PARTY_WORKERS=40; CONNECTIONS=80   # party, link AND account-detail pages share the party pool
+CUSTOMER_PAGE=""  # the customer summary page, {customer} where the CSV's Client Number goes
+ACCOUNT_WORKERS=24; PARTY_WORKERS=40; CONNECTIONS=80   # party, link, account-detail AND customer pages share the party pool
 DETAIL_WORKERS=9  # only when fetch_all_account_sections is called without the run's pool
 TL=threading.local(); COOKIES=[]; UA="Mozilla/5.0"; COOKIE_GEN=0
 CAPTURES=None   # RUNTIME_ROOT\logs\captures\<run>: the page System 2 answered with when an account fails
@@ -69,12 +72,13 @@ def load_libs():
 
 
 def configure(cfg):
-    global PORT,BASE,CHECK_URL,ACCOUNT_PAGE,PARTY_MARKER,LINKS_PAGE,DETAIL_PAGES
+    global PORT,BASE,CHECK_URL,ACCOUNT_PAGE,PARTY_MARKER,LINKS_PAGE,DETAIL_PAGES,CUSTOMER_PAGE
     u=urlparse(cfg.system2_url)
     PORT=int(cfg.systems_cdp_port); BASE=f"{u.scheme}://{u.netloc}"; CHECK_URL=cfg.system2_url
     ACCOUNT_PAGE=cfg.system2_account_page; PARTY_MARKER=cfg.system2_party_marker.lower(); LINKS_PAGE=cfg.system2_party_links_page
     pages=getattr(cfg,"system2_detail_pages",None) or {}
     DETAIL_PAGES={n:(pages.get(n) or "") for n in P.DETAIL_SECTIONS}
+    CUSTOMER_PAGE=getattr(cfg,"system2_customer_summary_page","") or ""
 
 
 def clean(v): return re.sub(r"\s+"," ",str(v or "")).strip()
@@ -607,9 +611,9 @@ def detail_value(node):
     st=node.select_one(STATIC)
     if st is not None and not detail_hidden(st,node):return detail_value_text(st)
     return detail_value_text(node)
-def detail_value_text(node):
+def detail_value_text(node,controls=True):
     """Visible text: hidden parts, scripts, styles, buttons, icons, SVG, noscript, action / button links and soft-close
-    controls left out; a control inside gives its current value (a tick box: Yes / No)."""
+    controls left out; a control inside gives its current value (a tick box: Yes / No), or nothing with controls=False."""
     parts=[]
     for ch in node.children:
         if isinstance(ch,NavigableString):
@@ -620,8 +624,9 @@ def detail_value_text(node):
         if ch.get("role")=="button" or any(c.startswith(("fa-","glyphicon")) for c in cls) or "softclose" in (ch.get("id") or "").lower():continue
         if ch.name=="a" and (any(c=="btn" or c.startswith("btn-") for c in cls) or clean(ch.get_text(" ",strip=True)).casefold() in DETAIL_ACTIONS):continue
         if ch.name in ("input","select","textarea"):
+            if not controls:continue
             v=detail_value(ch);parts.append(("Yes" if v else "No") if isinstance(v,bool) else v)
-        else:parts.append(detail_value_text(ch))
+        else:parts.append(detail_value_text(ch,controls))
     return clean(" ".join(parts))
 def detail_put(target,key,value):
     """A labelled value; the same label again with another value becomes a list (source order, each value once).
@@ -963,13 +968,16 @@ def fetch_account_section(a,name,route):
         copies=capture_page(f"{a}-{name}",r,s,f"{comp['outcome']}: {comp.get('reason','')}")
         if copies:comp["pageCopies"]=copies
     return out
+def failure_why(exc):
+    """Why a page could not be retrieved, in plain words (never an address or a value)."""
+    page=getattr(exc,"page",None)
+    return {WrongAccount:"the page was for another account",WrongPage:"System 2 redirected to another page",
+            AccessDenied:"System 2 refused access",SessionExpired:"the System 2 sign-in expired",RunStopped:"the run was stopping",
+            CancelledError:"cancelled (the run was stopping)"}.get(type(exc)) or type(exc).__name__+(f" (HTTP {page[0].status_code})" if page else "")
 def section_failure(a,name,exc):
     """A page that could not be retrieved (after its retry) as a section entry - never blank data."""
     outcome=ACCOUNT_FAILED if isinstance(exc,WrongAccount) else REQUEST_FAILED
-    page=getattr(exc,"page",None)
-    why={WrongAccount:"the page was for another account",WrongPage:"System 2 redirected to another page",
-         AccessDenied:"System 2 refused access",SessionExpired:"the System 2 sign-in expired",RunStopped:"the run was stopping",
-         CancelledError:"cancelled (the run was stopping)"}.get(type(exc)) or type(exc).__name__+(f" (HTTP {page[0].status_code})" if page else "")
+    why=failure_why(exc)
     comp={"outcome":outcome,"sectionFound":False,"reason":why}
     copies=[] if isinstance(exc,(RunStopped,CancelledError)) else capture(f"{a}-{name}",exc)
     if copies:comp["pageCopies"]=copies
@@ -1011,6 +1019,175 @@ def bank_count(details):
 def fdt_rows(details):
     return detail_rows({n:e for n,e in details.items() if n=="08 Future Dated Instructions"})
 
+# ---------------------------------------------------------------------------------------------- customer summary page
+# The customer-level Charity Commission Number (2026-11-03): the visible 'Additional Info' panel of the customer summary
+# page (system2_customer_summary_page, {customer} = the CSV's Client Number; pasted in setup, never in this code), its
+# visible row 'Charity Commission Number'.  Requested once per Client Number per run, in the shared party pool (same
+# session, retry, pause, Access-Denied stop).  The Client Number is used as given: no account-summary fallback, no check
+# of the page against it - only that the answer stayed on the configured page (user, 2026-11-03).  Optional: a page not
+# captured never holds a case; the snapshot says so (metadata.customerAdditionalInfo) and is fetched again on a
+# same-day re-run.
+CHARITY_KEY="Client Charity Commission Number"; CUSTOMER_SOURCE="configured customer summary page"
+ADDITIONAL_INFO,CHARITY_LABEL="additional info","charity commission number"
+NOT_SHOWN="Confirmed not shown"
+CUSTOMER_ACCEPTED=(EXTRACTED,EMPTY,NOT_SHOWN)   # the page was read; anything else = not captured (fetched again next run)
+CUSTOMER_MERGED=(EXTRACTED,EMPTY)               # these put the key in the rows ('' only when the field was found blank)
+
+
+def customer_norm(v):return label(v).casefold()
+def client_key(row):
+    """The CSV match row's Client Number key, in the CSV's own spelling (None = not in the row)."""
+    return next((k for k in row if normhead(k)=="clientnumber"),None)
+def client_number(row):
+    k=client_key(row);return str(row.get(k) or "").strip() if k else ""
+def customer_numbers(matches):
+    """The distinct Client Numbers of an account's CSV matches, in row order (blank ones left out)."""
+    return list(dict.fromkeys(c for c in map(client_number,matches) if c))
+def customer_label(customer):
+    """A page-copy name that never shows the Client Number."""
+    return "customer-summary-"+hashlib.sha256(customer.encode("utf-8")).hexdigest()[:10]
+def charity_value(cell):
+    """A value cell's displayed value: a visible static display, else its visible text (controls left out), else a
+    visible read-only / disabled control's value.  An editable control is never taken for the saved value."""
+    st=next((x for x in cell.select(STATIC) if not detail_hidden(x,cell)),None)
+    if st is not None:return detail_value_text(st,controls=False)
+    text=detail_value_text(cell,controls=False)
+    if text:return text
+    for c in cell.find_all(["input","textarea"]):
+        if not detail_hidden(c,cell) and (c.has_attr("readonly") or c.has_attr("disabled")):
+            v=detail_value(c)
+            if isinstance(v,str) and v:return v
+    return ""
+def additional_info_panels(s):
+    """Every visible panel whose own heading reads 'Additional Info' (spacing, case and a trailing colon ignored)."""
+    out=[]
+    for hd in s.select(".panel-heading"):
+        p=hd.find_parent(lambda t:"panel" in (t.get("class") or []))
+        if p is None or p in out or detail_hidden(hd) or customer_norm(detail_value_text(hd,controls=False))!=ADDITIONAL_INFO:continue
+        out.append(p)
+    return out
+def charity_values(panel):
+    """The displayed values of every visible 'Charity Commission Number' row in one panel: label/value table rows (the
+    row's first labelled cell, then the next visible cell); only when no row has it, a label element followed by its
+    value inside the same panel.  [] = the field is not shown."""
+    vals=[]
+    for r in panel.find_all("tr"):
+        if detail_hidden(r,panel):continue
+        cells=[c for c in r.find_all(["td","th"],recursive=False) if not detail_hidden(c,panel)]
+        if any(c.find("table") for c in cells):continue
+        texts=[detail_value_text(c,controls=False) for c in cells]
+        i=next((n for n,t in enumerate(texts) if t),None)
+        if i is not None and customer_norm(texts[i])==CHARITY_LABEL:vals.append(charity_value(cells[i+1]) if i+1<len(cells) else "")
+    if vals:return vals
+    for lab in panel.find_all(["label","dt","strong","b","span"]):
+        if lab.find_parent("tr") is not None or detail_hidden(lab,panel) or customer_norm(detail_value_text(lab,controls=False))!=CHARITY_LABEL:continue
+        sib=next((x for x in lab.find_next_siblings() if not detail_hidden(x,panel)),None)
+        vals.append(charity_value(sib) if sib is not None else "")
+    return vals
+def customer_result(status,value,outcome,panel,field,why=""):
+    comp={"outcome":outcome,"panelFound":panel,"fieldFound":field}
+    if why:comp["reason"]=why
+    return {"captureStatus":status,"value":value,"completeness":comp}
+def parse_customer_charity_number(s):
+    """The customer summary page -> {captureStatus, value, completeness}.  The value is text as shown (leading zeros and
+    formatting kept).  A missing value is never read as 'none': the panel must be found first."""
+    panels=additional_info_panels(s)
+    if not panels:return customer_result(NOT_CAPTURED,None,UNEXPECTED,False,False)
+    vals=list(dict.fromkeys(v for p in panels for v in charity_values(p)))
+    if not vals:return customer_result("Not available",None,NOT_SHOWN,True,False)
+    shown=[v for v in vals if v] or vals                          # a displayed value wins over an empty duplicate row
+    if len(shown)>1:return customer_result(NOT_CAPTURED,None,UNEXPECTED,True,True,"the field shows different values")
+    if not shown[0]:return customer_result("Blank on Register","",EMPTY,True,True)
+    return customer_result("Captured",shown[0],EXTRACTED,True,True)
+def fetch_customer_additional_info(customer):
+    """One Client Number's customer summary page through soup_get (same session, retry, pause, Access-Denied stop,
+    page copy on failure), used only when it stayed on the configured page; a redirect raises (retried once)."""
+    GATE.check()
+    if not CUSTOMER_PAGE:
+        return customer_result(f"{NOT_CAPTURED} (no page address is configured for it)",None,NOT_FOUND,False,False,"no page address is configured")
+    url=CUSTOMER_PAGE.replace("{customer}",quote(customer,safe=""));r,s=soup_get(url)
+    if not same_route(r.url,url):
+        e=WrongPage("customer summary: System 2 answered from another page (redirected)");e.page=(r,s);raise e
+    out=parse_customer_charity_number(s)
+    if out["completeness"]["outcome"] not in CUSTOMER_ACCEPTED:
+        copies=capture_page(customer_label(customer),r,s,out["completeness"]["outcome"])
+        if copies:out["completeness"]["pageCopies"]=copies
+    return out
+def customer_failure(customer,exc):
+    """A customer summary page that could not be retrieved (after its retry) - never 'no number'."""
+    why=failure_why(exc)
+    out=customer_result(f"{NOT_CAPTURED} ({why})",None,REQUEST_FAILED,False,False,why)
+    copies=[] if isinstance(exc,(RunStopped,CancelledError)) else capture(customer_label(customer),exc)
+    if copies:out["completeness"]["pageCopies"]=copies
+    return out
+def submit_customers(pool,futures,matches):
+    """Each Client Number of these CSV matches not asked for yet this run -> one request.  -> how many were reused."""
+    reused=0
+    for c in customer_numbers(matches):
+        if c in futures:reused+=1
+        else:futures[c]=pool.submit(with_retry,fetch_customer_additional_info,c)
+    return reused
+def collect_customers(futures):
+    out={}
+    for c,f in futures.items():
+        try:
+            out[c]=f.result()
+        except Exception as e:
+            out[c]=customer_failure(c,e)
+    return out
+def merge_customer_additional_info(summary,results):
+    """Every CSV match row whose Client Number's page was read with the field shown gets 'Client Charity Commission
+    Number' right after its Client Number (the value as text; '' only when the field was found blank).  Nothing else in
+    a row changes; no row is added.  metadata.customerAdditionalInfo records each Client Number's outcome (no address).
+    -> how many rows have no Client Number (no request was made for them)."""
+    meta=summary.setdefault("metadata",{});matches=meta.get("csvMatches") or [];blank=0
+    for i,m in enumerate(matches):
+        c=client_number(m);res=results.get(c) if c else None
+        blank+=not c
+        if not res or res["completeness"]["outcome"] not in CUSTOMER_MERGED:continue
+        k=client_key(m);row={}
+        for key,v in m.items():
+            if key==CHARITY_KEY:continue
+            row[key]=v
+            if key==k:row[CHARITY_KEY]=str(res["value"])
+        matches[i]=row
+    meta["customerAdditionalInfo"]=[{"Client Number":c,"sourceReference":CUSTOMER_SOURCE,
+                                     **{k:v for k,v in (results.get(c) or customer_failure(c,RuntimeError("not requested"))).items() if k!="value"}}
+                                    for c in customer_numbers(matches)]
+    return blank
+def customer_tally(results):
+    """Aggregate counts only - never a Client Number or a value."""
+    outs=[(r.get("completeness") or {}).get("outcome") for r in results]
+    return {"charity_numbers_extracted":outs.count(EXTRACTED),"charity_numbers_confirmed_blank":outs.count(EMPTY),
+            "charity_number_fields_not_shown":outs.count(NOT_SHOWN),
+            "customer_summary_pages_failed":sum(o not in CUSTOMER_ACCEPTED for o in outs)}
+def customer_problems(summary):
+    """Why the Account Summary's Charity Commission Numbers cannot be trusted ([] = fine): a record per Client Number;
+    the key only on rows whose customer's page showed the field (blank only when confirmed blank), on all of them, right
+    after the Client Number, as text, the same on every row of one customer.  Plain words only."""
+    meta=summary.get("metadata") if isinstance(summary,dict) else None
+    if not isinstance(meta,dict) or not isinstance(meta.get("customerAdditionalInfo"),list):
+        return ["it has no customer summary page record (made before the Charity Commission Number was read)"]
+    rec={}
+    for e in meta["customerAdditionalInfo"]:
+        if not isinstance(e,dict) or not isinstance(e.get("completeness"),dict) or not isinstance(e.get("captureStatus"),str):
+            return ["a customer summary page record is not valid"]
+        rec[str(e.get("Client Number") or "")]=e["completeness"].get("outcome")
+    out=[];seen={}
+    for m in meta.get("csvMatches") or []:
+        if not isinstance(m,dict):out.append("a CSV match row is not valid");continue
+        c=client_number(m);keys=list(m);outcome=rec.get(c)
+        if c and c not in rec:out.append("a CSV match row's customer has no customer summary page record")
+        if (CHARITY_KEY in m)!=(bool(c) and outcome in CUSTOMER_MERGED):
+            out.append("a Charity Commission Number is missing from, or added to, a CSV match row");continue
+        if CHARITY_KEY not in m:continue
+        v=m[CHARITY_KEY]
+        if keys.index(CHARITY_KEY)!=keys.index(client_key(m))+1:out.append("a Charity Commission Number is not right after its Client Number")
+        if not isinstance(v,str):out.append("a Charity Commission Number is not text")
+        elif (v=="")!=(outcome==EMPTY):out.append("a Charity Commission Number does not match its page's result")
+        elif seen.setdefault(c,v)!=v:out.append("rows of the same customer show different Charity Commission Numbers")
+    return list(dict.fromkeys(out))
+
 
 class SnapshotIncomplete(RuntimeError):
     """The written snapshot does not read back complete: never used, the account counts as failed."""
@@ -1035,7 +1212,11 @@ def snapshot_problems(obj,a,expect=None):
         if not isinstance(c,dict) or c.get("outcome") not in ACCEPTED or not isinstance(e.get("captureStatus"),str) or not isinstance(e.get("data"),dict):
             out.append(f"section '{n}' has no valid capture result")
     if not isinstance(obj[BLOCKS[1]],list) or not isinstance(obj[BLOCKS[2]],list):out.append("its Interested Party blocks are not lists")
+    out+=customer_problems(summary)
     if expect and not out:
+        rows=(summary.get("metadata") or {}).get("csvMatches") or []
+        if len(rows)!=len(expect["csvMatches"]):out.append(f"the snapshot file holds {len(rows)} CSV match row(s) but {len(expect['csvMatches'])} were read")
+        elif [list(r.items()) for r in rows]!=expect["csvMatches"]:out.append("a CSV match row changed while the snapshot was written")
         parties,links=obj[BLOCKS[1]],obj[BLOCKS[2]]
         if len(parties)!=expect["parties"]:out.append(f"the snapshot file holds {len(parties)} Interested Party record(s) but {expect['parties']} were read")
         if len(links)!=expect["links"]:out.append(f"the snapshot file holds {len(links)} link result(s) but {expect['links']} were read")
@@ -1056,7 +1237,8 @@ def write_result(target,a,data,parties,links,details):
         raise DetailsIncomplete("account-detail page(s) not captured: "+", ".join(bad))
     data.pop("_interestedPartyLinks",None);result=dict(zip(BLOCKS,(data,parties,links,details)))
     expect={"parties":len(parties),"links":len(links),"contacts":[d for d,_ in contact_counts(parties)],
-            "banks":bank_count(details),"fdt":fdt_rows(details),"tables":detail_rows(details)}
+            "banks":bank_count(details),"fdt":fdt_rows(details),"tables":detail_rows(details),
+            "csvMatches":[list(r.items()) for r in json.loads(json.dumps((data.get("metadata") or {}).get("csvMatches") or []))]}
     stage=target.with_name(f".{target.name}.staging")
     P.write_json(stage,result)
     problems=snapshot_problems(json.loads(stage.read_text("utf-8")),a,expect)
@@ -1067,11 +1249,15 @@ def write_result(target,a,data,parties,links,details):
     os.replace(stage,target)
     print(f"SAVED {a}",flush=True)
 def reusable(path,a):
-    """A snapshot made earlier today is reused only if it reads back complete for this account; otherwise it is set
-    aside as .incomplete.json and the account is fetched again.  -> (reuse it?, why not)"""
+    """A snapshot made earlier today is reused only if it reads back complete for this account and every customer
+    summary page in it was read (a re-run is the chance to fill that gap); otherwise it is set aside as
+    .incomplete.json and the account is fetched again.  -> (reuse it?, why not)"""
     if not path.exists():return False,""
     try:
-        problems=snapshot_problems(json.loads(path.read_text("utf-8")),a)
+        obj=json.loads(path.read_text("utf-8"));problems=snapshot_problems(obj,a)
+        if not problems and any(((e.get("completeness") or {}).get("outcome")) not in CUSTOMER_ACCEPTED
+                                for e in obj[BLOCKS[0]]["metadata"]["customerAdditionalInfo"]):
+            problems=["a customer summary page was not captured"]
     except (OSError,ValueError) as e:
         problems=[f"it could not be read ({type(e).__name__})"]
     if not problems:return True,""
@@ -1216,14 +1402,14 @@ def run_pipeline(run_dir):
         time.sleep(0.3)
     if len(todo)<len(accounts):
         say(f"{len(accounts)-len(todo)} account snapshot(s) already made today - reused")
-    failed={}; written=0; started=time.perf_counter()
+    failed={}; written=0; started=time.perf_counter(); customer_facts={}
     facts={a:{"state":"reused (made earlier today)",**snapshot_facts(paths.snapshot(a,day))} for a in accounts if a not in todo}
     try:
         if todo:
             COOKIES,UA=auth(sender); COOKIE_GEN+=1
             say(f"fetching {len(todo)} account snapshot(s) in bulk")
-            ar={};pf={};lf={};sf={}
-            with ThreadPoolExecutor(max_workers=PARTY_WORKERS) as pp:   # party, link and account-detail pages
+            ar={};pf={};lf={};sf={};cf={};customers_reused=0           # cf: one request per Client Number this run
+            with ThreadPoolExecutor(max_workers=PARTY_WORKERS) as pp:   # party, link, account-detail and customer pages
                 with ThreadPoolExecutor(max_workers=min(ACCOUNT_WORKERS,len(todo))) as ap:
                     fs={ap.submit(with_retry,fetch_account,a,rows):a for a in todo}
                     for f in as_completed(fs):
@@ -1235,6 +1421,7 @@ def run_pipeline(run_dir):
                                 u=link_url(x)
                                 if u not in lf:lf[u]=pp.submit(with_retry,fetch_links,x)
                             sf[a]=submit_account_sections(pp,a)
+                            customers_reused+=submit_customers(pp,cf,d["metadata"]["csvMatches"])
                             say(f"account {a} read","detail")
                         except RunStopped:
                             pass
@@ -1243,7 +1430,7 @@ def run_pipeline(run_dir):
                             facts[a]={"state":"failed","error":failed[a],"captures":capture(a,e)}
                             say(f"account {a} FAILED after one retry: {type(e).__name__}")
                         if GATE.stopped():                  # nothing still waiting is requested
-                            for other in [*fs,*pf.values(),*lf.values(),*(x for s in sf.values() for x in s.values())]:other.cancel()
+                            for other in [*fs,*pf.values(),*lf.values(),*cf.values(),*(x for s in sf.values() for x in s.values())]:other.cancel()
                 pr={};pe={};lr={};le={}
                 for u,f in pf.items():
                     try:pr[u]=f.result()
@@ -1252,6 +1439,9 @@ def run_pipeline(run_dir):
                     try:lr[u]=f.result()
                     except Exception as e:le[u]=f"{type(e).__name__}: {e}"
                 details={a:collect_account_sections(s,a) for a,s in sf.items()}
+                customers=collect_customers(cf)
+            customer_facts={"customer_summary_pages_requested":len(cf),"customer_summary_pages_reused":customers_reused,
+                            **customer_tally(customers.values())}
             if not GATE.stopped():
                 for a in todo:
                     d=ar.get(a)
@@ -1263,6 +1453,9 @@ def run_pipeline(run_dir):
                     # aggregate counts and page names only - never a value read from a page
                     dfacts={"detail_sections":tally,"bank_accounts_written":bank_count(dets),"future_instruction_rows_written":fdt_rows(dets)}
                     try:
+                        no_client=merge_customer_additional_info(d,customers)
+                        ctally=customer_tally(d["metadata"]["customerAdditionalInfo"])
+                        dfacts["customer_summary"]={"csv_rows_without_client_number":no_client,**ctally}
                         write_result(paths.snapshot(a,day),a,d,parties,links,dets);written+=1
                         facts[a]={"state":"saved this run","parties":len(parties),"party_pages_missing":missing,
                                   "contact_records":{k:[sum(((p.get(k) or {}).get("completeness") or {}).get(n,0) for p in parties)
@@ -1271,6 +1464,9 @@ def run_pipeline(run_dir):
                         say(f"account {a}: detail pages - {tally['extracted']} read, {tally['confirmed_empty']} confirmed empty","detail")
                         if missing:say(f"account {a}: snapshot saved, but {missing} party detail page(s) could not be read")
                         if unread:say(f"account {a}: {unread} contact table(s) could not be read - marked 'Not captured' in the snapshot")
+                        if ctally["customer_summary_pages_failed"]:
+                            say(f"account {a}: {ctally['customer_summary_pages_failed']} customer summary page(s) not captured - "
+                                "snapshot saved without their Charity Commission Number")
                     except Exception as e:
                         failed[a]=str(e) if isinstance(e,DetailsIncomplete) else f"Output: {type(e).__name__}: {e}"
                         facts[a]={"state":"failed","error":failed[a],**dfacts,
@@ -1280,7 +1476,8 @@ def run_pipeline(run_dir):
     finally:
         P.write_json(paths.sub("status")/"part2-failed.json",failed)
         try:
-            P.write_json(paths.diagnostics("part2")/"accounts.json",{"day":day,"accounts":facts,"denied":GATE.denied or "","written":P.now()})
+            P.write_json(paths.diagnostics("part2")/"accounts.json",{"day":day,"accounts":facts,"customer_summary_pages":customer_facts,
+                                                                    "denied":GATE.denied or "","written":P.now()})
         except Exception:
             pass
         control.finished("part2",saved=written,failed=len(failed),denied=GATE.denied or "")

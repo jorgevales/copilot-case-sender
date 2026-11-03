@@ -364,7 +364,8 @@ def good_details(p2):
 
 
 def summary(account="AB1"):
-    return {"metadata": {"requestedAccount": account}, "sections": {}, "_interestedPartyLinks": []}
+    return {"metadata": {"requestedAccount": account, "csvMatches": [], "customerAdditionalInfo": []}, "sections": {},
+            "_interestedPartyLinks": []}
 
 
 def test_the_snapshot_has_exactly_four_blocks_and_nine_sections_in_order(p2, base):
@@ -434,6 +435,7 @@ def test_the_coordinator_refuses_to_start_without_every_detail_page(p2):
                                 system2_url="https://system2.example.invalid/", system2_party_marker="m",
                                 system2_account_page="https://system2.example.invalid/a?id={account}",
                                 system2_party_links_page="https://system2.example.invalid/l?p={party}",
+                                system2_customer_summary_page="https://system2.example.invalid/c?id={customer}",
                                 completion_mode="submission_only", result_contract_path="", systems_cdp_port=9223, cdp_port=9333,
                                 system2_detail_pages={n: ROUTE.format(n=i) for i, n in enumerate(P.DETAIL_SECTIONS)})
     assert R.pipeline_problems(cfg) == []
