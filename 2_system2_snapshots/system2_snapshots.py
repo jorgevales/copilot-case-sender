@@ -18,9 +18,10 @@ script: every parser, route, field label, the 24/40 worker pools and the output 
 """
 from __future__ import annotations
 
-import argparse,os,re,sys,threading,time,traceback
+import argparse,json,os,re,sys,threading,time,traceback
 from concurrent.futures import ThreadPoolExecutor,as_completed
 from datetime import datetime,timezone
+from html import unescape as html_unescape
 from pathlib import Path
 from urllib.parse import parse_qs,quote,urljoin,urlparse
 
@@ -212,28 +213,308 @@ def ctl(c):
     if t in {"checkbox","radio"}:return c.has_attr("checked")
     return "" if t in {"hidden","password","file"} else clean(c.get("value"))
 MISSING_SECTION="Not available in Register snapshot (this section was not found on the page)"
-def fields(sec):
-    out={}
-    if not sec:return {"captureStatus":MISSING_SECTION}  # never an empty {} that reads like blank values
-    for g in sec.select(".form-group,.control-group"):
-        l=g.select_one("label.control-label") or g.find("label")
-        if l:
-            k=label(l.get_text(" ",strip=True));c=g.find(["input","select","textarea"])
-            if k:out[k]=ctl(c) if c else clean(g.get_text(" ",strip=True))[len(clean(l.get_text(" ",strip=True))):].strip()
+BLANK_TABLE="Blank on Register (the table is on the page and has no entries)"
+NOT_CAPTURED="Not captured"      # the contract's phrase for 'could not be read': Copilot then cannot compare (never blank)
+# Distinct outcomes in every section's "completeness" block - never collapsed into an empty string or list.
+EXTRACTED,EMPTY,NOT_FOUND,FAILED,DISAGREE="Extracted successfully","Confirmed empty","Not found","Extraction failed","Discrepancy"
+
+# ---------------------------------------------------------------------------------------------- party profile
+# What the Interested Party profile holds and where (System_2_Claude_Handover.md; Copilot's answer of 2026-11-03 from
+# the captured page, sanitised).  The email / phone / address records are NOT rows in the page System 2 sends: the
+# page's own setup functions AddExistingCustomerInterestedParty... build those rows in the browser from object
+# literals written in its script.  This part never runs a script: it READS those literals as text (`setup_records`),
+# also reads any finished rows a page carries (`table_records`), and compares the two.  A table that shows only its
+# 'NoEmail' / 'NoPhone' / 'NoAddress' placeholder is never taken as proof of no records.
+
+# snapshot key: (table id, saved-row id prefix, placeholder row id, setup function, heading (older layouts),
+#                [(column, setup-script property, cell id prefix)])
+CONTACTS={
+ "Emails":("EmailContacts","EmailRow","NoEmail","AddExistingCustomerInterestedPartyEmails","Email",
+           [("Email Type","EmailType","rowEditEmailType"),("Email Address","EmailAddress","rowEditEmailAddress")]),
+ "Phone numbers":("PhoneContacts","PhoneRow","NoPhone","AddExistingCustomerInterestedPartyPhoneNumbers","Phone numbers",
+           [("Phone Type","PhoneType","PhoneType"),("Country","PhoneCountry","rowEditPhoneCountry"),
+            ("Area Code","PhoneAreaCode","rowEditPhoneAreaCode"),("Number","PhoneNumber","rowEditPhoneNumber")]),
+ "Addresses":("addressList","AddressRow","NoAddress","AddExistingCustomerInterestedPartyAddresses","Address",
+           [("Address Type","AddressType","rowEditAddressType"),("Country","AddressCountry","rowEditAddressCountry")]
+           +[(f"Address Line {n}",f"AddressLine{n}",f"rowEditAddressLine{n}") for n in range(1,7)]
+           +[("Postcode","Postcode","rowEditAddressPostcode")]),
+}
+# Hidden database references inside a saved row: never shown, never written (user, 2026-11-03).  Listed so that e.g.
+# 'rowEditAddressTypeId7' is never read as the address type 'rowEditAddressType' + '7d...'.
+HIDDEN_PREFIXES=("rowEditAddressTypeId","rowEditAddressDbCountryId","rowEditPhoneDbCountryId","tableEmailEntry",
+                 "tablePhoneEntry","tableAddressEntry")
+COMPLIANCE=(("AML","AML"),("PEP","PEP"),("Financial Sanctions","FS"))    # section heading, control id code
+DIALOG=re.compile(r"dialog|modal|popup",re.I)
+ENTITY=re.compile(r"&(#\d+|#x[0-9a-fA-F]+|[A-Za-z]+);")
+
+
+class ScriptError(ValueError):
+    """The page's setup script is not in the shape this reader knows: the section is 'Not captured', never guessed."""
+
+
+COUNTER=object()                 # a generated display counter (Id: ++LastEmailId): not a saved value, never written
+JS_ESC={"n":"\n","t":"\t","r":"\r","b":"\b","f":"\f","v":"\v","0":"\0"}
+JS_IDENT=re.compile(r"[A-Za-z_$][\w$]*")
+JS_COUNTER=re.compile(r"(\+\+|--)\s*[A-Za-z_$][\w$]*|[A-Za-z_$][\w$]*\s*(\+\+|--)")
+JS_NUMBER=re.compile(r"-?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?")
+def js_skip(src,i):
+    while i<len(src):
+        if src[i].isspace():i+=1
+        elif src.startswith("//",i):j=src.find("\n",i);i=len(src) if j<0 else j+1
+        elif src.startswith("/*",i):j=src.find("*/",i+2);i=len(src) if j<0 else j+2
+        else:break
+    return i
+def js_string(src,i):
+    """The quoted text at src[i] -> (text, end), escapes decoded as JavaScript does."""
+    q,out,i=src[i],[],i+1
+    while i<len(src):
+        c=src[i]
+        if c==q:return "".join(out),i+1
+        if c in "\r\n":raise ScriptError("a text value runs past the end of its line")
+        if c=="\\":
+            n=src[i+1:i+2]
+            if n=="u" and re.fullmatch(r"[0-9a-fA-F]{4}",src[i+2:i+6]):out.append(chr(int(src[i+2:i+6],16)));i+=6;continue
+            if n=="x" and re.fullmatch(r"[0-9a-fA-F]{2}",src[i+2:i+4]):out.append(chr(int(src[i+2:i+4],16)));i+=4;continue
+            if n in ("\r","\n"):i+=2;continue
+            out.append(JS_ESC.get(n,n));i+=2;continue
+        out.append(c);i+=1
+    raise ScriptError("a text value is not closed")
+def js_value(src,i):
+    """Text as written; a number / true / false / null as its source text (a string: a leading zero is never lost)."""
+    if src[i:i+1] in ("'",'"'):return js_string(src,i)
+    m=JS_COUNTER.match(src,i)
+    if m:return COUNTER,m.end()
+    m=JS_NUMBER.match(src,i)
+    if m:return m.group(0),m.end()
+    m=JS_IDENT.match(src,i)
+    if m and m.group(0) in ("true","false","null"):return m.group(0),m.end()
+    raise ScriptError("a value this reader does not know (an expression, not plain text)")
+def js_object(src,i):
+    """The object literal starting at src[i]=='{' -> ({property: value}, end).  Strict: anything else is an error."""
+    out,i={},js_skip(src,i+1)
+    while True:
+        if i>=len(src):raise ScriptError("a record is not closed")
+        if src[i]=="}":return out,i+1
+        if src[i] in "'\"":key,i=js_string(src,i)
+        else:
+            m=JS_IDENT.match(src,i)
+            if not m:raise ScriptError("a record has something other than a property name")
+            key,i=m.group(0),m.end()
+        i=js_skip(src,i)
+        if src[i:i+1]!=":":raise ScriptError(f"no ':' after the property {key}")
+        value,i=js_value(src,js_skip(src,i+1))
+        if key in out:raise ScriptError(f"the property {key} appears twice in one record")
+        out[key]=value;i=js_skip(src,i)
+        if src[i:i+1]==",":i=js_skip(src,i+1);continue
+        if src[i:i+1]!="}":raise ScriptError(f"something follows the value of {key} that is not ',' or '}}'")
+def js_function_body(text,name):
+    """The body of `function name(...) {...}` in the page's scripts; None when the page has no such function."""
+    m=re.search(r"\bfunction\s+"+re.escape(name)+r"\s*\([^)]*\)\s*\{",text)
+    if not m:return None
+    i=start=m.end();depth=1
+    while i<len(text):
+        c=text[i]
+        if c in "'\"":_,i=js_string(text,i);continue
+        if text.startswith(("//","/*"),i):i=js_skip(text,i);continue
+        depth+=(c=="{")-(c=="}")
+        if depth==0:return text[start:i]
+        i+=1
+    raise ScriptError(f"the function {name} is not closed")
+def scripts_text(s):
+    """Every script of the page that runs (not the text/html row templates)."""
+    return "\n".join(x.string or x.get_text() for x in s.find_all("script")
+                     if clean(x.get("type") or "text/javascript").lower() in ("text/javascript","application/javascript","module"))
+def setup_records(text,name):
+    """[{property: text}] in source order from every call(...{...}) in the setup function; None = no such function."""
+    body=js_function_body(text,name)
+    if body is None:return None
+    out,i,call=[],0,re.compile(r"\(\s*\{")
+    while (m:=call.search(body,i)):
+        obj,i=js_object(body,m.end()-1)
+        out.append({k:v for k,v in obj.items() if v is not COUNTER})
     return out
-def named_table(rt,name):
-    sec=section(rt,name);t=sec.find("table") if sec else None
-    if not sec:return {"captureStatus":MISSING_SECTION,"columns":[],"rows":[]}
-    if not t:return {"captureStatus":"Not available in Register snapshot (the section has no table)","columns":[],"rows":[]}
-    x=parse_table(t);rows=[]
-    for row in x.get("rows",[]):
-        row.pop("Action",None);row.pop("Edit",None)
-        if not any("click add new" in clean(v.get("value")).casefold() for v in row.values() if isinstance(v,dict)):rows.append(row)
-    status="Captured" if rows else "Blank on Register (the table is on the page and has no entries)"
-    return {"captureStatus":status,"columns":[c for c in x.get("columns",[]) if c not in {"Action","Edit"}],"rows":rows}
+
+def visible(c):return clean(c.get("type")).lower()!="hidden"
+def in_dialog(e):
+    """Inside a hidden Add / Edit / Upload dialog: its blank defaults are not the saved profile."""
+    for p in [e,*e.parents]:
+        if not isinstance(p,Tag):continue
+        if p.get("role")=="dialog" or DIALOG.search(p.get("id") or "") or any(DIALOG.search(c) for c in p.get("class") or []):return True
+    return False
+def control_facts(c,shown):
+    """One control as the page shows it: value, selected label AND value, ticked or not, disabled / read-only."""
+    kind=c.name if c.name!="input" else (clean(c.get("type")).lower() or "text")
+    d={"label":shown,"control":kind}
+    if c.get("id"):d["id"]=c.get("id")
+    if c.name=="select":
+        opts=c.find_all("option");o=next((x for x in opts if x.has_attr("selected")),None)
+        d["selectedMarked"]=o is not None       # none marked: the browser shows the first option
+        o=o or (opts[0] if opts else None)
+        d["selectedLabel"]=clean(o.get_text(" ",strip=True)) if o else ""
+        d["selectedValue"]=clean(o.get("value") if o is not None and o.has_attr("value") else d["selectedLabel"])
+    elif kind in ("checkbox","radio"):d["checked"]=c.has_attr("checked")
+    else:d["value"]=ctl(c)
+    if c.has_attr("disabled"):d["disabled"]=True
+    if c.has_attr("readonly"):d["readOnly"]=True
+    return d
+def fields(sec,skip_ids=()):
+    """label -> value of a form section (as before), + 'controls' (the detail of each) + 'completeness'.  Repeated
+    labels never overwrite each other; hidden dialog defaults are left out."""
+    out,controls,dialog={},{},0
+    if not sec:return {"captureStatus":MISSING_SECTION,"completeness":{"outcome":NOT_FOUND,"sectionFound":False}}
+    for g in sec.select(".form-group,.control-group"):
+        if in_dialog(g):dialog+=1;continue
+        l=g.select_one("label.control-label") or g.find("label")
+        if not l:continue
+        k=label(l.get_text(" ",strip=True));c=next((x for x in g.find_all(["input","select","textarea"]) if visible(x)),None)
+        if not k or (c is not None and c.get("id") in skip_ids):continue
+        key,n=k,2
+        while key in out:key,n=f"{k} ({n})",n+1
+        # no visible control: the text the page shows (e.g. a displayed value backed by a hidden input)
+        out[key]=ctl(c) if c is not None else clean(g.get_text(" ",strip=True))[len(clean(l.get_text(" ",strip=True))):].strip()
+        if c is not None:controls[key]=control_facts(c,k)
+    comp={"outcome":EXTRACTED,"sectionFound":True,"fieldsRead":len(out),"dialogFieldsLeftOut":dialog}
+    if not out and not skip_ids:                   # found, but nothing readable: never shown as blank values
+        comp["outcome"]=FAILED
+        return {"captureStatus":f"{NOT_CAPTURED} (no labelled field was found in this section)","completeness":comp}
+    if controls:out["controls"]=controls
+    out["completeness"]=comp
+    return out
+def compliance(s,rt,name,code):
+    """AML / PEP / Financial Sanctions keyed by their control IDs: the comment label repeats 'Financial Sanctions
+    Check Comment' in all three sections, so labels never decide which field a value belongs to."""
+    sec=section(rt,name);ids=[f"entryForm{code}Check{p}" for p in ("Status","Result","Comment")]
+    found=[s.find(id=x) for x in ids]
+    if not sec and not any(found):return fields(None)
+    out=fields(sec,skip_ids=ids) if sec else {"completeness":{"outcome":EXTRACTED,"sectionFound":False,"fieldsRead":0}}
+    comp=out.pop("completeness");controls=out.pop("controls",{})
+    for part,c in zip(("Status","Result","Comment"),found):
+        key=f"{name} Check {part}"
+        if c is None:out[key]="Not available in Register snapshot (the control was not found on the page)";continue
+        g=c.find_parent(class_=lambda x:x and ("form-group" in x.split() or "control-group" in x.split()))
+        l=g and (g.select_one("label.control-label") or g.find("label"))
+        out[key]=ctl(c);controls[key]=control_facts(c,label(l.get_text(" ",strip=True)) if l else "")
+    if controls:out["controls"]=controls
+    comp.update(fieldsRead=len(out)-("controls" in out),controlsMissing=[f"{name} Check {p}" for p,c in zip(("Status","Result","Comment"),found) if c is None])
+    out["completeness"]=comp
+    return out
+def signature(s):
+    """The SAVED signature (img#imgSignature, never the upload preview img#imgUploadedSignature): present and readable
+    or not.  Nothing of the image itself is kept or logged."""
+    import base64
+    img=s.find("img",id="imgSignature");facts={"savedSignature":"absent","uploadPreviewLeftOut":s.find(id="imgUploadedSignature") is not None}
+    if img is None:return "No signature found in the profile",facts
+    src=(img.get("src") or "").strip();facts["savedSignature"]="present"
+    if not src:facts["imageData"]="none (the image has no source)"
+    elif src[:5].lower()=="data:":
+        try:
+            head=base64.b64decode(src.split(",",1)[1][:64]+"==",validate=False)[:12]
+            kind="PNG" if head.startswith(b"\x89PNG") else "JPEG" if head.startswith(b"\xff\xd8\xff") else "GIF" if head.startswith(b"GIF8") else \
+                 "BMP" if head.startswith(b"BM") else "WEBP" if head[:4]==b"RIFF" and head[8:12]==b"WEBP" else ""
+        except Exception:
+            kind=""
+        facts["imageData"]=f"readable {kind} image" if kind else "unreadable (not a known image format)"
+    else:facts["imageData"]="a separate image address (not loaded by this snapshot)"
+    ok=facts["imageData"].startswith("readable") or facts["imageData"].startswith("a separate")
+    return ("Signature present in the profile" if ok else "Signature present in the profile, but its image could not be read"),facts
+
+def header_row(r):
+    cells=r.find_all(["th","td"],recursive=False)
+    return bool(cells) and all(c.name=="th" or "TableHead" in (c.get("class") or []) for c in cells)
+def row_values(r,cols,spec):
+    """One saved row -> {column: {"value": text}}: each cell found by its id prefix WITHIN this row (generated
+    suffixes never assumed); a cell without its id falls back to its column position, blank cells kept in place."""
+    by_prefix,prefixes={},[p for _,_,p in spec]+list(HIDDEN_PREFIXES)
+    for e in r.find_all(id=True):
+        p=max((x for x in prefixes if e["id"].startswith(x)),key=len,default=None)
+        if p and p not in HIDDEN_PREFIXES and p not in by_prefix:by_prefix[p]=e
+    cells=r.find_all("td",recursive=False);out={};by_position=0
+    for col,_,p in spec:
+        e=by_prefix.get(p)
+        if e is not None:v=clean(e.get("value")) if e.name in ("input","select","textarea") else clean(e.get_text(" ",strip=True))
+        else:
+            i=next((n for n,c in enumerate(cols) if normhead(c)==normhead(col)),None)
+            v=clean(cells[i].get_text(" ",strip=True)) if i is not None and i<len(cells) else "";by_position+=1
+        out[col]={"value":v}
+    return out,by_position
+def table_records(t,spec,prefix,placeholder):
+    """Header, placeholder and saved rows told apart by structure: no thead needed, td.TableHead headers too."""
+    cols,recs,placeholders,other,by_position=[],[],0,0,0
+    for r in t.find_all("tr"):
+        if r.find_parent("table") is not t:continue
+        rid=r.get("id") or ""
+        if header_row(r):
+            cols=cols or [clean(c.get_text(" ",strip=True)) for c in r.find_all(["th","td"],recursive=False)];continue
+        if rid==placeholder:placeholders+=1;continue
+        if rid.startswith(prefix):
+            v,n=row_values(r,cols,spec);recs.append(v);by_position+=n;continue
+        other+=1                                   # not a header, the placeholder or a saved record: counted, not used
+    return cols,recs,placeholders,other,by_position
+def contact_section(s,rt,key):
+    """One contact table of the profile, with its completeness block.  Every saved record, in page order."""
+    table_id,prefix,placeholder,fn,heading,spec=CONTACTS[key]
+    t=s.find("table",id=table_id)
+    if t is None:
+        sec=section(rt,heading);t=sec.find("table") if sec else None
+    cols,rows,placeholders,other,by_position=table_records(t,spec,prefix,placeholder) if t is not None else ([],[],0,0,0)
+    notes=[];error=""
+    try:
+        script=setup_records(scripts_text(s),fn)
+    except ScriptError as e:
+        script,error=None,str(e)
+    decoded=0
+    if script is not None:
+        recs=[]
+        for obj in script:
+            row={}
+            for col,prop,_ in spec:
+                v=obj.get(prop,"")
+                if ENTITY.search(v):v=html_unescape(v);decoded+=1      # as the browser shows it
+                row[col]={"value":v}
+            recs.append(row)
+            unknown=sorted(set(obj)-{p for _,p,_ in spec}-{"Id","EmailEntry","PhoneEntry","AddressEntry","PhoneDbCountryId","AddressTypeId","AddressDbCountryId"})
+            if unknown:notes.append("the page setup script has properties this snapshot does not map: "+", ".join(unknown))
+        script=recs
+    columns=[c for c in cols if normhead(c) not in ("action","edit")] or [c for c,_,_ in spec]
+    comp={"sectionFound":t is not None,"tableRows":len(rows),"setupScriptRecords":None if script is None else len(script),
+          "placeholdersExcluded":placeholders,"otherRowsIgnored":other}
+    if error:notes.append(f"the page setup script could not be read: {error}")
+    if decoded:notes.append(f"{decoded} value(s) held HTML character references, written as the page shows them")
+    if by_position:notes.append(f"{by_position} cell(s) read by column position (no cell id)")
+    status,out_rows=None,rows
+    if rows and script and rows!=script:
+        status=f"{NOT_CAPTURED} (the page's table rows and its setup script disagree: {len(rows)} row(s) against {len(script)} record(s))"
+        comp.update(outcome=DISAGREE,source="table rows (the setup script's records are under setupScriptRows)")
+    elif rows:
+        comp.update(outcome=EXTRACTED,source="table rows"+(" (same as the page setup script)" if script else ""))
+    elif script:
+        out_rows=script;comp.update(outcome=EXTRACTED,source="page setup script (read as text, never run)")
+    elif script==[]:
+        status=BLANK_TABLE;comp.update(outcome=EMPTY,source="page setup script lists no records")
+    elif error:
+        status=f"{NOT_CAPTURED} (the records could not be read: {error})";comp.update(outcome=FAILED,source="none")
+    elif t is None:
+        status=MISSING_SECTION;comp.update(outcome=NOT_FOUND,source="none")
+    else:
+        status=f"{NOT_CAPTURED} (no saved row in the table and no setup script for it on the page)";comp.update(outcome=FAILED,source="none")
+    comp.update(recordsDetected=len(out_rows) if comp["outcome"] in (EXTRACTED,DISAGREE) else 0,notes=list(dict.fromkeys(notes)))
+    out={"captureStatus":status or "Captured","columns":columns,"rows":out_rows if comp["outcome"]!=EMPTY else []}
+    if comp["outcome"]==DISAGREE:out["setupScriptRows"]=script
+    comp["recordsWritten"]=len(out["rows"])
+    out["completeness"]=comp
+    return out
 def fetch_party(d):
     r,s=soup_get(d["url"]);rt=root(s)
-    return {"interestedPartyId":d.get("interestedPartyId",""),"nameFromAccount":d.get("nameFromAccount",""),"metadata":{"sourceUrl":r.url,"httpStatus":r.status_code,"retrievedUtc":datetime.now(timezone.utc).isoformat(),"pageTitle":clean(s.title.get_text()) if s.title else ""},"Personal Details":fields(section(rt,"Personal Details")),"Emails":named_table(rt,"Email"),"Phone numbers":named_table(rt,"Phone numbers"),"Addresses":named_table(rt,"Address"),"Security checks":{"AML":fields(section(rt,"AML")),"PEP":fields(section(rt,"PEP")),"Financial Sanctions":fields(section(rt,"Financial Sanctions")),"Signature":"Signature present in the profile" if (section(rt,"Signature") and section(rt,"Signature").find("img",src=True)) else "No signature found in the profile"}}
+    sig,sig_facts=signature(s)
+    return {"interestedPartyId":d.get("interestedPartyId",""),"nameFromAccount":d.get("nameFromAccount",""),
+            "metadata":{"sourceUrl":r.url,"httpStatus":r.status_code,"retrievedUtc":datetime.now(timezone.utc).isoformat(),"pageTitle":clean(s.title.get_text()) if s.title else ""},
+            "Personal Details":fields(section(rt,"Personal Details")),
+            **{k:contact_section(s,rt,k) for k in CONTACTS},
+            "Security checks":{**{name:compliance(s,rt,name,code) for name,code in COMPLIANCE},"Signature":sig,"Signature capture":sig_facts}}
+def contact_counts(parties):
+    """[(saved records detected, records in the snapshot)] per party and contact section."""
+    return [((p.get(k) or {}).get("completeness",{}).get("recordsDetected",0),len((p.get(k) or {}).get("rows") or []))
+            for p in parties for k in CONTACTS]
 def link_url(d):
     pid=clean(d.get("interestedPartyId")) or (parse_qs(urlparse(d.get("url","")).query).get("InterestedPartyid") or [""])[0]
     if not pid:raise ValueError("Interested Party ID missing")
@@ -259,12 +540,34 @@ def rendered_links(s,table_id,entity):
     return out
 def fetch_links(d):
     r,s=soup_get(link_url(d));cu=rendered_links(s,"CustomerInterestedParties","Customer");ac=rendered_links(s,"AccountInterestedParties","Account")
-    return {"interestedPartyId":d.get("interestedPartyId",""),"nameFromAccount":d.get("nameFromAccount",""),"metadata":{"sourceUrl":r.url,"httpStatus":r.status_code,"retrievedUtc":datetime.now(timezone.utc).isoformat()},"Customer Interested Parties":grouped(cu,"Customer number"),"Account Interested Parties":grouped(ac,"Account number")}
+    seen=lambda tid,rows:f"table found, {len(rows)} link(s) read" if s.find("table",id=tid) else "table not found on the page - nothing read from it"
+    return {"interestedPartyId":d.get("interestedPartyId",""),"nameFromAccount":d.get("nameFromAccount",""),"metadata":{"sourceUrl":r.url,"httpStatus":r.status_code,"retrievedUtc":datetime.now(timezone.utc).isoformat()},"Customer Interested Parties":grouped(cu,"Customer number"),"Account Interested Parties":grouped(ac,"Account number"),
+            "coverage":{"Customer Interested Parties":seen("CustomerInterestedParties",cu),"Account Interested Parties":seen("AccountInterestedParties",ac)}}
+class SnapshotIncomplete(RuntimeError):
+    """The written snapshot holds fewer contact records than were read: never used, the account counts as failed."""
 def write_result(target,a,data,parties,links):
-    """One snapshot per account for the run's day; the coordinator copies it into each case folder of that account."""
+    """One snapshot per account for the run's day; the coordinator copies it into each case folder of that account.
+    Read back after writing: every contact record read from the pages must be in the file, or it is set aside."""
     data.pop("_interestedPartyLinks",None);result={"Account Summary":data,"Interested Parties linked to the account":parties,"Interested Party links to other account numbers":links}
     P.write_json(target,result)
+    back=json.loads(Path(target).read_text("utf-8")).get("Interested Parties linked to the account") or []
+    detected=[d for d,_ in contact_counts(parties)];written=[w for _,w in contact_counts(back)]
+    if detected!=written or len(back)!=len(parties):
+        os.replace(target,target.with_name(target.stem+".incomplete.json"))     # kept for review, never reused
+        raise SnapshotIncomplete(f"the snapshot file holds {sum(written)} contact record(s) but {sum(detected)} were read")
     print(f"SAVED {a}",flush=True)
+
+def assemble(d,pr,pe,lr,le):
+    """One account's parties and links from the pages read (pr/lr by address) and the failures (pe/le) -> (parties,
+    links, pages missing).  A party page that failed keeps its error; nothing is left out silently."""
+    parties=[];links=[];missing=0
+    for x in d["_interestedPartyLinks"]:
+        u=x["url"];lu=link_url(x);missing+=(u not in pr)+(lu not in lr)
+        # the profile's separate 'Interested Party Link' tab is its own page (fetch_links): say if it was read
+        tab=("Inspected - see 'Interested Party links to other account numbers'" if lu in lr
+             else f"Not inspected - the link page could not be read ({le.get(lu,'Unknown')})")
+        parties.append({**pr.get(u,{"interestedPartyId":x.get("interestedPartyId",""),"nameFromAccount":x.get("nameFromAccount",""),"metadata":{"sourceUrl":u,"retrievalError":pe.get(u,"Unknown")}}),"Interested Party Link tab":tab});links.append(lr.get(lu,{"interestedPartyId":x.get("interestedPartyId",""),"nameFromAccount":x.get("nameFromAccount",""),"metadata":{"sourceUrl":lu,"retrievalError":le.get(lu,"Unknown")},"Customer Interested Parties":[],"Account Interested Parties":[]}))
+    return parties,links,missing
 
 # ---------------------------------------------------------------------------------------------- pipeline
 
@@ -423,17 +726,21 @@ def run_pipeline(run_dir):
                 for a in todo:
                     d=ar.get(a)
                     if not d:continue
-                    parties=[];links=[];missing=0
-                    for x in d["_interestedPartyLinks"]:
-                        u=x["url"];lu=link_url(x);missing+=(u not in pr)+(lu not in lr)
-                        parties.append(pr.get(u,{"interestedPartyId":x.get("interestedPartyId",""),"nameFromAccount":x.get("nameFromAccount",""),"metadata":{"sourceUrl":u,"retrievalError":pe.get(u,"Unknown")}}));links.append(lr.get(lu,{"interestedPartyId":x.get("interestedPartyId",""),"nameFromAccount":x.get("nameFromAccount",""),"metadata":{"sourceUrl":lu,"retrievalError":le.get(lu,"Unknown")},"Customer Interested Parties":[],"Account Interested Parties":[]}))
+                    parties,links,missing=assemble(d,pr,pe,lr,le)
+                    sections=[(p.get(k) or {}).get("completeness",{}) for p in parties for k in CONTACTS]
+                    unread=sum(c.get("outcome") in (FAILED,DISAGREE) for c in sections)
                     try:
                         write_result(paths.snapshot(a,day),a,d,parties,links);written+=1
                         facts[a]={"state":"saved this run","parties":len(parties),"party_pages_missing":missing,
-                                  **snapshot_facts(paths.snapshot(a,day))}
+                                  "contact_records":{k:[sum(((p.get(k) or {}).get("completeness") or {}).get(n,0) for p in parties)
+                                                        for n in ("recordsDetected","recordsWritten")] for k in CONTACTS},
+                                  "contact_sections_not_captured":unread,**snapshot_facts(paths.snapshot(a,day))}
                         if missing:say(f"account {a}: snapshot saved, but {missing} party detail page(s) could not be read")
+                        if unread:say(f"account {a}: {unread} contact table(s) could not be read - marked 'Not captured' in the snapshot")
                     except Exception as e:
                         failed[a]=f"Output: {type(e).__name__}: {e}"
+                        facts[a]={"state":"failed","error":failed[a]}
+                        say(f"account {a} FAILED while saving: {type(e).__name__}")
         say(f"finished: {written} snapshot(s) saved, {len(failed)} failed, in {time.perf_counter()-started:.0f}s")
     finally:
         P.write_json(paths.sub("status")/"part2-failed.json",failed)

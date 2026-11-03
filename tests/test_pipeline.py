@@ -1071,6 +1071,7 @@ def test_one_whole_run_coordinates_the_three_parts_and_reports_every_csv_row(bas
                                   "system2_account_page": "https://system2.example.invalid/account?id={account}",
                                   "system2_party_marker": "partyprofile",
                                   "system2_party_links_page": "https://system2.example.invalid/links?party={party}"}), "utf-8")
+    (cases_root / "Copilot review results.xlsx").write_bytes(b"older run")   # the coordinator sets it aside here
     csv = write_csv(base / "daily.csv", [(hexid(1), "AB100000", "C1", "Ended", "Change of Address"),
                                          (hexid(2), "AB200000", "C2", "Voided", "Change of Address"),
                                          (hexid(3), "AB300000", "C3", "Ended", "Change of Address"),
@@ -1084,6 +1085,7 @@ def test_one_whole_run_coordinates_the_three_parts_and_reports_every_csv_row(bas
     R = load("run_pipeline", "orchestrator/run_pipeline.py")
     sender = sys.modules["copilot_case_sender"]
     monkeypatch.setattr(sender, "ensure_dependencies", lambda *a: None)
+    monkeypatch.setattr(sender, "cdp_http", lambda *a, **k: None)     # no real Edge: the pointer sweep finds none
     monkeypatch.setattr(R, "open_systems_edge", lambda cfg, rt: "started (fake)")
     monkeypatch.setattr(R, "PART_SCRIPTS", {"part1": fakes["part1"], "part2": fakes["part2"]})
     monkeypatch.setattr(R, "SENDER_SCRIPT", fakes["sender"])
@@ -1102,9 +1104,13 @@ def test_one_whole_run_coordinates_the_three_parts_and_reports_every_csv_row(bas
     assert "sent - Copilot: Correct" in by_id[hexid(1)] and "sent - Copilot: Correct" in by_id[hexid(4)]
     assert "skipped" in by_id[hexid(2)] and "Voided" in by_id[hexid(2)]
     assert "held" in by_id[hexid(3)] and "View not found" in by_id[hexid(3)]
-    assert sorted(p.name for p in cases_root.iterdir() if p.name != ".work") == \
+    assert sorted(p.name for p in cases_root.iterdir() if p.is_dir() and p.name != ".work") == \
         [f"{hexid(1)} - AB100000", f"{hexid(4)} - AB400000"]
+    older = [p.name for p in cases_root.iterdir() if p.is_file()]     # the results workbook lives in CASES_ROOT
+    assert len(older) == 1 and older[0].startswith("Copilot review results - older ")
+    assert not list((runtime / "reports").glob("*.xlsx"))              # never in RUNTIME_ROOT
     assert "SKIPPED - 1 row(s)" in out and "DAILY REPORT" in out
+    assert "Visual pointer: the systems Edge did not answer" in out      # the sweep ran once the parts had ended
 
 
 # ---------------------------------------------------------------------------------------------- case timing (End Date)
@@ -1138,7 +1144,7 @@ def test_a_pipeline_case_gets_its_timing_in_the_message_its_answer_checked_and_a
     wrong_end = {**good, "CASE_END_DATETIME": "Not provided"}
     env.world.behaviors = [{"answers": ["Working\n- compared\n" + json.dumps(wrong_end), json.dumps(good)]}]
     r = w.runner()
-    r.workbook = WB.ReviewWorkbook(env.base / "reports")
+    r.workbook = WB.ReviewWorkbook(env.cases_root)
     results = T.run(r.run(collections.deque(w.feed.poll())))
     message = env.world.sends[0][2]
     assert "{{" not in message and "12/10/2026 02:17 PM" in message and "2026-10-14T12:23:38+00:00" in message
@@ -1149,7 +1155,7 @@ def test_a_pipeline_case_gets_its_timing_in_the_message_its_answer_checked_and_a
     assert len(tab.followups) == 1 and "must be copied" in tab.followups[0]     # the wrong copy was sent back once
     saved = json.loads((env.rt.results / f"{iid}.json").read_text("utf-8"))
     assert list(saved["result"]) == list(S.RESULT_KEYS)
-    book = env.base / "reports" / WB.NAME
+    book = env.cases_root / WB.NAME
     import zipfile
     with zipfile.ZipFile(book) as z:
         sheet = z.read("xl/worksheets/sheet2.xml").decode("utf-8")
@@ -1168,3 +1174,545 @@ def test_a_case_without_an_end_date_is_sent_with_not_provided_and_flagged(env2):
     (state, note), = results.values()
     assert state == "result_correct" and "CHECK: no End Date in the CSV" in note
     assert env.world.sends[0][2].count("Not provided") == 4
+
+
+# ---------------------------------------------------------------------------------------------- the purple pointer
+
+S1_URL, S2_URL = "https://system1.example.invalid/app/inbox", "https://system2.example.invalid/home"
+VC = sys.modules["studio_visual_cursor"]             # loaded by Part 1
+
+
+class PointerFrame:
+    """One document.  `pointer` = token of the pointer drawn in it (None = none).  `hang` = 'install' / 'remove' /
+    'all': that call never answers (a frozen or busy tab)."""
+
+    def __init__(self, pointer=None, hang=""):
+        self.pointer, self.hang, self.page = pointer, hang, None
+
+    async def evaluate(self, script, arg=None):
+        if script == VC.INSTALL:
+            if self.hang in ("install", "all"):
+                await asyncio.sleep(3600)
+            self.pointer = arg["token"]
+        elif script == VC.REMOVE:
+            if self.hang in ("remove", "all"):
+                await asyncio.sleep(3600)
+            found, self.pointer = int(self.pointer is not None), None
+            return found
+
+
+class PointerPage:
+    def __init__(self, url, *frames):
+        self.url, self.frames, self.handlers, self.closed = url, list(frames) or [PointerFrame()], {}, False
+        for f in self.frames:
+            f.page = self
+
+    def on(self, name, fn):
+        self.handlers.setdefault(name, []).append(fn)
+
+    def remove_listener(self, name, fn):
+        self.handlers[name].remove(fn)
+
+    def is_closed(self):
+        return self.closed
+
+    def set_default_timeout(self, ms):
+        pass
+
+    async def evaluate(self, script, arg=None):
+        return await self.frames[0].evaluate(script, arg)
+
+
+class PointerContext:
+    def __init__(self, *pages):
+        self.pages, self.handlers = list(pages), []
+
+    def on(self, name, fn):
+        self.handlers.append(fn)
+
+    def remove_listener(self, name, fn):
+        self.handlers.remove(fn)
+
+
+def system1_only(page):
+    return page.url.startswith("https://system1.example.invalid/")
+
+
+def test_the_pointer_is_drawn_on_system1_tabs_only_and_removed_from_every_tab_at_the_end():
+    s1 = PointerPage(S1_URL)
+    s2 = PointerPage(S2_URL, PointerFrame(pointer="left-by-an-earlier-run"))
+    ctx = PointerContext(s1, s2)
+
+    async def go():
+        cur = await VC.VisualCursor.start(ctx, VC.CursorConfig(), only=system1_only)
+        drawn = (s1.frames[0].pointer, s2.frames[0].pointer)
+        await cur.move_to(s2, 5, 5)                          # a move on System 2 draws nothing there
+        after_move = s2.frames[0].pointer
+        first = await cur.close()
+        second = await cur.close()                            # called twice: nothing new, no error
+        return cur, drawn, after_move, first, second
+    cur, drawn, after_move, first, second = asyncio.run(go())
+    assert drawn == (cur._token, None) and after_move is None    # never on System 2; the old one there was removed
+    assert s1.frames[0].pointer is None and s2.frames[0].pointer is None
+    assert first == {"removed": 1, "absent": 1, "unreachable": 0} and second == first
+    assert not ctx.handlers and not any(s1.handlers.values()) and not any(s2.handlers.values())   # no listener left
+
+
+def test_a_system1_tab_that_goes_elsewhere_loses_the_pointer_at_once():
+    s1 = PointerPage(S1_URL)
+    ctx = PointerContext(s1)
+
+    async def go():
+        cur = await VC.VisualCursor.start(ctx, VC.CursorConfig(), only=system1_only)
+        assert s1.frames[0].pointer == cur._token
+        s1.url = S2_URL
+        for fn in list(s1.handlers["framenavigated"]):
+            fn(s1.frames[0])
+        for _ in range(5):
+            await asyncio.sleep(0)
+        gone = s1.frames[0].pointer
+        await cur.close()
+        return gone
+    assert asyncio.run(go()) is None
+
+
+def test_a_tab_that_does_not_answer_cannot_hold_the_pointer_start_or_clean_up(monkeypatch):
+    monkeypatch.setattr(VC, "STOP_SECONDS", 0.05)
+    ok, stuck = PointerPage(S1_URL), PointerPage(S1_URL, PointerFrame(hang="all"))
+    ctx = PointerContext(ok, stuck)
+
+    async def go():
+        cur = await asyncio.wait_for(VC.VisualCursor.start(ctx, VC.CursorConfig(), only=system1_only), 2)
+        return await asyncio.wait_for(cur.close(), 2)
+    assert asyncio.run(go()) == {"removed": 1, "absent": 0, "unreachable": 1}
+    assert ok.frames[0].pointer is None
+
+
+def test_a_switched_off_pointer_still_removes_one_left_by_an_earlier_run():
+    s1 = PointerPage(S1_URL, PointerFrame(pointer="earlier"))
+
+    async def go():
+        cur = await VC.VisualCursor.start(PointerContext(s1), VC.CursorConfig(enabled=False), only=system1_only)
+        return await cur.close()
+    assert asyncio.run(go()) == {"removed": 1, "absent": 0, "unreachable": 0} and s1.frames[0].pointer is None
+
+
+@pytest.mark.parametrize("outcome", ["finished", "stopped before go", "system1 failed", "pointer clean-up hangs"])
+def test_part1_removes_the_pointer_from_both_tabs_on_every_way_out(base, monkeypatch, outcome):
+    s1, s2 = PointerPage(S1_URL), PointerPage(S2_URL, PointerFrame(pointer="earlier"))
+    ctx = PointerContext(s1, s2)
+    paths = P.Paths.new_run(base / "runtime", base / "cases").create()
+    cfg = types.SimpleNamespace(runtime_root=str(base / "runtime"), cases_root=str(base / "cases"), node_executable="",
+                                systems_cdp_port=9223)
+    stopped = []
+
+    class PW:
+        async def stop(self):
+            stopped.append(True)
+
+    async def start_driver(*a, **k):
+        return PW(), "fake", 0.0
+
+    async def connect(pw, sender, port):
+        return types.SimpleNamespace(contexts=[ctx])
+
+    async def go_signal(context, control):
+        return outcome != "stopped before go"
+
+    async def inbox(context, page=None):
+        return s1
+
+    async def cases(*a):
+        if outcome == "system1 failed":
+            raise RuntimeError("System 1 page changed")
+    sender = types.SimpleNamespace(load_config=lambda: cfg, validate_config=lambda c: (None, []),
+                                   bootstrap_storage=lambda c, p: None, load_playwright=lambda: (None,),
+                                   start_driver=start_driver)
+    monkeypatch.setitem(sys.modules, "copilot_case_sender", sender)     # what Part 1 imports inside run_pipeline
+    monkeypatch.setattr(P1, "configure", lambda c: None)
+    monkeypatch.setattr(P1, "ORIGIN", "https://system1.example.invalid")
+    monkeypatch.setattr(P1, "connect_systems_edge", connect)
+    monkeypatch.setattr(P1, "wait_for_go", go_signal)
+    monkeypatch.setattr(P1, "open_or_recover_inbox", inbox)
+    monkeypatch.setattr(P1, "run_cases", cases)
+    monkeypatch.setattr(P1.P, "read_plan", lambda p: {"cases": []})
+    if outcome == "pointer clean-up hangs":
+        monkeypatch.setattr(P1, "CURSOR_CLOSE_SECONDS", 0.05)
+        s1.frames[0].hang = "remove"
+    if outcome == "system1 failed":
+        with pytest.raises(RuntimeError, match="page changed"):
+            asyncio.run(P1.run_pipeline(paths.run))
+    else:
+        asyncio.run(P1.run_pipeline(paths.run))
+    events = (paths.sub("events") / "part1.jsonl").read_text("utf-8")
+    assert stopped and s2.frames[0].pointer is None               # System 2: the old pointer is gone, never redrawn
+    if outcome == "pointer clean-up hangs":
+        assert "coordinator sweeps the tabs at the end" in events   # said so; the coordinator's sweep follows
+    else:
+        assert s1.frames[0].pointer is None and "visual pointer: removed from 1 page(s), none on 1, 0 did not answer" in events   # System 2 was cleaned at the start
+
+
+def test_the_coordinator_sweeps_every_systems_edge_tab_only_after_part1_has_ended(monkeypatch):
+    R = sys.modules.get("run_pipeline") or load("run_pipeline", "orchestrator/run_pipeline.py")
+    tabs = [{"type": "page", "url": S1_URL, "webSocketDebuggerUrl": "ws://127.0.0.1:9223/devtools/page/1"},
+            {"type": "page", "url": S2_URL, "webSocketDebuggerUrl": "ws://127.0.0.1:9223/devtools/page/2"},
+            {"type": "page", "url": "edge://newtab/", "webSocketDebuggerUrl": "ws://127.0.0.1:9223/devtools/page/3"},
+            {"type": "service_worker", "url": S1_URL, "webSocketDebuggerUrl": "ws://127.0.0.1:9223/devtools/page/4"}]
+    pointers = {"1": 1, "2": 1}
+    evaluated = []
+
+    def page_eval(ws, port, expression, timeout):
+        n = ws.rsplit("/", 1)[1]
+        evaluated.append((n, port, expression))
+        found, pointers[n] = pointers.get(n, 0), 0
+        return found
+    monkeypatch.setattr(R.sender, "cdp_http", lambda port, path, timeout=1.5: tabs if path == "/json/list" else None)
+    monkeypatch.setattr(R.sender, "cdp_page_eval", page_eval)
+    events = []
+    control = types.SimpleNamespace(event=lambda part, text: events.append(text))
+    cfg = types.SimpleNamespace(systems_cdp_port=9223)
+    running = {"part1": types.SimpleNamespace(poll=lambda: None)}
+    assert "still finishing" in R.sweep_pointer(cfg, running, control) and not evaluated   # never under Part 1's feet
+    ended = {"part1": types.SimpleNamespace(poll=lambda: 1), "part2": types.SimpleNamespace(poll=lambda: 0)}
+    assert R.sweep_pointer(cfg, ended, control) == "Visual pointer: removed from 2 tab(s) of the systems Edge, none on 0"
+    assert sorted(n for n, _, _ in evaluated) == ["1", "2"] and {e for _, _, e in evaluated} == {VC.SWEEP}
+    assert R.sweep_pointer(cfg, ended, control).endswith("removed from 0 tab(s) of the systems Edge, none on 2")  # twice
+    monkeypatch.setattr(R.sender, "cdp_page_eval", lambda *a: None)
+    assert R.sweep_pointer(cfg, ended, control).endswith("none on 0, 2 did not answer")
+    monkeypatch.setattr(R.sender, "cdp_http", lambda *a, **k: None)
+    assert "did not answer - no tab was swept" in R.sweep_pointer(cfg, ended, control) and len(events) == 5
+
+
+DOM_TEST = r"""
+const {JSDOM} = require(JSDOM_PATH);
+const out = {};
+const dom = new JSDOM('<!doctype html><body><p id="keep">page</p><iframe></iframe></body>', {runScripts: 'outside-only'});
+const w = dom.window;
+w.matchMedia = () => ({matches: true});
+w.Element.prototype.animate = () => ({finished: Promise.resolve(), cancel(){}});
+const install = w.eval('(' + INSTALL + ')'), remove = w.eval('(' + REMOVE + ')');
+install(CFG);
+out.drawn = w.document.querySelectorAll('[data-studio-visual-cursor]').length;
+install({...CFG, token: 'run-2'});
+out.afterSecondRun = w.document.querySelectorAll('[data-studio-visual-cursor]').length;
+out.token = w.__studio_visual_cursor_v1__.token;
+w.document.body.appendChild(w.document.createElement('div')).setAttribute('data-studio-visual-cursor', '');
+out.removed = w.eval(SWEEP);
+out.left = w.document.querySelectorAll('[data-studio-visual-cursor]').length + (w.__studio_visual_cursor_v1__ ? 1 : 0);
+out.again = w.eval(SWEEP);
+out.pageKept = !!w.document.getElementById('keep');
+install(CFG);
+w.dispatchEvent(new w.Event('pagehide'));
+out.afterPagehide = w.document.querySelectorAll('[data-studio-visual-cursor]').length + (w.__studio_visual_cursor_v1__ ? 1 : 0);
+out.removeFalse = remove(false);
+console.log(JSON.stringify(out));
+"""
+
+
+def test_the_in_page_scripts_draw_replace_sweep_and_self_remove_in_a_real_dom(base):
+    """The in-page scripts themselves, in a DOM (jsdom under node): another run's pointer is replaced, the sweep
+    removes every pointer and nothing else, twice is safe, and leaving the page removes it.  Skipped unless
+    JSDOM_NODE_MODULES names a node_modules folder holding jsdom (local development only, never on the VDI)."""
+    import subprocess
+    mods = os.environ.get("JSDOM_NODE_MODULES", "")
+    if not (shutil.which("node") and mods and (Path(mods) / "jsdom").is_dir()):
+        pytest.skip("set JSDOM_NODE_MODULES to a node_modules folder with jsdom")
+    cfg = {**VC.asdict(VC.CursorConfig()), "token": "run-1", "report_prefix": "__p:", "initial_x": 24, "initial_y": 24}
+    values = {"JSDOM_PATH": str(Path(mods) / "jsdom"), "INSTALL": VC.INSTALL, "REMOVE": VC.REMOVE, "SWEEP": VC.SWEEP,
+              "CFG": cfg}
+    script = base / "dom_test.js"
+    script.write_text("".join(f"const {k} = {json.dumps(v)};\n" for k, v in values.items()) + DOM_TEST, "utf-8")
+    run = subprocess.run(["node", str(script)], capture_output=True, text=True, timeout=60)
+    assert run.returncode == 0, run.stderr
+    out = json.loads(run.stdout.strip().splitlines()[-1])
+    assert out == {"drawn": 1, "afterSecondRun": 1, "token": "run-2", "removed": 2, "left": 0, "again": 0,
+                   "pageKept": True, "afterPagehide": 0, "removeFalse": 0}
+
+
+# ---------------------------------------------------------------------------------------------- Part 2: the party profile
+# A synthetic Interested Party profile in the shape System 2 sends it (no script run): the contact rows are built by
+# the page's setup functions (shape from the sanitised sample, System_2_Claude_Handover.md + Copilot's answer); only
+# headers and placeholders are rows.  Every value is made up.
+
+import base64 as _b64
+
+PNG = "data:image/png;base64," + _b64.b64encode(b"\x89PNG\r\n\x1a\n" + b"\0" * 24).decode()
+
+SETUP_SCRIPT = """
+var LastEmailId = 0;
+$(document).ready(function () {
+    hidePartyForm();
+    AddExistingCustomerInterestedPartyEmails();
+    AddExistingCustomerInterestedPartyPhoneNumbers();
+    AddExistingCustomerInterestedPartyAddresses();
+});
+function AddExistingCustomerInterestedPartyEmails() {
+    var newEmailContact;
+    var newEmailTemplate = tmpl("NewEmailTemplate");
+%(emails)s
+}
+function AddExistingCustomerInterestedPartyPhoneNumbers() {
+    var newEmailContact;
+    var newEmailTemplate = tmpl("NewPhoneTemplate");
+%(phones)s
+}
+function AddExistingCustomerInterestedPartyAddresses() {
+    var newEmailContact;
+    var newEmailTemplate = tmpl("AddressessTemplate");
+%(addresses)s
+}
+"""
+
+
+def js_email(kind, address, entry="ID_EMAIL_A"):
+    return ('    LastEmailId++;\n    newEmailContact = newEmailTemplate({\n        Id: ++LastEmailId,\n'
+            f'        EmailType: "{kind}",\n        EmailAddress: "{address}",\n        EmailEntry: "{entry}"\n    }});\n'
+            "    $('#EmailContacts tr:last').after(newEmailContact);\n")
+
+
+def js_phone(kind, area, number):
+    return ('    LastEmailId++;\n    newEmailContact = newEmailTemplate({\n        Id: ++LastEmailId,\n'
+            f'        PhoneCountry: "999",\n        PhoneDbCountryId: "ID_COUNTRY_A",\n        PhoneType: "{kind}",\n'
+            f'        PhoneAreaCode: "{area}",\n        PhoneNumber: "{number}",\n        PhoneEntry: "ID_PHONE"\n    }});\n'
+            "    $('#PhoneContacts tr:last').after(newEmailContact);\n")
+
+
+def js_address(line1, line2):
+    return ('    LastEmailId++;\n    newEmailContact = newEmailTemplate({\n        Id: ++LastEmailId,\n'
+            '        AddressType: "ADDRESS_TYPE_A",\n        AddressTypeId: "ID_ADDRESS_TYPE_A",\n'
+            '        AddressCountry: "COUNTRY_A",\n        AddressDbCountryId: "ID_COUNTRY_A",\n'
+            f'        AddressLine1: "{line1}",\n        AddressLine2: "{line2}",\n        AddressLine3: "",\n'
+            '        AddressLine4: "",\n        AddressLine5: "",\n        AddressLine6: "",\n'
+            '        Postcode: "POSTCODE_A",\n        AddressEntry: "ID_ADDRESS_A"\n    });'
+            " $('#addressList tr:last').after(newEmailContact);\n")
+
+
+def compliance_html(code, name, status, result, comment):
+    opts = lambda chosen, words: "".join(f'<option value="{w}"{" selected=\'selected\'" if w == chosen else ""}>{w}</option>'
+                                         for w in words)
+    return (f"<h3>{name}</h3>"
+            f'<div class="form-group"><label class="control-label">{name} Check Status</label>'
+            f'<select id="entryForm{code}CheckStatus">{opts(status, ["STATUS_A", "STATUS_B"])}</select></div>'
+            f'<div class="form-group"><label class="control-label">{name} Check Result</label>'
+            f'<select id="entryForm{code}CheckResult"><option value=""></option>{opts(result, ["RESULT_A", "RESULT_B"])}</select></div>'
+            # the page labels every comment box 'Financial Sanctions Check Comment'
+            f'<div class="form-group"><label class="control-label">Financial Sanctions Check Comment</label>'
+            f'<textarea id="entryForm{code}CheckComment">{comment}</textarea></div>')
+
+
+def profile(emails=None, phones=None, addresses=None, script=True, rows=None, signature=PNG, tables=True, extra_script=""):
+    rows = rows or {}
+    emails = [js_email("EMAIL_TYPE_A", "x@example.com")] if emails is None else emails
+    phones = [js_phone("PHONE_TYPE_A", "1234", "000001"), js_phone("PHONE_TYPE_B", "0123", "000002")] if phones is None else phones
+    addresses = [js_address("ADDRESS_LINE_A", "ADDRESS_LINE_B")] if addresses is None else addresses
+    setup = SETUP_SCRIPT % {"emails": "".join(emails), "phones": "".join(phones), "addresses": "".join(addresses)}
+    address_head = "".join(f'<td class="TableHead">{h}</td>' for h in
+                           ["Address Type", "Country"] + [f"Address Line {n}" for n in range(1, 7)] + ["Postcode", "Edit"])
+    contact_tables = (
+        '<h3>Email</h3><table id="EmailContacts"><tbody><tr><th>Email Type</th><th>Email Address</th><th>Action</th></tr>'
+        '<tr id="NoEmail"><td colspan="3">Click Add New to add an email address</td></tr>' + rows.get("email", "") + '</tbody></table>'
+        '<h3>Phone numbers</h3><table id="PhoneContacts"><tbody><tr><th>Phone Type</th><th>Country</th><th>Area Code</th>'
+        '<th>Number</th><th>Action</th></tr><tr id="NoPhone" class="TableDataRow"><td colspan="5">No phone numbers</td></tr>'
+        + rows.get("phone", "") + '</tbody></table>'
+        f'<h3>Address</h3><table id="addressList"><tbody><tr>{address_head}</tr>'
+        '<tr id="NoAddress" class="TableDataRow"><td colspan="4">No addresses</td></tr>' + rows.get("address", "") + "</tbody></table>"
+    ) if tables else ""
+    return (
+        "<html><head><title>Interested Party</title></head><body><a>Logout</a><div id='interestPartyContainer'>"
+        "<h3>Personal Details</h3>"
+        '<div class="form-group"><label class="control-label">Title</label><select id="entryFormTitle"><option value="">'
+        '</option><option value="T1">TITLE_A</option><option value="T2" selected="selected">TITLE_B</option></select></div>'
+        '<div class="form-group"><label class="control-label">First Name</label><input id="entryFormFirstName" type="text" value="PERSON_A"></div>'
+        '<div class="form-group"><label class="control-label">Middle Name</label><input id="entryFormMiddleName" type="text" value=""></div>'
+        '<div class="form-group"><label class="control-label">Date of Birth</label><input id="entryFormDateOfBirth" type="text" value="01/01/1900" readonly></div>'
+        '<div class="form-group"><label class="control-label">Marketing Opt In</label><input id="MarketingOptIn" type="checkbox" checked="checked"></div>'
+        '<div class="form-group"><label class="control-label">Deceased</label><input id="IsDeceased" type="checkbox"></div>'
+        '<div class="form-group"><label class="control-label">Wrap Provider</label><span>COMPANY_A</span><input type="hidden" id="customerAcd" value="ID_9"></div>'
+        '<div id="EmailDialog" class="modal" style="display:none"><div class="form-group"><label>Email Address</label>'
+        '<input id="dlgEmailAddress" value=""></div><div class="form-group"><label>Confirm Email Address</label>'
+        '<input id="dlgConfirmEmailAddress" value=""></div></div>'
+        + contact_tables
+        + compliance_html("AML", "AML", "STATUS_A", "RESULT_A", "AML_NOTE")
+        + compliance_html("PEP", "PEP", "STATUS_B", None, "")
+        + compliance_html("FS", "Financial Sanctions", "STATUS_A", None, "FS_NOTE")
+        + "<h3>Signature</h3>" + (f'<img id="imgSignature" src="{signature}">' if signature is not None else "")
+        + '<div id="UploadSignatureDialog" class="modal"><input type="file"><img id="imgUploadedSignature" src="data:image/png;base64,AAAA"></div>'
+        "</div>"
+        '<script type="text/html" id="NewEmailTemplate"><tr id="EmailRow{%=o.Id%}" class="TableDataRow"><td id="rowEditEmailType{%=o.Id%}">{%=o.EmailType%}</td></tr></script>'
+        + (f"<script>{setup}</script>" if script else "") + (f"<script>{extra_script}</script>" if extra_script else "")
+        + "</body></html>")
+
+
+def party_of(p2, monkeypatch, html):
+    monkeypatch.setattr(p2, "soup_get", lambda url, params=None: page(p2, html, url="https://system2.example.invalid/p"))
+    return p2.fetch_party({"interestedPartyId": "ID_A", "nameFromAccount": "PERSON_A", "url": "https://system2.example.invalid/p"})
+
+
+def values(section):
+    return [{k: v["value"] for k, v in row.items()} for row in section["rows"]]
+
+
+def test_part2_reads_every_contact_record_from_the_page_setup_script_without_running_it(p2, monkeypatch):
+    party = party_of(p2, monkeypatch, profile())
+    emails, phones, addresses = party["Emails"], party["Phone numbers"], party["Addresses"]
+    assert values(emails) == [{"Email Type": "EMAIL_TYPE_A", "Email Address": "x@example.com"}]
+    assert values(phones) == [{"Phone Type": "PHONE_TYPE_A", "Country": "999", "Area Code": "1234", "Number": "000001"},
+                              {"Phone Type": "PHONE_TYPE_B", "Country": "999", "Area Code": "0123", "Number": "000002"}]
+    assert values(addresses) == [{"Address Type": "ADDRESS_TYPE_A", "Country": "COUNTRY_A", "Address Line 1": "ADDRESS_LINE_A",
+                                  "Address Line 2": "ADDRESS_LINE_B", "Address Line 3": "", "Address Line 4": "",
+                                  "Address Line 5": "", "Address Line 6": "", "Postcode": "POSTCODE_A"}]
+    assert addresses["columns"] == ["Address Type", "Country"] + [f"Address Line {n}" for n in range(1, 7)] + ["Postcode"]
+    assert phones["columns"] == ["Phone Type", "Country", "Area Code", "Number"]          # td.TableHead / th, no Action
+    for sec, n in ((emails, 1), (phones, 2), (addresses, 1)):
+        c = sec["completeness"]
+        assert sec["captureStatus"] == "Captured" and c["outcome"] == "Extracted successfully"
+        assert c["source"].startswith("page setup script") and c["recordsDetected"] == c["recordsWritten"] == n
+        assert c["placeholdersExcluded"] == 1 and c["tableRows"] == 0 and c["setupScriptRecords"] == n
+    text = json.dumps(party)
+    assert "ID_COUNTRY_A" not in text and "ID_EMAIL_A" not in text and "ID_ADDRESS_TYPE_A" not in text  # hidden refs left out
+
+
+def test_part2_finished_rows_are_read_by_id_prefix_with_any_suffix_and_matched_with_the_script(p2, monkeypatch):
+    rows = {"email": '<tr id="EmailRow7" class="TableDataRow"><td id="rowEditEmailType7">EMAIL_TYPE_A</td>'
+                     '<td id="rowEditEmailAddress7">x@example.com<input type="hidden" id="tableEmailEntry7" value="ID_EMAIL_A"></td>'
+                     '<td><a>Edit</a></td></tr>',
+            "phone": "".join(f'<tr id="PhoneRow{n}" class="TableDataRow"><td id="PhoneType{n}">{t}</td>'
+                             f'<td><span id="rowEditPhoneCountry{n}">999</span><input type="hidden" id="rowEditPhoneDbCountryId{n}" value="ID_COUNTRY_A"></td>'
+                             f'<td id="rowEditPhoneAreaCode{n}">{a}</td><td id="rowEditPhoneNumber{n}">{num}</td><td>Edit</td></tr>'
+                             for n, t, a, num in ((12, "PHONE_TYPE_A", "1234", "000001"), (40, "PHONE_TYPE_B", "0123", "000002"))),
+            "address": ('<tr id="AddressRow3" class="TableDataRow"><td><span id="rowEditAddressType3">ADDRESS_TYPE_A</span>'
+                        '<input type="hidden" id="rowEditAddressTypeId3" value="ID_ADDRESS_TYPE_A"></td>'
+                        '<td id="rowEditAddressCountry3">COUNTRY_A</td><td id="rowEditAddressLine13">ADDRESS_LINE_A</td>'
+                        '<td id="rowEditAddressLine23">ADDRESS_LINE_B</td><td id="rowEditAddressLine33"></td><td id="rowEditAddressLine43"></td>'
+                        '<td id="rowEditAddressLine53"></td><td id="rowEditAddressLine63"></td>'
+                        '<td id="rowEditAddressPostcode3">POSTCODE_A</td><td>Edit</td></tr>')}
+    party = party_of(p2, monkeypatch, profile(rows=rows))
+    assert [r["Area Code"] for r in values(party["Phone numbers"])] == ["1234", "0123"]     # suffixes 12, 40: not 1, 2
+    assert values(party["Addresses"])[0]["Address Type"] == "ADDRESS_TYPE_A"              # never the hidden TypeId
+    assert values(party["Addresses"])[0]["Address Line 3"] == "" and values(party["Addresses"])[0]["Postcode"] == "POSTCODE_A"
+    for key in ("Emails", "Phone numbers", "Addresses"):
+        c = party[key]["completeness"]
+        assert party[key]["captureStatus"] == "Captured" and c["source"] == "table rows (same as the page setup script)"
+        assert c["tableRows"] == c["setupScriptRecords"] == c["recordsWritten"]
+
+
+def test_part2_an_empty_table_is_blank_only_when_the_setup_script_says_so(p2, monkeypatch):
+    empty = party_of(p2, monkeypatch, profile(emails=[], phones=[], addresses=[]))
+    for key in ("Emails", "Phone numbers", "Addresses"):
+        assert empty[key]["captureStatus"].startswith("Blank on Register") and empty[key]["rows"] == []
+        assert empty[key]["completeness"]["outcome"] == "Confirmed empty"
+    no_script = party_of(p2, monkeypatch, profile(script=False))           # only the placeholder: NOT proof of no records
+    for key in ("Emails", "Phone numbers", "Addresses"):
+        assert no_script[key]["captureStatus"].startswith("Not captured") and no_script[key]["rows"] == []
+        assert no_script[key]["completeness"]["outcome"] == "Extraction failed"
+    no_tables = party_of(p2, monkeypatch, profile(script=False, tables=False))
+    assert no_tables["Emails"]["captureStatus"].startswith("Not available in Register snapshot")
+    assert no_tables["Emails"]["completeness"]["outcome"] == "Not found"
+
+
+def test_part2_one_unreadable_section_is_not_captured_while_the_others_are_read(p2, monkeypatch):
+    odd = [js_email("EMAIL_TYPE_A", "x@example.com").replace('EmailType: "EMAIL_TYPE_A"', "EmailType: typeFor(3)")]
+    party = party_of(p2, monkeypatch, profile(emails=odd))
+    assert party["Emails"]["captureStatus"].startswith("Not captured (the records could not be read")
+    assert party["Emails"]["completeness"]["outcome"] == "Extraction failed" and party["Emails"]["rows"] == []
+    assert len(party["Phone numbers"]["rows"]) == 2 and party["Addresses"]["captureStatus"] == "Captured"
+
+
+def test_part2_many_records_keep_their_order_and_identical_records_are_not_merged(p2, monkeypatch):
+    emails = [js_email("EMAIL_TYPE_A", "a@example.com"), js_email("EMAIL_TYPE_B", "b@example.com"),
+              js_email("EMAIL_TYPE_B", "b@example.com"), js_email("EMAIL_TYPE_C", "O&#39;Neill@example.com")]
+    party = party_of(p2, monkeypatch, profile(emails=emails))
+    assert [r["Email Address"] for r in values(party["Emails"])] == ["a@example.com", "b@example.com", "b@example.com",
+                                                                   "O'Neill@example.com"]
+    assert party["Emails"]["completeness"]["recordsWritten"] == 4
+    assert any("HTML character references" in n for n in party["Emails"]["completeness"]["notes"])
+
+
+def test_part2_table_rows_that_disagree_with_the_script_are_not_captured_and_both_kept(p2, monkeypatch):
+    rows = {"email": '<tr id="EmailRow9" class="TableDataRow"><td id="rowEditEmailType9">EMAIL_TYPE_Z</td>'
+                     '<td id="rowEditEmailAddress9">z@example.com</td><td>Edit</td></tr>'}
+    party = party_of(p2, monkeypatch, profile(rows=rows))
+    e = party["Emails"]
+    assert e["captureStatus"].startswith("Not captured (the page's table rows and its setup script disagree")
+    assert e["completeness"]["outcome"] == "Discrepancy" and values(e) == [{"Email Type": "EMAIL_TYPE_Z", "Email Address": "z@example.com"}]
+    assert e["setupScriptRows"][0]["Email Address"]["value"] == "x@example.com"
+
+
+def test_part2_personal_details_keep_selected_values_ticks_blanks_and_leave_dialogs_out(p2, monkeypatch):
+    pd = party_of(p2, monkeypatch, profile())["Personal Details"]
+    assert pd["Title"] == "TITLE_B" and pd["First Name"] == "PERSON_A" and pd["Middle Name"] == ""      # blank stays blank
+    assert pd["Marketing Opt In"] is True and pd["Deceased"] is False
+    assert pd["Wrap Provider"] == "COMPANY_A"                                 # displayed text, not the hidden input
+    assert "Email Address" not in pd and "Confirm Email Address" not in pd    # the hidden dialog's blank defaults
+    c = pd["controls"]
+    assert c["Title"]["selectedLabel"] == "TITLE_B" and c["Title"]["selectedValue"] == "T2" and c["Title"]["selectedMarked"]
+    assert "TITLE_A" not in json.dumps(c["Title"])                            # the option list is not the person's data
+    assert c["Date of Birth"]["readOnly"] is True and c["Deceased"] == {"label": "Deceased", "control": "checkbox",
+                                                                         "id": "IsDeceased", "checked": False}
+    assert pd["completeness"] == {"outcome": "Extracted successfully", "sectionFound": True, "fieldsRead": 7,
+                                  "dialogFieldsLeftOut": 2}
+
+
+def test_part2_compliance_fields_are_keyed_by_control_not_by_their_repeated_label(p2, monkeypatch):
+    sc = party_of(p2, monkeypatch, profile())["Security checks"]
+    aml, pep, fs = sc["AML"], sc["PEP"], sc["Financial Sanctions"]
+    assert (aml["AML Check Status"], aml["AML Check Result"], aml["AML Check Comment"]) == ("STATUS_A", "RESULT_A", "AML_NOTE")
+    assert (pep["PEP Check Status"], pep["PEP Check Result"], pep["PEP Check Comment"]) == ("STATUS_B", "", "")
+    assert fs["Financial Sanctions Check Comment"] == "FS_NOTE" and fs["Financial Sanctions Check Result"] == ""
+    assert "Financial Sanctions Check Comment" not in aml and "Financial Sanctions Check Comment" not in pep
+    assert aml["controls"]["AML Check Comment"]["label"] == "Financial Sanctions Check Comment"   # kept as evidence
+    assert pep["controls"]["PEP Check Result"]["selectedMarked"] is False                     # nothing chosen: not inferred
+    assert pep["controls"]["PEP Check Status"]["selectedLabel"] == "STATUS_B"
+    assert aml["completeness"]["controlsMissing"] == []
+
+
+def test_part2_signature_is_reported_present_absent_or_unreadable_and_never_copied(p2, monkeypatch):
+    good = party_of(p2, monkeypatch, profile())["Security checks"]
+    assert good["Signature"] == "Signature present in the profile"
+    assert good["Signature capture"] == {"savedSignature": "present", "uploadPreviewLeftOut": True, "imageData": "readable PNG image"}
+    assert PNG.split(",")[1][:20] not in json.dumps(good)
+    gone = party_of(p2, monkeypatch, profile(signature=None))["Security checks"]
+    assert gone["Signature"] == "No signature found in the profile" and gone["Signature capture"]["savedSignature"] == "absent"
+    bad = party_of(p2, monkeypatch, profile(signature="data:image/png;base64,bm90IGFuIGltYWdl"))["Security checks"]
+    assert bad["Signature"].endswith("its image could not be read")
+    assert bad["Signature capture"]["imageData"] == "unreadable (not a known image format)"
+
+
+def test_part2_a_record_dropped_while_writing_is_caught_and_the_file_never_reused(p2, monkeypatch, base):
+    party = party_of(p2, monkeypatch, profile())
+    target = base / "AB1_Account_Summary_Interested_Parties_and_Links.json"
+    p2.write_result(target, "AB1", {"metadata": {}}, [party], [])
+    back = json.loads(target.read_text("utf-8"))["Interested Parties linked to the account"][0]
+    assert [len(back[k]["rows"]) for k in ("Emails", "Phone numbers", "Addresses")] == [1, 2, 1]
+    real = P.write_json
+
+    def lossy(path, obj):
+        copy = json.loads(json.dumps(obj))
+        copy["Interested Parties linked to the account"][0]["Phone numbers"]["rows"].pop()
+        real(path, copy)
+    monkeypatch.setattr(p2.P, "write_json", lossy)
+    with pytest.raises(p2.SnapshotIncomplete, match="holds 3 contact record"):
+        p2.write_result(target, "AB1", {"metadata": {}}, [party], [])
+    assert not target.exists() and (base / (target.stem + ".incomplete.json")).exists()   # set aside, never reused
+
+
+def test_part2_the_interested_party_link_tab_is_reported_inspected_or_not(p2, monkeypatch):
+    d = {"_interestedPartyLinks": [
+        {"interestedPartyId": "ID_A", "nameFromAccount": "PERSON_A", "url": "https://system2.example.invalid/partyprofile?InterestedPartyid=ID_A"},
+        {"interestedPartyId": "ID_B", "nameFromAccount": "PERSON_B", "url": "https://system2.example.invalid/partyprofile?InterestedPartyid=ID_B"}]}
+    a_url, b_url = (x["url"] for x in d["_interestedPartyLinks"])
+    a_links, b_links = p2.link_url(d["_interestedPartyLinks"][0]), p2.link_url(d["_interestedPartyLinks"][1])
+    pr = {a_url: {"interestedPartyId": "ID_A", "Emails": {"rows": []}}}
+    pe = {b_url: "ReadTimeout: party page did not answer"}
+    lr = {a_links: {"interestedPartyId": "ID_A"}}
+    le = {b_links: "ReadTimeout: link page did not answer"}
+    parties, links, missing = p2.assemble(d, pr, pe, lr, le)
+    assert parties[0]["Interested Party Link tab"].startswith("Inspected")
+    assert parties[1]["Interested Party Link tab"] == "Not inspected - the link page could not be read (ReadTimeout: link page did not answer)"
+    assert parties[1]["metadata"]["retrievalError"].startswith("ReadTimeout") and missing == 2
+    assert "Interested Party Link tab" not in pr[a_url]                     # the shared page record is not changed
+    html = "<html><body><a>Logout</a><table id='CustomerInterestedParties'><tr><th>Customer</th><th>Role</th><th>x</th><th>y</th><th>Status</th></tr></table></body></html>"
+    monkeypatch.setattr(p2, "soup_get", lambda url, params=None: page(p2, html))
+    cov = p2.fetch_links(d["_interestedPartyLinks"][0])["coverage"]
+    assert cov == {"Customer Interested Parties": "table found, 0 link(s) read",
+                   "Account Interested Parties": "table not found on the page - nothing read from it"}

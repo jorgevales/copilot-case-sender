@@ -24,7 +24,7 @@ PLACEHOLDERS = ("{{CASE_END_DATETIME}}", "{{REGISTER_SNAPSHOT_DATETIME}}", "{{BU
 WITHIN = "Case completed within the last 3 business days"
 AGED = "Case completed more than 3 business days"
 AGE_LIMIT = 3
-PROCESSOR_ERROR, AGED_CASE = "Potential processor error", "Discrepancy from aged case"
+PROCESSOR_ERROR, AGED_CASE = "Potential processor error", "Possible discrepancy due to aged case"
 AGED_SENTENCE = "This case was completed more than 3 business days before the Register snapshot was captured."
 HOLIDAY_FILE = "bank_holidays.txt"      # optional, beside daily_review_instructions.md: one date per line
 

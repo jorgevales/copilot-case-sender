@@ -78,9 +78,9 @@ Never write `Incorrect` unless line 1 is true. Never write `Correct` if line 1 o
 | Case age statement in the message | `DISCREPANCY_TYPE` |
 |---|---|
 | `Case completed within the last 3 business days` | `Potential processor error` |
-| `Case completed more than 3 business days` | `Discrepancy from aged case` |
+| `Case completed more than 3 business days` | `Possible discrepancy due to aged case` |
 | `Not provided` (or missing): business-day gap 3 or less, or also `Not provided` | `Potential processor error` |
-| `Not provided` (or missing): business-day gap more than 3 | `Discrepancy from aged case` |
+| `Not provided` (or missing): business-day gap more than 3 | `Possible discrepancy due to aged case` |
 
 Never calculate business days yourself.
 
@@ -95,7 +95,7 @@ Never calculate business days yourself.
 | `DISCREPANCY_TYPE` | `JUSTIFICATION` must start with | and must also contain |
 |---|---|---|
 | `Potential processor error` | `Potential processor error:` | - |
-| `Discrepancy from aged case` | `Discrepancy from aged case:` | the exact sentence `This case was completed more than 3 business days before the Register snapshot was captured.` |
+| `Possible discrepancy due to aged case` | `Possible discrepancy due to aged case:` | the exact sentence `This case was completed more than 3 business days before the Register snapshot was captured.` |
 | `None` | anything | - |
 
 If the case age was not provided, say so in `JUSTIFICATION`. When a `MATCH` is `null` or a STATUS is `Not determinable`, say why in `JUSTIFICATION`.

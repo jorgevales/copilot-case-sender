@@ -1,6 +1,10 @@
 """The results workbook for the human reviewers (stdlib only: an .xlsx is a zip of XML files, nothing to install).
 
-  RUNTIME_ROOT\\reports\\Copilot review results.xlsx     this run's valid Copilot answers, rewritten after every answer
+  CASES_ROOT\\Copilot review results.xlsx     this run's valid Copilot answers, rewritten after every answer
+
+It is saved beside the instruction-ID case folders the run picked its cases from (CASES_ROOT; user, 2026-11-03),
+never in RUNTIME_ROOT.  A file there is not a case: case discovery lists only folders.  The folder must already
+exist (setup checks it): it is never created here, so a lost share cannot leave an empty CASES_ROOT behind.
 
 Four tabs:
   Summary     totals by result, discrepancy type, Sub Worktype and issue type
@@ -96,12 +100,14 @@ class Sheet:
         self.links.append((f"{column_letter(col)}{row}", f"'{sheet}'!A{target_row}"))
 
 
-CASE_HEAD = (["Instruction ID", "Client Account Number", "Sub Worktype", "Copilot result", "Discrepancy type", "Headline",
+# "Discrepancy type" sits with the timing facts, away from "Copilot result": beside the result it read as the reason
+# for an Incorrect (user, 2026-11-03).  An aged case is Incorrect only because a comparison did not match.
+CASE_HEAD = (["Instruction ID", "Client Account Number", "Sub Worktype", "Copilot result", "Headline",
               "Issues", "Issue details (one per field)", "Client request", "Justification", "Comparisons", "Matches",
               "No match", "Could not compare", "Rule checks", "Not satisfied", "Not determinable",
               "Case end date/time (UK)", "Register snapshot date/time", "Business days gap", "Case age statement",
-              "Client Number"] + [h for h, _ in REVIEWER] + ["Reviewer corrected result"])
-CASE_WIDTHS = [34, 16, 22, 13, 22, 40, 8, 70, 45, 60, 11, 9, 9, 11, 10, 11, 12, 20, 26, 10, 30, 14, 12, 30, 30, 16]
+              "Discrepancy type", "Client Number"] + [h for h, _ in REVIEWER] + ["Reviewer corrected result"])
+CASE_WIDTHS = [34, 16, 22, 13, 40, 8, 70, 45, 60, 11, 9, 9, 11, 10, 11, 12, 20, 26, 10, 30, 26, 14, 12, 30, 30, 16]
 ISSUE_HEAD = (["Instruction ID", "Sub Worktype", "Copilot result", "Issue no.", "Type", "Field or rule",
                "Discrepancy ({field}: {discrepancy})", "Customer expectation", "Customer source", "Register value",
                "Register source", "Evidence"] + [h for h, _ in REVIEWER])
@@ -135,11 +141,11 @@ def build(cases: list) -> list:
         issue_types.update(k for k, *_ in items)
         phrases.update(_text(r.get("System_data")) for r in rows if r.get("MATCH") is not True)
         case_row = cases_sh.add(
-            [info.get("iid"), info.get("account"), info.get("sub_worktype"), verdict, kind, result.get("HEADLINE"),
+            [info.get("iid"), info.get("account"), info.get("sub_worktype"), verdict, result.get("HEADLINE"),
              len(items), issue_details(result), result.get("CLIENT_REQUEST"), result.get("JUSTIFICATION"), len(rows),
              flags.count(True), flags.count(False), flags.count(None), len(rules), statuses.count("Not satisfied"),
              statuses.count("Not determinable"), result.get("CASE_END_DATETIME"), result.get("REGISTER_SNAPSHOT_DATETIME"),
-             info.get("gap"), info.get("age"), info.get("client_number"), "", "", "", ""],
+             info.get("gap"), info.get("age"), kind, info.get("client_number"), "", "", "", ""],
             wrap=True, fills={3: COLOUR.get(verdict, "")})
         for n, (k, name, line, comp, rule) in enumerate(items, 1):
             src = comp or {}
@@ -168,7 +174,7 @@ def build(cases: list) -> list:
         summary.add([word, totals[word]], fills={0: COLOUR[word]})
     summary.add([])
     summary.add(["Discrepancy type", "Cases"], bold=True, fill=HEAD)
-    for word in ("Potential processor error", "Discrepancy from aged case", "None"):
+    for word in ("Potential processor error", "Possible discrepancy due to aged case", "None"):
         summary.add([word, kinds[word]])
     summary.add([])
     summary.add(["Sub Worktype", "Cases", "Correct", "Incorrect", "Inconclusive"], bold=True, fill=HEAD)
@@ -355,7 +361,8 @@ def set_aside(folder) -> Path | None:
 
 def make_room(folder, wait=input, say=print) -> Path | None:
     """Start of a run: set the older workbook aside.  While Excel holds it open: say so, wait for Enter, try again."""
-    Path(folder).mkdir(parents=True, exist_ok=True)
+    if not Path(folder).is_dir():
+        raise RuntimeError(f"the folder for '{NAME}' (CASES_ROOT) was not found - is the drive connected?")
     while True:
         try:
             moved = set_aside(folder)
@@ -391,7 +398,6 @@ class ReviewWorkbook:
         target = path or self.path
         tmp = target.with_name(f".{target.stem}.tmp-{uuid.uuid4().hex[:8]}.xlsx")
         try:
-            self.folder.mkdir(parents=True, exist_ok=True)
             with open(tmp, "wb") as fh:
                 fh.write(xlsx_bytes(self.cases))
                 fh.flush()

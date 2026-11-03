@@ -26,7 +26,7 @@ from urllib.parse import quote, urlparse
 
 HERE = Path(os.path.abspath(__file__)).parent      # never .resolve(): it turns a mapped drive (S:) into its UNC form
 PROJECT = HERE.parent
-for _p in (PROJECT, PROJECT / "3_copilot_sender", HERE):
+for _p in (PROJECT, PROJECT / "3_copilot_sender", PROJECT / "1_system1_documents", HERE):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
@@ -34,6 +34,7 @@ import copilot_case_sender as sender               # noqa: E402  config, storage
 from shared import pipeline as P                   # noqa: E402
 from shared import review_workbook as WB            # noqa: E402
 import handover as H                               # noqa: E402
+import studio_visual_cursor as VC                  # noqa: E402  only its clean-up script (stdlib module, no Playwright)
 
 PART_SCRIPTS = {"part1": PROJECT / "1_system1_documents" / "system1_documents.py",
                 "part2": PROJECT / "2_system2_snapshots" / "system2_snapshots.py"}
@@ -163,6 +164,39 @@ def start_part(part: str, paths: P.Paths, rt):
                             creationflags=flags)
 
 
+def sweep_pointer(cfg, procs: dict, control: P.Control) -> str:
+    """End of the run: remove Part 1's purple pointer from every tab of the systems Edge - one clean-up script per tab
+    over its own loopback DevTools socket (no click, no reload, no tab closed or brought to the front).  Part 1 removes
+    its own pointer when it ends; this also covers a Part 1 that crashed or was stopped, a tab its clean-up could not
+    reach, and a pointer left by an earlier run.  Never while Part 1 still runs (its pointer then shows real work).
+    Safe to repeat: a tab without a pointer is left as it is.  Returns the line it printed."""
+    p1 = procs.get("part1")
+    if p1 is not None and p1.poll() is None:
+        line = "Visual pointer: Part 1 is still finishing - it removes its own pointer when it ends"
+    else:
+        port = int(cfg.systems_cdp_port)
+        tabs = sender.cdp_http(port, "/json/list", 1.5)
+        if not isinstance(tabs, list):
+            line = "Visual pointer: the systems Edge did not answer - no tab was swept"
+        else:
+            removed = clean = failed = 0
+            for t in tabs:
+                if t.get("type") != "page" or not str(t.get("url", "")).startswith(("http://", "https://")):
+                    continue
+                found = sender.cdp_page_eval(str(t.get("webSocketDebuggerUrl", "")), port, VC.SWEEP, 3.0)
+                if found is None:
+                    failed += 1
+                elif found:
+                    removed += 1
+                else:
+                    clean += 1
+            line = (f"Visual pointer: removed from {removed} tab(s) of the systems Edge, none on {clean}"
+                    + (f", {failed} did not answer" if failed else ""))
+    print(line, flush=True)
+    control.event("coordinator", line)
+    return line
+
+
 def run_sender(paths: P.Paths, detail) -> int:
     """Part 3 in THIS console (its questions and the Enter).  Ctrl+C belongs to it: the first press stops it safely."""
     cmd = [sys.executable, "-B", "-E", "-s", str(SENDER_SCRIPT), "run", "--pipeline", str(paths.run)]
@@ -199,7 +233,7 @@ def main(argv=None) -> int:
         sender.ensure_dependencies(cfg, ctx.rt, ctx.log)
         if cfg.completion_mode == "json_result":    # before anything starts: the older results workbook is renamed
             try:                                    # (open in Excel = wait for Enter, then try again)
-                WB.make_room(ctx.rt.root / "reports")
+                WB.make_room(Path(cfg.cases_root))   # the workbook lives beside the case folders
             except RuntimeError as exc:
                 raise sender.SenderError(str(exc)) from None
         csv_path = Path(sender.clean_path(args.csv)) if args.csv else ask_csv(cfg)
@@ -265,6 +299,8 @@ def main(argv=None) -> int:
                 if all(p.poll() is not None for p in procs.values()):
                     break
                 time.sleep(0.5)
+        if procs:                                   # the systems Edge was used: no pointer may stay in its tabs
+            sweep_pointer(cfg, procs, control)
         return finish(paths, plan, control, code, edge_offset)
     except P.CsvError as exc:
         print(f"CSV PROBLEM: {exc}.")

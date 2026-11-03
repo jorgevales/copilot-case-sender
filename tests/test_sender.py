@@ -1404,11 +1404,11 @@ def test_structure_and_verdict_problems_are_named():
         assert any(expected in x for x in problems), (name, problems)
     # the timing label and the copied values follow THIS case's message
     old = answer_obj("Incorrect", end=aged["case_end"], snap=aged["snapshot"])
-    assert any("must be 'Discrepancy from aged case'" in x for x in parsed(json.dumps(old), expect=aged)[1])
-    good = {**old, "DISCREPANCY_TYPE": "Discrepancy from aged case", "JUSTIFICATION": "Discrepancy from aged case: x. "
+    assert any("must be 'Possible discrepancy due to aged case'" in x for x in parsed(json.dumps(old), expect=aged)[1])
+    good = {**old, "DISCREPANCY_TYPE": "Possible discrepancy due to aged case", "JUSTIFICATION": "Possible discrepancy due to aged case: x. "
             "This case was completed more than 3 business days before the Register snapshot was captured."}
     assert parsed(json.dumps(good), expect=aged)[1] == []
-    no_sentence = {**good, "JUSTIFICATION": "Discrepancy from aged case: x."}
+    no_sentence = {**good, "JUSTIFICATION": "Possible discrepancy due to aged case: x."}
     assert any("must include the sentence" in x for x in parsed(json.dumps(no_sentence), expect=aged)[1])
     assert any("CASE_END_DATETIME must be copied" in x
                for x in parsed(json.dumps({**good, "CASE_END_DATETIME": "12/10/2026"}), expect=aged)[1])
@@ -1632,11 +1632,12 @@ def test_a_valid_answer_goes_into_the_results_workbook(env2):
     env2.make_case(2)
     found, _, _ = env2.cases()
     r = env2.runner()
-    r.workbook = S.WB.ReviewWorkbook(env2.runtime / "reports")
+    r.workbook = S.WB.ReviewWorkbook(env2.cases_root)
     results = run(r.run(collections.deque(found)))
     assert [v[0] for v in results.values()] == ["result_correct"] * 2
-    assert r.workbook.close() == env2.runtime / "reports" / S.WB.NAME
-    sheet = zipfile.ZipFile(env2.runtime / "reports" / S.WB.NAME).read("xl/worksheets/sheet2.xml").decode("utf-8")
+    assert r.workbook.close() == env2.cases_root / S.WB.NAME
+    sheet = zipfile.ZipFile(env2.cases_root / S.WB.NAME).read("xl/worksheets/sheet2.xml").decode("utf-8")
+    assert [c.id for c in env2.cases()[0]] == [c.id for c in found]     # the workbook is never taken for a case
     assert all(c.id in sheet for c in found) and "Raise the limit to 500" in sheet and "No issues" in sheet
     assert "key order fixed" not in results[found[0].key][1] and "no discrepancy; 1 comparison(s)" in results[found[0].key][1]
 

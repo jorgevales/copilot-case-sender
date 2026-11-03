@@ -2,6 +2,15 @@
 
 The pointer stays at its last interaction position. Native mouse movement does
 not reset it. Focus/input/programmatic clicks provide background-action feedback.
+
+Pipeline changes (2026-11-03, the pointer stayed in the System 1 AND System 2 tabs after the run):
+  - `only` (a page -> bool test) limits the pointer to the pages Part 1 works on; any other page that still carries
+    one (an earlier run) has it removed instead of drawn;
+  - `close()` removes it from every page with a time limit per frame (a tab that does not answer cannot hold the
+    clean-up), and returns what it found: {"removed", "absent", "unreachable"};
+  - a page that is left (navigation, bfcache) destroys its own pointer, so going Back never shows a stale one;
+  - an install meets a pointer left by another run (other token): the old one is destroyed first;
+  - REMOVE / SWEEP are the one clean-up script, also used by the coordinator's end-of-run sweep (no Playwright).
 """
 from __future__ import annotations
 
@@ -35,15 +44,33 @@ class CursorConfig:
     visuals_in_screenshots: bool = False
     visuals_in_traces: bool = False
 
+STOP_SECONDS = 3.0         # longest wait for one frame to take or drop the pointer
+
+# Removes the pointer of ANY run from one document: its state object (timers, observer, listeners, animations) and
+# every host element.  Returns how many it found (0 = none).  deep=true also reaches same-origin iframes.
+REMOVE = r"""deep => {
+ const key='__studio_visual_cursor_v1__';let found=0;
+ const wipe=w=>{try{const s=w[key];if(s){found++;try{s.destroy()}catch(e){}try{delete w[key]}catch(e){}}
+   w.document.querySelectorAll('[data-studio-visual-cursor]').forEach(e=>{found++;e.remove();});}catch(e){}};
+ wipe(window);
+ if(deep)document.querySelectorAll('iframe').forEach(f=>{try{if(f.contentWindow)wipe(f.contentWindow)}catch(e){}});
+ return found;
+}"""
+SWEEP = "(" + REMOVE + ")(true)"   # one Runtime.evaluate expression, for a tab reached over its own DevTools socket
+
 INSTALL = r"""cfg => {
  const key='__studio_visual_cursor_v1__';
- if(window[key]){window[key].ensure();return;}
+ if(window[key]){
+   if(window[key].token===cfg.token){window[key].ensure();return;}
+   try{window[key].destroy()}catch(e){}         // left by another run: never two pointers, never a dead one
+   try{delete window[key]}catch(e){}
+ }
  let dead=false,host=null,shadow=null,pointer=null,glyph=null,moveAnimation=null;
  let root=null,observer=null,focusTimer=null,lastDown=null;
  const listeners=[],animations=new Set(),timers=new Map();
  const reduced=()=>cfg.reduced_motion===null?matchMedia('(prefers-reduced-motion: reduce)').matches:cfg.reduced_motion;
  const duration=n=>reduced()?0:Math.max(0,n);
- const state={x:cfg.initial_x,y:cfg.initial_y,lastInput:null,ensure,move,previewElement,destroy};
+ const state={x:cfg.initial_x,y:cfg.initial_y,lastInput:null,token:cfg.token,ensure,move,previewElement,destroy};
  window[key]=state;
  function listen(target,type,fn){target.addEventListener(type,fn,true);listeners.push([target,type,fn]);}
  function animate(el,frames,ms){
@@ -174,20 +201,24 @@ INSTALL = r"""cfg => {
  observer.observe(document,{childList:true,subtree:true,attributes:true,attributeFilter:['data-s4view','data-s4-document-view','data-s4-popup-download']});
  listen(window,'resize',()=>ensure());
  listen(window,'blur',()=>{if(glyph)glyph.style.transform='scale(1)';});
+ // A page that is left goes into the back/forward cache as it is: destroy first, so Back never shows the pointer.
+ listen(window,'pagehide',()=>destroy());
  function destroy(){
    if(dead)return;dead=true;observer.disconnect();
    for(const [t,n,f] of listeners)t.removeEventListener(n,f,true);
    for(const a of animations)a.cancel();animations.clear();
    if(focusTimer!==null)clearTimeout(focusTimer);
    for(const [id,resolve] of timers){clearTimeout(id);resolve();}timers.clear();
-   host?.remove();delete window[key];
+   host?.remove();if(window[key]===state)delete window[key];
  }
  ensure();
 }"""
 
 class VisualCursor:
-    def __init__(self, context, config=None, *, tracing=False):
+    def __init__(self, context, config=None, *, tracing=False, only=None):
         self.context=context
+        self._only=only              # page -> bool: the pages the pointer may be drawn on (None = every page)
+        self.cleanup={"removed":0,"absent":0,"unreachable":0}
         self.config=config or CursorConfig()
         self._tracing=tracing
         self.enabled=self.config.enabled and (not tracing or self.config.visuals_in_traces)
@@ -201,10 +232,10 @@ class VisualCursor:
         self._page_handler=lambda page:self._schedule(self._attach(page))
 
     @classmethod
-    async def start(cls, context, config=None, *, tracing=False):
+    async def start(cls, context, config=None, *, tracing=False, only=None):
         current=_INSTANCES.get(context)
         if current and not current._closed:return current
-        current=cls(context,config,tracing=tracing)
+        current=cls(context,config,tracing=tracing,only=only)
         _INSTANCES[context]=current
         if current.enabled:await current._start()
         return current
@@ -240,7 +271,7 @@ class VisualCursor:
             cfg=asdict(self.config)
             cfg['token']=self._token;cfg['report_prefix']=self._prefix
             cfg['initial_x'],cfg['initial_y']=self._positions.get(frame.page,(24,24))
-            await frame.evaluate(INSTALL,cfg)
+            await asyncio.wait_for(frame.evaluate(INSTALL,cfg),STOP_SECONDS)   # a silent tab never holds Part 1
         except Exception:pass
 
     async def _attach(self, page):
@@ -254,8 +285,25 @@ class VisualCursor:
             for name,fn in zip(('framenavigated','domcontentloaded','close','console'),self._pages[page]):page.on(name,fn)
         await self._refresh(page)
 
+    def _allowed(self, page):
+        try:
+            return self._only is None or bool(self._only(page))
+        except Exception:
+            return False
+
     async def _refresh(self, page):
+        if not self._allowed(page):          # e.g. the System 2 tab, or a System 1 tab that went elsewhere
+            await asyncio.gather(*(self._remove(f) for f in page.frames))
+            return
         await asyncio.gather(*(self._install(f) for f in page.frames))
+
+    async def _remove(self, frame):
+        """'removed' / 'absent' / 'unreachable' (the frame did not answer within STOP_SECONDS, or failed)."""
+        try:
+            found=await asyncio.wait_for(frame.evaluate(REMOVE,False),STOP_SECONDS)
+            return 'removed' if found else 'absent'
+        except Exception:
+            return 'unreachable'
 
     def _detach_page(self, page):
         handlers=self._pages.pop(page,None)
@@ -267,6 +315,7 @@ class VisualCursor:
         try:
             self._positions[page]=(x,y)
             await self._attach(page)
+            if not self._allowed(page):return
             await page.evaluate('(p)=>window.__studio_visual_cursor_v1__?.move(p.x,p.y)',{'x':x,'y':y})
         except Exception:pass
 
@@ -315,16 +364,25 @@ class VisualCursor:
         for task in tasks:task.cancel()
         if tasks:await asyncio.gather(*tasks,return_exceptions=True)
         self._tasks.clear()
-        async def remove(frame):
-            try:await frame.evaluate('()=>window.__studio_visual_cursor_v1__?.destroy()')
-            except Exception:pass
-        await asyncio.gather(*(remove(f) for p in self.context.pages for f in p.frames))
+        try:
+            frames=[f for p in self.context.pages if not p.is_closed() for f in p.frames]
+        except Exception:
+            frames=[]
+        outcomes=await asyncio.gather(*(self._remove(f) for f in frames))
+        self.cleanup={k:outcomes.count(k) for k in ("removed","absent","unreachable")}
+        return self.cleanup
 
     async def close(self):
-        if self._closed:return
+        """Remove the pointer from every page (also pages it was never drawn on: an earlier run may have left one).
+        Safe to call again: the second call does nothing and returns the first call's counts."""
+        if self._closed:return self.cleanup
         self._closed=True;self.enabled=False
-        await self._stop();self._positions.clear()
-        if _INSTANCES.get(self.context) is self:del _INSTANCES[self.context]
+        try:
+            await self._stop()
+        finally:
+            self._positions.clear()
+            if _INSTANCES.get(self.context) is self:del _INSTANCES[self.context]
+        return self.cleanup
 
 
 def for_page(page):

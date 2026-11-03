@@ -39,7 +39,10 @@ It uses the one System 1 tab in the **systems Edge** (port `systems_cdp_port`, d
   An unfinished case stays in `.work`.
 
 Kept unchanged from the original script: every UI step, selector and wait, the Audit Trail route, plus
-`studio_visual_cursor.py` (the moving cursor; `STUDIO_VISUAL_CURSOR=0` turns it off). Rewritten (VDI run 2026-11-02:
+`studio_visual_cursor.py` (the moving purple cursor; `STUDIO_VISUAL_CURSOR=0` turns it off). Since 2026-11-03 (it
+stayed in the System 1 and System 2 tabs after runs) it is drawn on System 1 tabs only, removed from every tab when
+Part 1 ends in any way (each tab within 3 s; a pointer left by an earlier run is removed too; a page that is left
+removes its own), and the coordinator sweeps every systems-Edge tab once Part 1 has ended. Rewritten (VDI run 2026-11-02:
 the old popup fallback clicked every link that mentioned "download" or "save" - including links inside the document -
 and one-by-position pairing could name a file after the wrong row): the document routes described above.
 Changed for the pipeline:

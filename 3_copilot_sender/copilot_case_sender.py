@@ -3225,7 +3225,7 @@ FIXUP_TEXT = ("Your previous answer was rejected by the program that reads it (a
 # message).  VDI runs 2026-11-02: first answers used another key set; then every answer failed the 'Working' + last-line
 # layout - so the reply is now the JSON line alone.
 ANSWER_TEMPLATE = ('{"COPILOT_RESULT":"<Correct or Incorrect or Inconclusive>","DISCREPANCY_TYPE":"<None or Potential '
-                   'processor error or Discrepancy from aged case>","HEADLINE":"<the outcome in at most 20 words>",'
+                   'processor error or Possible discrepancy due to aged case>","HEADLINE":"<the outcome in at most 20 words>",'
                    '"CASE_END_DATETIME":"' + TM.PLACEHOLDERS[0] + '",'
                    '"REGISTER_SNAPSHOT_DATETIME":"' + TM.PLACEHOLDERS[1] + '","CLIENT_REQUEST":"<one sentence: the request, '
                    'its source and provenance label>","JUSTIFICATION":"<your argument for the result>","A_B_COMPARISONS":'
@@ -5132,7 +5132,7 @@ async def run_async(ctx, journal, ledger, listed, message, pipeline_dir=None) ->
     runner.prompt_version = prompt_version(cfg, message)
     feed = runner.feed = PipelineFeed(pipeline_dir, ctx, local_salt(ctx.rt)) if pipeline_dir else None
     if cfg.completion_mode == "json_result":        # the older workbook was set aside before the run (make_room)
-        runner.workbook = WB.ReviewWorkbook(ctx.rt.root / "reports")
+        runner.workbook = WB.ReviewWorkbook(Path(cfg.cases_root))   # beside the case folders, not in RUNTIME_ROOT
     cases = []
     code, results, crash, started, start_seq, bfacts = 0, {}, None, time.monotonic(), journal.seq, None
     ctx.edge_offset = edge_log_size(ctx.rt)        # the run report shows only the Edge messages written from here on
@@ -5574,7 +5574,7 @@ def run_command(args) -> int:
         message = message.rstrip() + "\n\n" + CONTRACT_REMINDER
         if not getattr(args, "pipeline", None):         # (the coordinator already did this before Parts 1 and 2 started)
             try:
-                WB.make_room(ctx.rt.root / "reports")   # an older results workbook is renamed; open in Excel = wait for Enter
+                WB.make_room(Path(cfg.cases_root))      # an older results workbook is renamed; open in Excel = wait for Enter
             except RuntimeError as exc:
                 raise SenderError(str(exc)) from None
     journal = Journal(ctx.rt, cfg.persist_retries)

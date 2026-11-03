@@ -1274,6 +1274,20 @@ async def run_cases(context,page,todo,paths,control,say,counts):
                     break
 
 
+CURSOR_CLOSE_SECONDS=15                            # the pointer clean-up never holds Part 1's exit longer than this
+
+
+async def close_cursor(cursor,say):
+    """Remove the purple pointer from every tab of the systems Edge and say what was found (counts only).  A tab that
+    does not answer is left to the coordinator's end-of-run sweep (orchestrator/run_pipeline.py `sweep_pointer`)."""
+    try:
+        c=await asyncio.wait_for(cursor.close(),CURSOR_CLOSE_SECONDS)
+        say(f"visual pointer: removed from {c['removed']} page(s), none on {c['absent']}, "
+            f"{c['unreachable']} did not answer",'detail' if not c['unreachable'] else 'minimal')
+    except Exception as exc:
+        say(f"visual pointer clean-up did not finish ({type(exc).__name__}) - the coordinator sweeps the tabs at the end")
+
+
 async def run_pipeline(run_dir):
     global CAPTURES
     import copilot_case_sender as sender            # Part 3's storage rules and fast Playwright start, reused as-is
@@ -1306,7 +1320,7 @@ async def run_pipeline(run_dir):
         say('connected to the systems Edge - waiting for your sign-in','detail')
         cursor=await VisualCursor.start(context,CursorConfig(
             enabled=os.environ.get('STUDIO_VISUAL_CURSOR','1')!='0'
-        ))
+        ),only=on_system1)                         # System 1 tabs only: never drawn on System 2 or any other tab
         try:
             if not await wait_for_go(context,control):
                 return 0
@@ -1315,7 +1329,7 @@ async def run_pipeline(run_dir):
             page.set_default_timeout(4000)
             await run_cases(context,page,todo,paths,control,say,counts)
         finally:
-            await cursor.close()
+            await close_cursor(cursor,say)
     finally:
         await pw.stop()                            # disconnects only: the systems Edge stays open as it is
         control.finished('part1',downloaded=counts['done'],held=counts['held'])

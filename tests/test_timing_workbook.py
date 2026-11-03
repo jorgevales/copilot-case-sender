@@ -217,3 +217,69 @@ def test_the_workbook_is_written_after_every_answer_and_a_copy_is_made_when_it_s
         sheet = z.read("xl/worksheets/sheet2.xml").decode("utf-8")
     assert "a" * 32 in sheet and "b" * 32 in sheet                      # the copy has every answer
     assert not any(p.name.startswith(".") for p in folder.iterdir())   # no temp file left behind
+
+
+def test_the_discrepancy_type_sits_with_the_timing_facts_not_beside_the_result():
+    # Beside "Copilot result" the aged label read as the reason for an Incorrect (user, 2026-11-03).
+    head = W.CASE_HEAD
+    assert head.index("Discrepancy type") == head.index("Case age statement") + 1
+    assert head.index("Discrepancy type") - head.index("Copilot result") > 10
+    assert len(W.CASE_WIDTHS) == len(head)
+    aged = {**RESULT, "DISCREPANCY_TYPE": T.AGED_CASE}
+    _, cases, _, _ = W.build([({**INFO, "gap": "5", "age": T.AGED}, aged)])
+    row = dict(zip(head, cells(cases)[1]))
+    assert row["Discrepancy type"] == "Possible discrepancy due to aged case" and row["Copilot result"] == "Incorrect"
+    assert row["Case age statement"] == T.AGED and row["Business days gap"] == "5"
+    assert T.AGED_CASE == "Possible discrepancy due to aged case" and "Discrepancy from" not in T.AGED_CASE
+
+
+def test_the_workbook_folder_is_never_created_by_the_workbook(folder):
+    missing = folder / "not-there"
+    with pytest.raises(RuntimeError, match="CASES_ROOT"):
+        W.make_room(missing, wait=lambda p: None, say=lambda t: None)
+    book = W.ReviewWorkbook(missing)
+    with pytest.raises(OSError):
+        book.add(INFO, RESULT)
+    assert not missing.exists()
+
+
+@pytest.mark.parametrize("end, snap, gap, age", [
+    ("12/10/2026 02:17 PM", "2026-10-14T12:23:38+00:00", "2", T.WITHIN),     # Mon -> Wed: younger than 3
+    ("09/10/2026 02:17 PM", "2026-10-14T12:23:38+00:00", "3", T.WITHIN),     # Fri -> Wed: exactly 3 = within
+    ("08/10/2026 02:17 PM", "2026-10-14T12:23:38+00:00", "4", T.AGED),       # Thu -> Wed: older than 3
+    ("13/10/2026 11:59 PM", "2026-10-13T23:30:00+00:00", "1", T.WITHIN),     # 23:59 Tue UK; 00:30 Wed UK (BST)
+])
+def test_case_age_boundaries_in_business_days_and_uk_time(end, snap, gap, age):
+    t = T.case_timing(end, snap, T.Holidays())
+    assert (t["gap"], t["age"]) == (gap, age)
+
+
+def test_case_age_alone_never_decides_the_result_only_a_mismatch_does():
+    """The age matrix: Incorrect needs a MATCH false (or a rule not satisfied); age only names the discrepancy type."""
+    sys.path.insert(0, str(PROJECT / "3_copilot_sender"))
+    import copilot_case_sender as S
+    young = T.case_timing("12/10/2026 02:17 PM", SNAP, T.Holidays())
+    exact = T.case_timing("09/10/2026 02:17 PM", SNAP, T.Holidays())
+    old = T.case_timing("08/10/2026 02:17 PM", SNAP, T.Holidays())
+    no_date = T.case_timing("", SNAP, T.Holidays())
+    bad_date = T.case_timing("31/02/2026", SNAP, T.Holidays())
+    assert (young["age"], exact["age"], old["age"]) == (T.WITHIN, T.WITHIN, T.AGED)
+    assert no_date["age"] == bad_date["age"] == T.NOT_PROVIDED and bad_date["notes"]
+    rule = [{"RULE": "Signed", "STATUS": "Satisfied", "EVIDENCE": "e", "NOTE": "ok"}]
+
+    def answer(timing, verdict, match, kind):
+        rows = [comparison("Signatory", match)]
+        just = (kind + ": x. " + (T.AGED_SENTENCE if kind == T.AGED_CASE else "")) if kind != "None" else "x"
+        obj = {"COPILOT_RESULT": verdict, "DISCREPANCY_TYPE": kind, "HEADLINE": "h", "CASE_END_DATETIME": timing["case_end"],
+               "REGISTER_SNAPSHOT_DATETIME": timing["snapshot"], "CLIENT_REQUEST": "c", "JUSTIFICATION": just,
+               "A_B_COMPARISONS": rows, "RULE_CHECKS": rule}
+        return S.validate_result(obj, {**timing, "rules_file": True})
+
+    for timing in (young, exact, old, no_date, bad_date):            # an exact match is Correct at any age
+        assert answer(timing, "Correct", True, "None") == []
+        assert any("Incorrect needs a MATCH false" in p for p in answer(timing, "Incorrect", True, "None"))
+    assert answer(young, "Incorrect", False, T.PROCESSOR_ERROR) == []         # a real mismatch stays Incorrect
+    assert answer(old, "Incorrect", False, T.AGED_CASE) == []
+    assert answer(no_date, "Incorrect", False, T.PROCESSOR_ERROR) == []
+    assert any("must be 'Possible discrepancy due to aged case'" in p for p in answer(old, "Incorrect", False, T.PROCESSOR_ERROR))
+    assert any("must be None" in p for p in answer(old, "Correct", True, T.AGED_CASE))   # no aged label without a mismatch

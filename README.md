@@ -266,7 +266,7 @@ answer failed). The message ends with `CONTRACT_REMINDER` and a template line (`
 date/time values already in place. A fix-up asks for the corrected line only, fixing exactly the problems it lists.
 Eight keys:
 
-    {"COPILOT_RESULT":"Correct|Incorrect|Inconclusive","DISCREPANCY_TYPE":"None|Potential processor error|Discrepancy from aged case","CASE_END_DATETIME":"...","REGISTER_SNAPSHOT_DATETIME":"...","CLIENT_REQUEST":"...","JUSTIFICATION":"...","A_B_COMPARISONS":[{"ITEM":"...","Customer_expectation":"...","CUSTOMER_SOURCE":"...","System_data":"...","SYSTEM_SOURCE":"...","MATCH":true}],"RULE_CHECKS":[{"RULE":"...","STATUS":"Satisfied|Not satisfied|Not determinable|Not applicable","EVIDENCE":"...","NOTE":"..."}]}
+    {"COPILOT_RESULT":"Correct|Incorrect|Inconclusive","DISCREPANCY_TYPE":"None|Potential processor error|Possible discrepancy due to aged case","CASE_END_DATETIME":"...","REGISTER_SNAPSHOT_DATETIME":"...","CLIENT_REQUEST":"...","JUSTIFICATION":"...","A_B_COMPARISONS":[{"ITEM":"...","Customer_expectation":"...","CUSTOMER_SOURCE":"...","System_data":"...","SYSTEM_SOURCE":"...","MATCH":true}],"RULE_CHECKS":[{"RULE":"...","STATUS":"Satisfied|Not satisfied|Not determinable|Not applicable","EVIDENCE":"...","NOTE":"..."}]}
 
 The tool reads only the **newest assistant reply** of that case's chat once Copilot has stopped generating and the text
 has been unchanged for `answer_stable_seconds`, and of that reply **only its last non-empty line** (read with its line
@@ -342,15 +342,19 @@ there is no CSV: the case end, gap and age are `Not provided` without a flag. *L
 
 ### Results workbook (`Copilot review results.xlsx`)
 
-`RUNTIME_ROOT\reports\Copilot review results.xlsx` holds **this run's valid Copilot answers** and is rewritten after
-every answer (`shared/review_workbook.py`, written with Python's standard library: nothing to install).
+`CASES_ROOT\Copilot review results.xlsx` - beside the instruction-ID case folders the run picked its cases from, never
+in `RUNTIME_ROOT` (2026-11-03) - holds **this run's valid Copilot answers** and is rewritten after every answer
+(`shared/review_workbook.py`, written with Python's standard library: nothing to install). A file there is never taken
+for a case (case discovery lists folders only), and the folder is never created by the workbook (setup checks it).
 * **Four tabs** (it opens on Cases):
   - **Summary** - totals by result, discrepancy type, Sub Worktype, issue type, and how often the Register value of a
     non-matching field was `Not available in Register snapshot` / `Blank on Register` / a real value.
-  - **Cases** - ONE row per case: ID, account, Sub Worktype, Copilot result (coloured), discrepancy type, Headline,
+  - **Cases** - ONE row per case: ID, account, Sub Worktype, Copilot result (coloured), Headline,
     number of issues, **Issue details** (every wrong / not-comparable field and failed / undeterminable rule as its own
     numbered paragraph `1. [No match] {field}: {discrepancy}`, a blank line between them), client request,
-    justification, counts, timing, Client Number and reviewer columns (Y/N and result lists).
+    justification, counts, timing, **discrepancy type** (right after the case age statement, 2026-11-03: beside the
+    result it read as the reason for an Incorrect), Client Number and reviewer columns (Y/N and result lists). An aged
+    case is Incorrect only because a comparison did not match; its type then reads `Possible discrepancy due to aged case`.
   - **Issues** - one row per red / yellow item (the reviewers' to-do list): `{field}: {discrepancy}`, both values and
     both sources; the ID links back to the case's row in Cases; a thick line above each new case.
   - **All checks** - every comparison and rule check with its explanation (audit).
@@ -544,6 +548,8 @@ skipped, not failed.
 | Code check: no call passes a keyword already given by position (the bug that failed every case on the VDI, 2026-11-02) | **Tested here** (`tests/test_code_checks.py`) |
 | Part 1 downloads: viewer address paired by document ID (position only when no address names an ID and counts match); a viewer page's own file fetched; a document window read without clicking inside it (its address, the file it shows, a download it starts, its own toolbar button only) | **Tested here** (fake responses / window; pairing run in Node). Real System 1 viewer: **needs your VDI** |
 | Part 2: Access Denied vs expired sign-in vs normal page; Access Denied twice stops the run; expired → pause → fresh cookies; only System 2 cookies read; the failing page kept with addresses cut | **Tested here** (synthetic pages) |
+| Part 2 party profile (2026-11-03): every email / phone / address record read from the page's setup script (never run), finished rows by id prefix (any suffix, td.TableHead headers, placeholders left out), empty only when the script says so, an unreadable section 'Not captured', rows vs script disagreement, repeated labels, compliance by control ID, dialogs left out, signature present / absent / unreadable, a record lost while writing caught, Interested Party Link tab coverage | **Tested here** (synthetic page in the shape of the sanitised sample). Real System 2 profile pages: **needs your VDI** |
+| Purple pointer (2026-11-03): drawn on System 1 tabs only; removed from every tab on finish, stop, failure and a hung clean-up; a silent tab cannot hold it; twice is safe; the coordinator's sweep after Part 1 has ended; the in-page scripts in a DOM (jsdom, when `JSDOM_NODE_MODULES` is set) | **Tested here** (fake tabs; jsdom). Real systems Edge: **needs your VDI** |
 | Copilot refusals: blocked chat (with and without a reply) ends the case, nothing clicked; refusal resent and confirmed; responses file with replies, buttons and `...` menu | **Tested here** (fake page). Real refusal page: **needs your VDI** |
 | One whole run with real processes (coordinator + stand-ins for the three parts): skipped row, held case, two cases sent, daily report | **Tested here** |
 | Real System 1 / System 2 pages, cookie read over DevTools, two Edges side by side, background switches | **Needs your VDI** |
