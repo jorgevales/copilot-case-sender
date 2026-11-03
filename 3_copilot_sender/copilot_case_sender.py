@@ -381,6 +381,7 @@ DEFAULTS = {
     "system2_account_page": "",       # the account summary page, {account} where the account number goes
     "system2_party_marker": "",       # text found in the links to a linked party's profile page
     "system2_party_links_page": "",   # the page listing a party's other customers/accounts, {party} where its ID goes
+    "system2_detail_pages": {},       # the nine account-detail pages (shared.pipeline.DETAIL_SECTIONS), {account} in each
     "systems_cdp_port": 9223,         # Edge for System 1 + 2 (its own remembered profile); Copilot stays on cdp_port
     "last_csv_path": "",              # the daily CSV used last time (offered as the default)
 }
@@ -395,6 +396,7 @@ if str(PROJECT) not in sys.path:                # embedded Python does not add t
 from shared import timing as TM                 # noqa: E402  the four case-timing values of the base message
 from shared import review_workbook as WB        # noqa: E402  Copilot review results.xlsx for the human reviewers
 from shared.pipeline import SNAPSHOT_SUFFIX      # noqa: E402  Part 2's account snapshot, copied into each case folder
+from shared.pipeline import DETAIL_SECTIONS      # noqa: E402  Part 2's nine account-detail pages (asked in setup)
 
 
 def config_path() -> Path:
@@ -525,6 +527,9 @@ def setup_command() -> int:
                                            cur.get("system2_party_marker") or "")
     cur["system2_party_links_page"] = ask_text("  A party's links page address, with {party} where the party ID goes",
                                                cur.get("system2_party_links_page") or "")
+    print("  The nine account-detail pages, each with {account} where the account number goes:")
+    pages = cur.get("system2_detail_pages") or {}
+    cur["system2_detail_pages"] = {name: ask_text(f"    {name} page address", pages.get(name) or "") for name in DETAIL_SECTIONS}
     node = next((str(p) for p in exe_candidates("node") if p.is_file()), "")
     value = ask("Node.js node.exe (optional; Enter = use the copy bundled with Playwright)", cur.get("node_executable") or node, True)
     cur["node_executable"] = str(resolve_file(value, "node.exe") or "") if value else ""
@@ -3231,7 +3236,7 @@ ANSWER_TEMPLATE = ('{"COPILOT_RESULT":"<Correct or Incorrect or Inconclusive>","
                    'its source and provenance label>","JUSTIFICATION":"<your argument for the result>","A_B_COMPARISONS":'
                    '[{"ITEM":"<what is compared>","Customer_expectation":"<value the request requires>","CUSTOMER_SOURCE":'
                    '"<document or Audit Trail entry and date; provenance: label>","System_data":"<Register value>",'
-                   '"SYSTEM_SOURCE":"<Account Summary > section > field>","MATCH":false,"EXPLANATION":"<this field only: what '
+                   '"SYSTEM_SOURCE":"<Account Summary > section > field, or Nine Account Detail Sections > page > field>","MATCH":false,"EXPLANATION":"<this field only: what '
                    'differs or why it cannot be compared>"}],"RULE_CHECKS":[{"RULE":"<check '
                    'name from the rules file>","STATUS":"<Satisfied or Not satisfied or Not determinable or Not applicable>",'
                    '"EVIDENCE":"<source and provenance label>","NOTE":"<short note>"}]}')

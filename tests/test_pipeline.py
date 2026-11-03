@@ -1070,7 +1070,9 @@ def test_one_whole_run_coordinates_the_three_parts_and_reports_every_csv_row(bas
                                   "system2_url": "https://system2.example.invalid/home", "console_detail": "full",
                                   "system2_account_page": "https://system2.example.invalid/account?id={account}",
                                   "system2_party_marker": "partyprofile",
-                                  "system2_party_links_page": "https://system2.example.invalid/links?party={party}"}), "utf-8")
+                                  "system2_party_links_page": "https://system2.example.invalid/links?party={party}",
+                                  "system2_detail_pages": {n: f"https://system2.example.invalid/detail{i}?id={{account}}"
+                                                           for i, n in enumerate(P.DETAIL_SECTIONS)}}), "utf-8")
     (cases_root / "Copilot review results.xlsx").write_bytes(b"older run")   # the coordinator sets it aside here
     csv = write_csv(base / "daily.csv", [(hexid(1), "AB100000", "C1", "Ended", "Change of Address"),
                                          (hexid(2), "AB200000", "C2", "Voided", "Change of Address"),
@@ -1680,8 +1682,10 @@ def test_part2_signature_is_reported_present_absent_or_unreadable_and_never_copi
 
 def test_part2_a_record_dropped_while_writing_is_caught_and_the_file_never_reused(p2, monkeypatch, base):
     party = party_of(p2, monkeypatch, profile())
-    target = base / "AB1_Account_Summary_Interested_Parties_and_Links.json"
-    p2.write_result(target, "AB1", {"metadata": {}}, [party], [])
+    target = base / ("AB1" + P.SNAPSHOT_SUFFIX)
+    details = {n: {"captureStatus": "Captured", "data": {}, "completeness": {"outcome": "Extracted successfully", "sectionFound": True}}
+               for n in P.DETAIL_SECTIONS}
+    p2.write_result(target, "AB1", {"metadata": {"requestedAccount": "AB1"}}, [party], [], details)
     back = json.loads(target.read_text("utf-8"))["Interested Parties linked to the account"][0]
     assert [len(back[k]["rows"]) for k in ("Emails", "Phone numbers", "Addresses")] == [1, 2, 1]
     real = P.write_json
@@ -1692,7 +1696,7 @@ def test_part2_a_record_dropped_while_writing_is_caught_and_the_file_never_reuse
         real(path, copy)
     monkeypatch.setattr(p2.P, "write_json", lossy)
     with pytest.raises(p2.SnapshotIncomplete, match="holds 3 contact record"):
-        p2.write_result(target, "AB1", {"metadata": {}}, [party], [])
+        p2.write_result(target, "AB1", {"metadata": {"requestedAccount": "AB1"}}, [party], [], details)
     assert not target.exists() and (base / (target.stem + ".incomplete.json")).exists()   # set aside, never reused
 
 

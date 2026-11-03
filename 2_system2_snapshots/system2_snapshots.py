@@ -2,10 +2,10 @@
 """PART 2 - System 2 snapshots: fast bulk account-platform extractor (the account snapshot script, in the daily pipeline).
 
 For every account of the run (unique, from the CSV), in bulk with parallel authenticated requests: the account summary,
-its linked Interested Parties and their other customer/account relationships -> one JSON snapshot per account in
-RUNTIME_ROOT\\pipeline\\snapshots\\<today>\\<ACCOUNT>_Account_Summary_Interested_Parties_and_Links.json.  The coordinator
-copies it into each case folder of that account when Part 1 has finished the case.  A snapshot made earlier the same
-day is reused.
+its linked Interested Parties, their other customer/account relationships and the nine account-detail pages -> one
+JSON snapshot per account in RUNTIME_ROOT\\pipeline\\snapshots\\<today>\\<ACCOUNT>_Complete_Account_Profile.json (name:
+shared/pipeline.py).  The coordinator copies it into each case folder of that account when Part 1 has finished the
+case.  A snapshot made earlier the same day is reused only if it reads back complete for that account.
 
 Started by orchestrator/run_pipeline.py with --run-dir; never asks anything on the console.  Kept from the original
 script: every parser, route, field label, the 24/40 worker pools and the output schema.  Changed for the pipeline:
@@ -14,12 +14,14 @@ script: every parser, route, field label, the 24/40 worker pools and the output 
   - Access Denied (HTTP 401/403 or a denial page), after one retry, STOPS THE WHOLE RUN (shared stop signal), so the
     system is not hammered; an expired sign-in PAUSES this part until you sign in again and press Enter;
   - any other failed account is retried once, then reported (its cases are held, never sent without a snapshot);
-  - a party/link page is requested once (the original's eager setdefault could submit duplicates).
+  - a party/link page is requested once (the original's eager setdefault could submit duplicates);
+  - the nine account-detail pages (2026-11-03) go through the same requests, retry, pause, stop and party pool; the
+    snapshot is written only when every one of them was read or positively confirmed empty.
 """
 from __future__ import annotations
 
 import argparse,json,os,re,sys,threading,time,traceback
-from concurrent.futures import ThreadPoolExecutor,as_completed
+from concurrent.futures import CancelledError,ThreadPoolExecutor,as_completed
 from datetime import datetime,timezone
 from html import unescape as html_unescape
 from pathlib import Path
@@ -32,11 +34,13 @@ for _p in (PROJECT,PROJECT/"3_copilot_sender"):
 from shared import pipeline as P
 
 # requests / bs4 are imported by load_libs() after the storage bootstrap (they live in the private dependency folder).
-requests=BeautifulSoup=Tag=HTTPAdapter=None
+requests=BeautifulSoup=Tag=NavigableString=HTTPAdapter=None
 
 # System 2's pages are pasted once in setup and kept only in the local config - never written in this code.
 PORT=9223; BASE=""; CHECK_URL=""; ACCOUNT_PAGE=""; PARTY_MARKER=""; LINKS_PAGE=""; ACCOUNT_COLUMN="Client Account Number"
-ACCOUNT_WORKERS=24; PARTY_WORKERS=40; CONNECTIONS=80
+DETAIL_PAGES={}   # {P.DETAIL_SECTIONS name: address with {account}}
+ACCOUNT_WORKERS=24; PARTY_WORKERS=40; CONNECTIONS=80   # party, link AND account-detail pages share the party pool
+DETAIL_WORKERS=9  # only when fetch_all_account_sections is called without the run's pool
 TL=threading.local(); COOKIES=[]; UA="Mozilla/5.0"; COOKIE_GEN=0
 CAPTURES=None   # RUNTIME_ROOT\logs\captures\<run>: the page System 2 answered with when an account fails
 TITLE="Part 2 - System 2 snapshots"
@@ -57,18 +61,20 @@ class RunStopped(Exception):
 
 
 def load_libs():
-    global requests,BeautifulSoup,Tag,HTTPAdapter
+    global requests,BeautifulSoup,Tag,NavigableString,HTTPAdapter
     import requests as _requests
-    from bs4 import BeautifulSoup as _BS,Tag as _Tag
+    from bs4 import BeautifulSoup as _BS,NavigableString as _NS,Tag as _Tag
     from requests.adapters import HTTPAdapter as _HA
-    requests,BeautifulSoup,Tag,HTTPAdapter=_requests,_BS,_Tag,_HA
+    requests,BeautifulSoup,Tag,NavigableString,HTTPAdapter=_requests,_BS,_Tag,_NS,_HA
 
 
 def configure(cfg):
-    global PORT,BASE,CHECK_URL,ACCOUNT_PAGE,PARTY_MARKER,LINKS_PAGE
+    global PORT,BASE,CHECK_URL,ACCOUNT_PAGE,PARTY_MARKER,LINKS_PAGE,DETAIL_PAGES
     u=urlparse(cfg.system2_url)
     PORT=int(cfg.systems_cdp_port); BASE=f"{u.scheme}://{u.netloc}"; CHECK_URL=cfg.system2_url
     ACCOUNT_PAGE=cfg.system2_account_page; PARTY_MARKER=cfg.system2_party_marker.lower(); LINKS_PAGE=cfg.system2_party_links_page
+    pages=getattr(cfg,"system2_detail_pages",None) or {}
+    DETAIL_PAGES={n:(pages.get(n) or "") for n in P.DETAIL_SECTIONS}
 
 
 def clean(v): return re.sub(r"\s+"," ",str(v or "")).strip()
@@ -118,13 +124,16 @@ def soup_get(url,params=None):
 def capture(label,exc):
     """For the reviewing Copilot: the page System 2 answered with when `label` failed (addresses cut before '?')."""
     page=getattr(exc,"page",None)
-    if CAPTURES is None or not page:return []
-    r,s=page;base=re.sub(r"[^A-Za-z0-9._-]+","_",f"system2-{label}")[:90]
+    return capture_page(label,*page,f"{type(exc).__name__}: {exc}") if page else []
+def capture_page(label,r,s,why):
+    """A page copy (.txt + .html) in captures\\<run>\\ - also for a page that loaded but could not be used."""
+    if CAPTURES is None:return []
+    base=re.sub(r"[^A-Za-z0-9._-]+","_",f"system2-{label}")[:90]
     try:
         CAPTURES.mkdir(parents=True,exist_ok=True)
         title=clean(s.title.get_text()) if s.title else ""
         (CAPTURES/f"{base}.txt").write_text(P.REVIEWER_NOTE+f"\n\nHTTP {r.status_code}\naddress: {P.strip_query(r.url)}\ntitle: {title}\n"
-                                            f"error: {type(exc).__name__}: {exc}\n\n"+P.strip_queries(clean(s.get_text(" ",strip=True)))[:100000],encoding="utf-8")
+                                            f"error: {why}\n\n"+P.strip_queries(clean(s.get_text(" ",strip=True)))[:100000],encoding="utf-8")
         (CAPTURES/f"{base}.html").write_text(P.html_note(P.strip_queries(r.text)[:3000000]),encoding="utf-8")
         return [f"{base}.txt",f"{base}.html"]
     except Exception:
@@ -543,19 +552,534 @@ def fetch_links(d):
     seen=lambda tid,rows:f"table found, {len(rows)} link(s) read" if s.find("table",id=tid) else "table not found on the page - nothing read from it"
     return {"interestedPartyId":d.get("interestedPartyId",""),"nameFromAccount":d.get("nameFromAccount",""),"metadata":{"sourceUrl":r.url,"httpStatus":r.status_code,"retrievedUtc":datetime.now(timezone.utc).isoformat()},"Customer Interested Parties":grouped(cu,"Customer number"),"Account Interested Parties":grouped(ac,"Account number"),
             "coverage":{"Customer Interested Parties":seen("CustomerInterestedParties",cu),"Account Interested Parties":seen("AccountInterestedParties",ac)}}
+# ---------------------------------------------------------------------------------------------- account-detail pages
+# The nine account-detail pages (P.DETAIL_SECTIONS; addresses pasted in setup, never in this code).  The readers follow
+# the sanitised parser reference the user supplied (2026-11-03: element ids, headings and wording of the real pages),
+# made strict: a page counts as read only when its own landmarks are on it, an empty result is never success, and a
+# page is 'Confirmed empty' only on positive proof (FDT: the page says there are no instructions; Banking: no BANK
+# ACCOUNT row on a fully loaded page - main form, account header and 'Banking Details' title all there).
+UNEXPECTED,ACCOUNT_FAILED,REQUEST_FAILED="Unexpected page layout","Account validation failed","Request failed"
+ACCEPTED=(EXTRACTED,EMPTY)      # any other outcome on any of the nine pages fails the account (its cases are held)
+DETAIL_ACTIONS={"edit","save","cancel","remove","delete","add","add new","action","actions"}
+HIDE_CLASSES={"hidden","hide","d-none"}         # a folded 'collapse' section is NOT hidden: its saved data is captured
+NO_VALUE_INPUTS=("hidden","password","file","button","submit","reset","image")
+STATIC="[id$='Static'], .form-control-static"
+BOLD_HEADINGS={"Preferences","Post Settings","Email Settings","Portal Settings","Document Reporting Oversight Emails"}
+INTRODUCING_FIRM="Details of Introducing Firm"
+APPROPRIATENESS="Appropriateness Test completed for Complex Direct Investments."
+NO_FDT="No FDT Instructions linked to Account."
+BANK_LABEL=re.compile(r"BANK ACCOUNT\s+\d+",re.I)
+FLAG_PANELS=("General","CS Request","Sub-type")
+FLAG_ON,FLAG_OFF={"fa-check-circle-o","fa-check-circle","fa-check"},{"fa-circle-o"}
+BLOCKS=("Account Summary","Interested Parties linked to the account","Interested Party links to other account numbers",
+        "Nine Account Detail Sections")
+
+
+class WrongAccount(RuntimeError):
+    """A detail page answered for another account: never used."""
+
+
+class WrongPage(RuntimeError):
+    """A detail request ended on another page than the configured one (a redirect)."""
+
+
+def detail_hidden(node,stop=None):
+    """Hidden on the page (the hidden attribute, a hiding class, inline display:none / visibility:hidden) - the node or
+    an ancestor below `stop`."""
+    while isinstance(node,Tag) and node is not stop:
+        style=re.sub(r"\s+","",node.get("style") or "").lower()
+        if node.has_attr("hidden") or HIDE_CLASSES&set(node.get("class") or []) or "display:none" in style or "visibility:hidden" in style:return True
+        node=node.parent
+    return False
+def detail_value(node):
+    """The value shown now: a select's chosen option (never its option list), an input's value, a tick box's state, a
+    textarea's text; in a container a visible static display wins (even when explicitly empty), else its text."""
+    if node is None:return ""
+    if node.name=="select":
+        o=node.find("option",selected=True)
+        if o is None and not node.has_attr("multiple"):o=node.find("option")
+        return clean(o.get_text(" ",strip=True)) if o else ""
+    if node.name=="input":
+        t=clean(node.get("type") or "text").lower()
+        if t in NO_VALUE_INPUTS:return ""
+        return node.has_attr("checked") if t in ("checkbox","radio") else clean(node.get("value"))
+    if node.name=="textarea":return clean(node.get_text(" ",strip=True))
+    st=node.select_one(STATIC)
+    if st is not None and not detail_hidden(st,node):return detail_value_text(st)
+    return detail_value_text(node)
+def detail_value_text(node):
+    """Visible text: hidden parts, scripts, styles, buttons, icons, SVG, noscript, action / button links and soft-close
+    controls left out; a control inside gives its current value (a tick box: Yes / No)."""
+    parts=[]
+    for ch in node.children:
+        if isinstance(ch,NavigableString):
+            if type(ch) is NavigableString:parts.append(str(ch))     # never a comment or other markup string
+            continue
+        if not isinstance(ch,Tag) or ch.name in ("script","style","button","svg","noscript","i") or detail_hidden(ch,node):continue
+        cls=ch.get("class") or []
+        if ch.get("role")=="button" or any(c.startswith(("fa-","glyphicon")) for c in cls) or "softclose" in (ch.get("id") or "").lower():continue
+        if ch.name=="a" and (any(c=="btn" or c.startswith("btn-") for c in cls) or clean(ch.get_text(" ",strip=True)).casefold() in DETAIL_ACTIONS):continue
+        if ch.name in ("input","select","textarea"):
+            v=detail_value(ch);parts.append(("Yes" if v else "No") if isinstance(v,bool) else v)
+        else:parts.append(detail_value_text(ch))
+    return clean(" ".join(parts))
+def detail_put(target,key,value):
+    """A labelled value; the same label again with another value becomes a list (source order, each value once).
+    Blank and action labels are ignored."""
+    key=label(key)
+    if not key or key.casefold() in DETAIL_ACTIONS:return
+    if key not in target:target[key]=value
+    elif target[key]!=value:
+        if not isinstance(target[key],list):target[key]=[target[key]]
+        if value not in target[key]:target[key].append(value)
+def detail_own_rows(table):
+    return [] if table is None else [r for r in table.find_all("tr") if r.find_parent("table") is table]
+def detail_classes(e):return " ".join(e.get("class") or []).lower()
+def detail_table_is_grid(table):
+    """A table with a column-header row (th cells or TableSubHead), as opposed to label/value rows."""
+    for r in detail_own_rows(table):
+        cells=r.find_all(["th","td"],recursive=False)
+        if len(cells)>=2 and (any(c.name=="th" for c in cells) or "tablesubhead" in detail_classes(r)
+                              or sum("tablesubhead" in detail_classes(c) for c in cells)>=2):return True
+    return False
+def detail_is_head(r):
+    cells=r.find_all(["th","td"],recursive=False)
+    if not cells or (len(cells)==1 and cells[0].has_attr("colspan")):return False     # a caption row, not column names
+    return any(c.name=="th" for c in cells) or "tablesubhead" in detail_classes(r) or any("tablesubhead" in detail_classes(c) for c in cells)
+def detail_grid(table):
+    """{"columns", "rows", "message"}: column and row order kept, action columns, hidden and soft-close rows left out,
+    blank cells kept in place; a no-records / explanatory row goes to "message", never into the rows."""
+    out={"columns":[],"rows":[],"message":""}
+    if table is None:return out
+    rows=detail_own_rows(table);head=next((i for i,r in enumerate(rows) if detail_is_head(r)),None);msgs=[]
+    if head is None:
+        msgs=[v for v in (detail_value(r) for r in rows if not detail_hidden(r,table)) if v]
+    else:
+        keep=[]
+        for i,c in enumerate(rows[head].find_all(["th","td"],recursive=False)):
+            k=label(detail_value(c))
+            if detail_hidden(c,table) or k.casefold() in DETAIL_ACTIONS:continue
+            k,n=k or f"Column {i+1}",2
+            while k in [x for _,x in keep]:k,n=f"{label(detail_value(c)) or f'Column {i+1}'} ({n})",n+1
+            keep.append((i,k))
+        out["columns"]=[k for _,k in keep]
+        for r in rows[head+1:]:
+            if detail_hidden(r,table) or "softclose" in (r.get("id") or "").lower():continue
+            tds=r.find_all("td",recursive=False)
+            if not tds:continue
+            if len(tds)==1 and (len(keep)>1 or tds[0].has_attr("colspan") or tds[0].select_one(".alert")):
+                v=detail_value(r)
+                if v:msgs.append(v)
+                continue
+            item={k:(detail_value(tds[i]) if i<len(tds) and not detail_hidden(tds[i],table) else "") for i,k in keep}
+            if any(v not in ("",None) for v in item.values()):out["rows"].append(item)
+    out["message"]=" ".join(dict.fromkeys(msgs))
+    return out
+def detail_group_value(g,lab):
+    """A form / control group's value: its tick box, else a visible non-empty static display, else its visible
+    controls' current values, else its visible text."""
+    box=g.select_one("input[type=checkbox]")
+    if box is not None and not detail_hidden(box,g):return box.has_attr("checked")
+    shown=[detail_value_text(x) for x in g.select(STATIC) if not detail_hidden(x,g) and x is not lab and lab not in x.parents]
+    if any(shown):return clean(" ".join(shown))
+    ctls=[x for x in g.find_all(["select","textarea","input"]) if not detail_hidden(x,g)
+          and not (x.name=="input" and clean(x.get("type")).lower() in NO_VALUE_INPUTS)]
+    if ctls:return clean(" ".join(str(detail_value(x)) for x in ctls))
+    return clean(" ".join(str(x) if type(x) is NavigableString else detail_value_text(x) for x in g.children
+                          if x is not lab and (type(x) is NavigableString or (isinstance(x,Tag) and not detail_hidden(x,g) and lab not in x.descendants))))
+def detail_fields(root):
+    """Visible labelled values: label/value table rows (never a grid's rows, never a nested table's twice), form /
+    control groups and definition lists."""
+    out={}
+    if root is None:return out
+    for r in root.find_all("tr"):
+        if detail_hidden(r,root):continue
+        cells=r.find_all(["td","th"],recursive=False)
+        if len(cells)<2 or any(c.find("table") for c in cells) or detail_table_is_grid(r.find_parent("table")):continue
+        for i in range(0,len(cells)-1,2):
+            if detail_hidden(cells[i],root) or detail_hidden(cells[i+1],root):continue
+            v=detail_value(cells[i+1])
+            if isinstance(v,str) and v.casefold() in DETAIL_ACTIONS:continue
+            detail_put(out,detail_value(cells[i]),v)
+    for g in root.select(".form-group, .control-group"):
+        if detail_hidden(g,root) or g.find("table"):continue
+        lab=g.select_one("label.control-label")
+        if lab is not None:detail_put(out,detail_value(lab),detail_group_value(g,lab))
+    for dt in root.find_all("dt"):
+        dd=dt.find_next_sibling("dd")
+        if dd is not None and not detail_hidden(dt,root) and not detail_hidden(dd,root):detail_put(out,detail_value(dt),detail_value(dd))
+    return out
+def detail_heading_text(node):
+    """The section name when `node` is a heading (h1-h4, legend, panel heading, expandable or TableHead/TableSubHead
+    table heading cell, bold subsection label), else ''."""
+    if node.name in ("h1","h2","h3","h4","legend") or "panel-heading" in (node.get("class") or []):return label(detail_value(node))
+    if node.name in ("td","th"):
+        if clean(node.get_text(" ",strip=True))==INTRODUCING_FIRM:return INTRODUCING_FIRM
+        if not node.find("table") and node.select_one("a.js-btn-expand-collapse"):return label(detail_value(node))
+        if node.has_attr("colspan") and any(x.lower() in ("tablehead","tablesubhead") for x in node.get("class") or []):return label(detail_value(node))
+    if node.name=="b" and clean(node.get_text()) in BOLD_HEADINGS:return label(detail_value(node))
+    return ""
+def detail_headings(root):
+    """Every visible heading of the page, casefolded."""
+    out=set()
+    for n in root.find_all(True):
+        h=detail_heading_text(n)
+        if h and not detail_hidden(n,root):out.add(h.casefold())
+    return out
+def detail_named_region(root,name):
+    """The part of the page under the visible heading `name`, up to the next other heading: its label/value rows (a
+    grid's rows excepted) and form groups, plus each grid table whole (read separately, never as field pairs)."""
+    target=next((n for n in root.find_all(True) if detail_heading_text(n).casefold()==name.casefold() and not detail_hidden(n,root)),None)
+    w=BeautifulSoup("<div><table></table></div>","html.parser").div
+    if target is None:return w
+    started,grids=False,[]
+    for node in root.descendants:
+        if node is target:started=True;continue
+        if not started or not isinstance(node,Tag) or target in node.parents:continue
+        h=detail_heading_text(node)
+        if h and h.casefold()!=name.casefold():break
+        if detail_hidden(node,root) or any(g in node.parents for g in grids):continue
+        if node.name=="table" and not node.find("table") and detail_table_is_grid(node):
+            grids.append(node);w.append(BeautifulSoup(str(node),"html.parser"));continue
+        if node.name=="tr" and not node.find("table"):
+            t=node.find_parent("table")
+            if (t is not None and detail_table_is_grid(t)) or any(detail_heading_text(c) for c in node.find_all(True)):continue
+            w.table.append(BeautifulSoup(str(node),"html.parser"))
+        elif "form-group" in (node.get("class") or []) and not node.find("table"):
+            w.append(BeautifulSoup(str(node),"html.parser"))
+    return w
+def detail_section_fields(root,name,skip=()):
+    """The labelled values under heading `name`; grids found there go under "tables" (except those in `skip`)."""
+    w=detail_named_region(root,name);out=detail_fields(w)
+    grids=[g for g in (detail_grid(t) for t in w.find_all("table",recursive=False)[1:]) if g not in skip]
+    if grids:out["tables"]=grids
+    return out
+def detail_main_root(s):
+    return s.select_one("form#frmmain") or s.select_one("#headerid") or s.body or s
+def detail_find_table(root,required):
+    """The first visible table (no table inside) whose first row names every column in `required`."""
+    want=[x.casefold() for x in required]
+    for t in root.find_all("table"):
+        if t.find("table") or detail_hidden(t,root):continue
+        first=next((r for r in detail_own_rows(t) if r.find_all(["th","td"],recursive=False)),None)
+        names=[label(detail_value(c)).casefold() for c in first.find_all(["th","td"],recursive=False)] if first is not None else []
+        if names and all(x in names for x in want):return t
+    return None
+def detail_static_or_selected(root,static_id,select_id):
+    """The visible static display; the control's selected value only when the display is absent or empty."""
+    d=root.find(id=static_id)
+    if d is not None and not detail_hidden(d,root):
+        v=detail_value(d)
+        if v!="":return v
+    c=root.find(id=select_id)
+    return detail_value(c) if c is not None else ""
+def detail_checked(node):
+    """True ticked / False not ticked / None the control is not on the page (never guessed)."""
+    return node.has_attr("checked") if node is not None else None
+def detail_title_shown(s,text):
+    """`text` is this page's own title: a heading, the browser title or the selected tab (not just one tab of nine)."""
+    want=text.casefold()
+    for e in s.find_all(["title","h1","h2","h3","h4","legend"])+s.select(".panel-heading, li.active, a.active, [aria-selected=true], [aria-current]"):
+        if want in clean(e.get_text(" ",strip=True)).casefold() and not detail_hidden(e):return True
+    return False
+def page_account(s):
+    """The account code the page's account header shows ('' = the page shows none)."""
+    head=s.select_one("div.account-details")
+    return clean((defs(head).get("Account Code") or {}).get("value")) if head else ""
+
+# One reader per page: soup -> (data, facts).  facts: "seen" = this page's landmarks found (none = unexpected layout),
+# "empty" + "emptyProof" = positively confirmed empty, "problem" = landmarks found but not readable, "absent" = optional
+# parts not shown on the page, "counts".
+def detail_parse_personal(s):
+    rt=detail_main_root(s);heads=detail_headings(rt);t=detail_find_table(rt,["Product","Status","Account Number"]);product=detail_grid(t)
+    data={"Account Details":detail_section_fields(rt,"Account Details",[product]),"Product Details":product,
+          "Customer Details":detail_section_fields(rt,"Customer Details",[product])}
+    return data,{"seen":[n for n in ("Account Details","Customer Details") if n.casefold() in heads]+(["Product table"] if t is not None else [])}
+def detail_parse_contact(s):
+    rt=detail_main_root(s);heads=detail_headings(rt);names=("Addresses","Contact Information","Preferred Contact Method")
+    return {n:detail_section_fields(rt,n) for n in names},{"seen":[n for n in names if n.casefold() in heads],
+                                                           "absent":[n for n in names if n.casefold() not in heads]}
+def detail_parse_correspondence(s):
+    rt=detail_main_root(s)
+    pref=detail_static_or_selected(rt,"documentReportingPreferenceStatic","documentReportingPreference")
+    data={"Preferences":{"Document Reporting Preference":pref,"Statement Frequency":detail_static_or_selected(rt,"stateFrequencyStatic","statementFrequency")}}
+    kind=pref.casefold()
+    if kind=="post":data["Post Settings"]={"Post Address":detail_static_or_selected(rt,"documentPostOptionStatic","documentPostOption")}
+    elif kind=="email":data["Email Settings"]=detail_grid(rt.find(id="tblCorrespondenceSummary"))
+    elif kind=="portal":data["Portal Settings"]={"Portal Address":detail_static_or_selected(rt,"documentPortalOptionStatic","documentPortalOption")}
+    data["Document Reporting Oversight Emails"]=detail_grid(rt.find(id="tblOversightEmails"))
+    facts={"seen":["Document Reporting Preference"] if rt.find(id=re.compile(r"^documentReportingPreference(Static)?$")) else []}
+    if facts["seen"] and not pref:facts["problem"]="the Document Reporting Preference shows no value"
+    elif pref and kind not in ("post","email","portal"):facts["notes"]=["no delivery-setting block is known for this preference"]
+    return data,facts
+def detail_parse_trading(s):
+    rt=detail_main_root(s);data={};seen=[];absent=[]
+    for name in ("Income Distribution Options","Interest Distribution Options"):
+        if any(detail_heading_text(h).casefold()==name.casefold() and not detail_hidden(h,rt) for h in rt.find_all(["h2","h3"])):
+            data[name]=detail_section_fields(rt,name);seen.append(name)
+        else:absent.append(name)
+    transfer=rt.find(id="incomeDistributionGroup")
+    if transfer is not None and not detail_hidden(transfer,rt):data["Distribution Transfer"]=detail_fields(transfer);seen.append("Distribution Transfer")
+    else:absent.append("Distribution Transfer")
+    fees={}
+    for name,tid in (("Fund-specific Rates","fundRebatesTable"),("Fund-specific Initial Charge Discount Rates","fundDiscountsTable")):
+        t=rt.find(id=tid)
+        if t is not None and not detail_hidden(t,rt):fees[name]=detail_grid(t);seen.append(name)
+        else:absent.append(name)
+    if fees:data["Fees and Commissions"]=fees
+    if "trade settlement" in detail_headings(rt):data["Trade Settlement"]=detail_section_fields(rt,"Trade Settlement");seen.append("Trade Settlement")
+    else:absent.append("Trade Settlement")
+    return data,{"seen":seen,"absent":absent}
+def detail_parse_banking(s):
+    rt=detail_main_root(s);accounts=[];current=None;handled=set()
+    for row in rt.find_all("tr"):
+        if detail_hidden(row,rt) or any(id(t) in handled for t in row.parents if isinstance(t,Tag) and t.name=="table"):continue
+        cells=row.find_all(["td","th"],recursive=False)
+        if not cells:continue
+        if any(c.find("table") for c in cells):
+            if current is not None and len(cells)>=2 and not cells[0].find("table"):
+                key=label(detail_value(cells[0]));nested=cells[1].find("table")
+                if nested is not None and key:     # a composite value (e.g. a sort code in parts), in displayed order
+                    parts=[detail_value(c) for c in nested.find_all("td") if not c.find("table") and not detail_hidden(c,nested)]
+                    detail_put(current,key,"-".join(parts) if "sort" in key.lower() else clean(" ".join(parts)));handled.add(id(nested))
+            continue
+        first=detail_value(cells[0])
+        if BANK_LABEL.fullmatch(first):current={"Bank Account Label":first};accounts.append(current)
+        elif current is not None and len(cells)>=2:
+            v=detail_value(cells[1])
+            if not (isinstance(v,str) and v.casefold() in DETAIL_ACTIONS):detail_put(current,first,v)
+    facts={"seen":["BANK ACCOUNT rows"] if accounts else [],"counts":{"bankAccounts":len(accounts)}}
+    if not accounts:
+        proof={"main form":s.select_one("form#frmmain") is not None,"account header":bool(page_account(s)),
+               "Banking Details title":detail_title_shown(s,"Banking Details")}
+        if all(proof.values()):
+            facts.update(seen=list(proof),empty=True,emptyProof="no BANK ACCOUNT row on a fully loaded Banking Details page")
+        else:facts["notes"]=["no BANK ACCOUNT row, and the page is not proven fully loaded (missing: "+", ".join(k for k,v in proof.items() if not v)+")"]
+    return {"Bank Accounts":accounts},facts
+def detail_parse_other(s):
+    rt=detail_main_root(s);heads=detail_headings(rt)
+    confirmation=detail_section_fields(rt,"Confirmation");box=rt.find(id="ML-Confirmation");confirmation["Confirmed"]=detail_checked(box)
+    advised=rt.find(id="launderingreg1");test=detail_section_fields(rt,"Appropriateness Test")
+    statement=rt.find(string=lambda x:x and clean(x)==APPROPRIATENESS)
+    if statement is not None and not detail_hidden(statement.parent,rt):test["Description"]=clean(statement)
+    data={"Money Laundering":{"Identity verification advised":detail_checked(advised),"Details of Individual":detail_section_fields(rt,"Details of Individual"),
+                              "Confirmation":confirmation,"Details of Introducing Firm":detail_section_fields(rt,INTRODUCING_FIRM)},
+          "Documentation":detail_section_fields(rt,"Documentation"),"Appropriateness Test":test}
+    names=("Details of Individual","Confirmation",INTRODUCING_FIRM,"Documentation","Appropriateness Test")
+    seen=[n for n,x in (("Identity verification advised",advised),("Confirmed",box)) if x is not None]+[n for n in names if n.casefold() in heads]
+    return data,{"seen":seen,"absent":[n for n in names if n.casefold() not in heads]}
+def detail_parse_suspended(s):
+    rt=detail_main_root(s);box=lambda name:rt.find("input",attrs={"name":name,"type":"checkbox"})
+    names={"Withdrawals":"Withdrawals","Deposits":"Deposits","Buys":"Buys","Sells":"Sells","Inter-Account Transfer":"InterAccountTransfer"}
+    applies=rt.find(id="SubAccountList")
+    data={"Applies to":detail_value(applies),"Payments":{k:detail_checked(box(names[k])) for k in ("Withdrawals","Deposits")},
+          "Transactional":{k:detail_checked(box(names[k])) for k in ("Buys","Sells","Inter-Account Transfer")}}
+    seen=(["Applies to"] if applies is not None else [])+[k for k,n in names.items() if box(n) is not None]
+    return data,{"seen":seen,"absent":[k for k,n in names.items() if box(n) is None]}
+def detail_parse_fdt(s):
+    rt=detail_main_root(s)
+    tables=[detail_grid(t) for t in rt.find_all("table") if not t.find("table") and not detail_hidden(t,rt) and detail_table_is_grid(t)]
+    said=NO_FDT.casefold() in detail_value_text(rt).casefold();rows=sum(len(t["rows"]) for t in tables)
+    block=(tables[0] if len(tables)==1 else {"tables":tables}) if tables else {"columns":[],"rows":[],"message":NO_FDT if said else ""}
+    facts={"seen":(["instruction table"] if tables else [])+(["no-instructions message"] if said else []),"counts":{"instructionRows":rows}}
+    if not rows and said:facts.update(empty=True,emptyProof="the page says: "+NO_FDT)
+    elif tables and not rows:facts["problem"]="the instruction table has no rows and the page does not say there are no instructions"
+    return {"FDT Instructions":block},facts
+def detail_parse_flags(s):
+    rt=detail_main_root(s);found={}
+    for p in rt.select("div.panel"):
+        head=p.select_one(".panel-heading");name=label(detail_value(head)) if head is not None else ""
+        if name not in FLAG_PANELS or name in found or detail_hidden(p,rt):continue
+        opts={}
+        for g in p.select(".form-group"):
+            lab=g.find("label")
+            if lab is None or detail_hidden(g,p):continue
+            icon=g.find("i");cls=set(icon.get("class") or []) if icon is not None else set()
+            hist=g.select_one("div.col-xs")
+            # a missing or unknown icon is None (unknown), never 'inactive'
+            detail_put(opts,detail_value(lab),{"Active":True if cls&FLAG_ON else False if cls&FLAG_OFF else None,
+                                               "History":detail_value(hist) if hist is not None else ""})
+        found[name]=opts
+    data={n:found[n] for n in FLAG_PANELS if n in found};t=rt.select_one("table.table-small-cell-padding")
+    custom=t is not None and not detail_hidden(t,rt);data["Custom Details"]=detail_fields(t) if custom else {}
+    return data,{"seen":list(data)[:-1]+(["Custom Details table"] if custom else []),
+                 "absent":[n for n in FLAG_PANELS if n not in found]+([] if custom else ["Custom Details"])}
+DETAIL_READERS=dict(zip(P.DETAIL_SECTIONS,(detail_parse_personal,detail_parse_contact,detail_parse_correspondence,
+                                           detail_parse_trading,detail_parse_banking,detail_parse_other,detail_parse_suspended,
+                                           detail_parse_fdt,detail_parse_flags)))
+def detail_count(x):
+    """How many values a reader found: blank text and unknown (None) states do not count, a grid counts its rows, a
+    flag counts by its name."""
+    if isinstance(x,dict):
+        if "Active" in x:return 1
+        if "rows" in x and "columns" in x:return len(x["rows"])+sum(detail_count(v) for k,v in x.items() if k=="tables")
+        return sum(detail_count(v) for v in x.values())
+    if isinstance(x,list):return sum(detail_count(v) for v in x)
+    return 0 if x is None or x=="" else 1
+def parse_account_detail_section(name,response,soup):
+    """One retrieved page -> {"captureStatus", "data", "completeness"}.  An empty result never means success by itself."""
+    reader=DETAIL_READERS.get(name)
+    if reader is None:raise KeyError(f"unknown account-detail section: {name}")
+    crash=""
+    try:
+        data,facts=reader(soup)
+    except Exception as e:
+        data,facts,crash={},{},f"the page could not be read ({type(e).__name__})"
+    seen=facts.get("seen") or [];n=detail_count(data)
+    if crash:outcome,why=FAILED,crash
+    elif not seen:outcome,why=UNEXPECTED,"none of this page's landmarks was found"
+    elif facts.get("problem"):outcome,why=FAILED,facts["problem"]
+    elif facts.get("empty"):outcome,why=EMPTY,facts.get("emptyProof","")
+    elif not n:outcome,why=FAILED,"the page's landmarks were found but no value could be read"
+    else:outcome,why=EXTRACTED,""
+    comp={"outcome":outcome,"sectionFound":bool(seen),"landmarksFound":seen,"valuesRead":n}
+    if why:comp["reason"]=why
+    comp.update(facts.get("counts") or {})
+    if facts.get("absent") and outcome in ACCEPTED:comp["optionalSectionsNotShown"]=facts["absent"]   # only once inspected
+    if facts.get("notes"):comp["notes"]=facts["notes"]
+    if response is not None and getattr(response,"status_code",None) is not None:comp["httpStatus"]=response.status_code
+    status="Captured" if outcome==EXTRACTED else f"Blank on Register ({why})" if outcome==EMPTY else \
+           f"{NOT_CAPTURED} (unexpected page layout: {why})" if outcome==UNEXPECTED else f"{NOT_CAPTURED} ({why})"
+    return {"captureStatus":status,"data":data,"completeness":comp}
+def same_route(final,wanted):
+    f,w=urlparse(final or ""),urlparse(wanted or "")
+    return f.netloc.lower()==w.netloc.lower() and f.path.rstrip("/").casefold()==w.path.rstrip("/").casefold()
+def fetch_account_section(a,name,route):
+    """One account-detail page through soup_get (same session, retry, pause, stop): on its configured page, for this
+    account (when the page shows one), then read.  A page for another account or another page raises (retried once)."""
+    GATE.check()
+    if not route:
+        return {"captureStatus":f"{NOT_CAPTURED} (no page address is configured for it)","data":{},
+                "completeness":{"outcome":NOT_FOUND,"sectionFound":False,"reason":"no page address is configured"}}
+    url=route.replace("{account}",quote(a,safe=""));r,s=soup_get(url)
+    if not same_route(r.url,url):
+        e=WrongPage(f"{name}: System 2 answered from another page (redirected)");e.page=(r,s);raise e
+    shown=page_account(s)
+    if shown and P.norm_account(shown)!=P.norm_account(a):
+        e=WrongAccount(f"{name}: the page shows another account");e.page=(r,s);raise e
+    out=parse_account_detail_section(name,r,s);comp=out["completeness"]
+    comp["accountCheck"]="matched" if shown else "account not shown on this page"
+    if comp["outcome"] not in ACCEPTED:
+        copies=capture_page(f"{a}-{name}",r,s,f"{comp['outcome']}: {comp.get('reason','')}")
+        if copies:comp["pageCopies"]=copies
+    return out
+def section_failure(a,name,exc):
+    """A page that could not be retrieved (after its retry) as a section entry - never blank data."""
+    outcome=ACCOUNT_FAILED if isinstance(exc,WrongAccount) else REQUEST_FAILED
+    page=getattr(exc,"page",None)
+    why={WrongAccount:"the page was for another account",WrongPage:"System 2 redirected to another page",
+         AccessDenied:"System 2 refused access",SessionExpired:"the System 2 sign-in expired",RunStopped:"the run was stopping",
+         CancelledError:"cancelled (the run was stopping)"}.get(type(exc)) or type(exc).__name__+(f" (HTTP {page[0].status_code})" if page else "")
+    comp={"outcome":outcome,"sectionFound":False,"reason":why}
+    copies=[] if isinstance(exc,(RunStopped,CancelledError)) else capture(f"{a}-{name}",exc)
+    if copies:comp["pageCopies"]=copies
+    return {"captureStatus":f"{NOT_CAPTURED} ({why})","data":{},"completeness":comp}
+def submit_account_sections(pool,a):
+    return {n:pool.submit(with_retry,fetch_account_section,a,n,DETAIL_PAGES.get(n,"")) for n in P.DETAIL_SECTIONS}
+def collect_account_sections(futures,a):
+    """The nine entries in P.DETAIL_SECTIONS order (never completion order)."""
+    out={}
+    for n in P.DETAIL_SECTIONS:
+        f=futures.get(n)
+        try:
+            out[n]=f.result() if f is not None else section_failure(a,n,RuntimeError("not requested"))
+        except Exception as e:
+            out[n]=section_failure(a,n,e)
+    return out
+def fetch_all_account_sections(a,pool=None):
+    """All nine pages of one account, in order.  Pass the run's shared pool; without one a single small pool is used
+    (never one per page, never a pool inside a pool)."""
+    own=pool is None;pool=pool or ThreadPoolExecutor(max_workers=DETAIL_WORKERS)
+    try:
+        return collect_account_sections(submit_account_sections(pool,a),a)
+    finally:
+        if own:pool.shutdown(wait=True,cancel_futures=True)
+def detail_tally(details):
+    """Aggregate outcome counts and the names of the pages not captured: safe for logs (no values)."""
+    outs=[(n,((e or {}).get("completeness") or {}).get("outcome")) for n,e in details.items()]
+    return {"extracted":sum(o==EXTRACTED for _,o in outs),"confirmed_empty":sum(o==EMPTY for _,o in outs),
+            "not_found":sum(o==NOT_FOUND for _,o in outs),"failed":sum(o not in ACCEPTED and o!=NOT_FOUND for _,o in outs),
+            "failed_sections":[n for n,o in outs if o not in ACCEPTED]}
+def detail_rows(details):
+    """Every table row kept in the detail sections (grids anywhere in their data)."""
+    def walk(x):
+        if isinstance(x,dict):return (len(x["rows"]) if "rows" in x and "columns" in x else 0)+sum(walk(v) for k,v in x.items() if k!="rows")
+        return sum(walk(v) for v in x) if isinstance(x,list) else 0
+    return walk([(e or {}).get("data") for e in details.values()])
+def bank_count(details):
+    return len(((details.get("05 Banking Details") or {}).get("data") or {}).get("Bank Accounts") or [])
+def fdt_rows(details):
+    return detail_rows({n:e for n,e in details.items() if n=="08 Future Dated Instructions"})
+
+
 class SnapshotIncomplete(RuntimeError):
-    """The written snapshot holds fewer contact records than were read: never used, the account counts as failed."""
-def write_result(target,a,data,parties,links):
+    """The written snapshot does not read back complete: never used, the account counts as failed."""
+
+
+class DetailsIncomplete(SnapshotIncomplete):
+    """An account-detail page was not captured: no snapshot is written, the account counts as failed."""
+
+
+def snapshot_problems(obj,a,expect=None):
+    """Why a snapshot cannot be used for account `a` ([] = usable).  `expect` = the counts read this run, which the
+    written file must still hold.  Plain words only: never a value from the file."""
+    if not isinstance(obj,dict) or list(obj)!=list(BLOCKS):return ["it does not hold exactly the four snapshot blocks"]
+    out=[];summary=obj[BLOCKS[0]] if isinstance(obj[BLOCKS[0]],dict) else {}
+    if not P.norm_account(a) or P.norm_account((summary.get("metadata") or {}).get("requestedAccount"))!=P.norm_account(a):
+        out.append("it is not for the requested account")
+    details=obj[BLOCKS[3]]
+    if not isinstance(details,dict) or list(details)!=list(P.DETAIL_SECTIONS):
+        out.append("its nine account-detail sections are missing or out of order");details={}
+    for n,e in details.items():
+        c=e.get("completeness") if isinstance(e,dict) else None
+        if not isinstance(c,dict) or c.get("outcome") not in ACCEPTED or not isinstance(e.get("captureStatus"),str) or not isinstance(e.get("data"),dict):
+            out.append(f"section '{n}' has no valid capture result")
+    if not isinstance(obj[BLOCKS[1]],list) or not isinstance(obj[BLOCKS[2]],list):out.append("its Interested Party blocks are not lists")
+    if expect and not out:
+        parties,links=obj[BLOCKS[1]],obj[BLOCKS[2]]
+        if len(parties)!=expect["parties"]:out.append(f"the snapshot file holds {len(parties)} Interested Party record(s) but {expect['parties']} were read")
+        if len(links)!=expect["links"]:out.append(f"the snapshot file holds {len(links)} link result(s) but {expect['links']} were read")
+        written=[w for _,w in contact_counts(parties)]
+        if written!=expect["contacts"]:out.append(f"the snapshot file holds {sum(written)} contact record(s) but {sum(expect['contacts'])} were read")
+        for what,count,key in (("bank account(s)",bank_count,"banks"),("future-dated instruction row(s)",fdt_rows,"fdt"),
+                               ("table row(s) in the detail sections",detail_rows,"tables")):
+            if count(details)!=expect[key]:out.append(f"the snapshot file holds {count(details)} {what} but {expect[key]} were read")
+    return out
+def write_result(target,a,data,parties,links,details):
     """One snapshot per account for the run's day; the coordinator copies it into each case folder of that account.
-    Read back after writing: every contact record read from the pages must be in the file, or it is set aside."""
-    data.pop("_interestedPartyLinks",None);result={"Account Summary":data,"Interested Parties linked to the account":parties,"Interested Party links to other account numbers":links}
-    P.write_json(target,result)
-    back=json.loads(Path(target).read_text("utf-8")).get("Interested Parties linked to the account") or []
-    detected=[d for d,_ in contact_counts(parties)];written=[w for _,w in contact_counts(back)]
-    if detected!=written or len(back)!=len(parties):
-        os.replace(target,target.with_name(target.stem+".incomplete.json"))     # kept for review, never reused
-        raise SnapshotIncomplete(f"the snapshot file holds {sum(written)} contact record(s) but {sum(detected)} were read")
+    Written under a staging name and read back first: only a complete file gets the real name (the coordinator can
+    never pick up one that fails); a failing one is set aside as .incomplete.json, never reused.  Nothing is written
+    unless every account-detail page was read or positively confirmed empty."""
+    target=Path(target);bad=detail_tally(details)["failed_sections"]
+    if bad:
+        target.unlink(missing_ok=True)
+        raise DetailsIncomplete("account-detail page(s) not captured: "+", ".join(bad))
+    data.pop("_interestedPartyLinks",None);result=dict(zip(BLOCKS,(data,parties,links,details)))
+    expect={"parties":len(parties),"links":len(links),"contacts":[d for d,_ in contact_counts(parties)],
+            "banks":bank_count(details),"fdt":fdt_rows(details),"tables":detail_rows(details)}
+    stage=target.with_name(f".{target.name}.staging")
+    P.write_json(stage,result)
+    problems=snapshot_problems(json.loads(stage.read_text("utf-8")),a,expect)
+    if problems:
+        os.replace(stage,target.with_name(target.stem+".incomplete.json"))     # kept for review, never reused
+        target.unlink(missing_ok=True)                                         # a failed account never leaves a snapshot
+        raise SnapshotIncomplete("; ".join(problems))
+    os.replace(stage,target)
     print(f"SAVED {a}",flush=True)
+def reusable(path,a):
+    """A snapshot made earlier today is reused only if it reads back complete for this account; otherwise it is set
+    aside as .incomplete.json and the account is fetched again.  -> (reuse it?, why not)"""
+    if not path.exists():return False,""
+    try:
+        problems=snapshot_problems(json.loads(path.read_text("utf-8")),a)
+    except (OSError,ValueError) as e:
+        problems=[f"it could not be read ({type(e).__name__})"]
+    if not problems:return True,""
+    try:
+        os.replace(path,path.with_name(path.stem+".incomplete.json"))
+    except OSError:
+        pass
+    return False,problems[0]
 
 def assemble(d,pr,pe,lr,le):
     """One account's parties and links from the pages read (pr/lr by address) and the failures (pe/le) -> (parties,
@@ -676,7 +1200,11 @@ def run_pipeline(run_dir):
     rows=[{**c.get("row",{}),"_account":c["account"],"_csvRowNumber":str(c.get("row_number",""))} for c in cases]
     accounts=list(dict.fromkeys(c["account"] for c in cases))
     paths.snapshots(day).mkdir(parents=True,exist_ok=True)
-    todo=[a for a in accounts if not paths.snapshot(a,day).exists()]
+    todo=[]
+    for a in accounts:                              # today's file is reused only if it reads back complete
+        ok,why=reusable(paths.snapshot(a,day),a)
+        if not ok:todo.append(a)
+        if why:say(f"account {a}: today's snapshot was set aside ({why}) - fetching it again")
     GATE=Gate(control,sender)
     answered=0
     while not control.is_go():                      # answer every sign-in check until you pressed Enter and all is ready
@@ -694,8 +1222,8 @@ def run_pipeline(run_dir):
         if todo:
             COOKIES,UA=auth(sender); COOKIE_GEN+=1
             say(f"fetching {len(todo)} account snapshot(s) in bulk")
-            ar={};pf={};lf={}
-            with ThreadPoolExecutor(max_workers=PARTY_WORKERS) as pp:
+            ar={};pf={};lf={};sf={}
+            with ThreadPoolExecutor(max_workers=PARTY_WORKERS) as pp:   # party, link and account-detail pages
                 with ThreadPoolExecutor(max_workers=min(ACCOUNT_WORKERS,len(todo))) as ap:
                     fs={ap.submit(with_retry,fetch_account,a,rows):a for a in todo}
                     for f in as_completed(fs):
@@ -706,6 +1234,7 @@ def run_pipeline(run_dir):
                                 if x["url"] not in pf:pf[x["url"]]=pp.submit(with_retry,fetch_party,x)
                                 u=link_url(x)
                                 if u not in lf:lf[u]=pp.submit(with_retry,fetch_links,x)
+                            sf[a]=submit_account_sections(pp,a)
                             say(f"account {a} read","detail")
                         except RunStopped:
                             pass
@@ -713,8 +1242,8 @@ def run_pipeline(run_dir):
                             failed[a]=f"{type(e).__name__}: {e}"
                             facts[a]={"state":"failed","error":failed[a],"captures":capture(a,e)}
                             say(f"account {a} FAILED after one retry: {type(e).__name__}")
-                        if GATE.stopped():
-                            for other in fs:other.cancel()
+                        if GATE.stopped():                  # nothing still waiting is requested
+                            for other in [*fs,*pf.values(),*lf.values(),*(x for s in sf.values() for x in s.values())]:other.cancel()
                 pr={};pe={};lr={};le={}
                 for u,f in pf.items():
                     try:pr[u]=f.result()
@@ -722,6 +1251,7 @@ def run_pipeline(run_dir):
                 for u,f in lf.items():
                     try:lr[u]=f.result()
                     except Exception as e:le[u]=f"{type(e).__name__}: {e}"
+                details={a:collect_account_sections(s,a) for a,s in sf.items()}
             if not GATE.stopped():
                 for a in todo:
                     d=ar.get(a)
@@ -729,18 +1259,23 @@ def run_pipeline(run_dir):
                     parties,links,missing=assemble(d,pr,pe,lr,le)
                     sections=[(p.get(k) or {}).get("completeness",{}) for p in parties for k in CONTACTS]
                     unread=sum(c.get("outcome") in (FAILED,DISAGREE) for c in sections)
+                    dets=details.get(a) or collect_account_sections({},a);tally=detail_tally(dets)
+                    # aggregate counts and page names only - never a value read from a page
+                    dfacts={"detail_sections":tally,"bank_accounts_written":bank_count(dets),"future_instruction_rows_written":fdt_rows(dets)}
                     try:
-                        write_result(paths.snapshot(a,day),a,d,parties,links);written+=1
+                        write_result(paths.snapshot(a,day),a,d,parties,links,dets);written+=1
                         facts[a]={"state":"saved this run","parties":len(parties),"party_pages_missing":missing,
                                   "contact_records":{k:[sum(((p.get(k) or {}).get("completeness") or {}).get(n,0) for p in parties)
                                                         for n in ("recordsDetected","recordsWritten")] for k in CONTACTS},
-                                  "contact_sections_not_captured":unread,**snapshot_facts(paths.snapshot(a,day))}
+                                  "contact_sections_not_captured":unread,**dfacts,**snapshot_facts(paths.snapshot(a,day))}
+                        say(f"account {a}: detail pages - {tally['extracted']} read, {tally['confirmed_empty']} confirmed empty","detail")
                         if missing:say(f"account {a}: snapshot saved, but {missing} party detail page(s) could not be read")
                         if unread:say(f"account {a}: {unread} contact table(s) could not be read - marked 'Not captured' in the snapshot")
                     except Exception as e:
-                        failed[a]=f"Output: {type(e).__name__}: {e}"
-                        facts[a]={"state":"failed","error":failed[a]}
-                        say(f"account {a} FAILED while saving: {type(e).__name__}")
+                        failed[a]=str(e) if isinstance(e,DetailsIncomplete) else f"Output: {type(e).__name__}: {e}"
+                        facts[a]={"state":"failed","error":failed[a],**dfacts,
+                                  "page_copies":[c for x in dets.values() for c in (x.get("completeness") or {}).get("pageCopies",[])]}
+                        say(f"account {a} FAILED: {failed[a]}" if isinstance(e,DetailsIncomplete) else f"account {a} FAILED while saving: {type(e).__name__}")
         say(f"finished: {written} snapshot(s) saved, {len(failed)} failed, in {time.perf_counter()-started:.0f}s")
     finally:
         P.write_json(paths.sub("status")/"part2-failed.json",failed)

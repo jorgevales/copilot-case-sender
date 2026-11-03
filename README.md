@@ -38,8 +38,8 @@ stay in your local, git-ignored `sender_config.json`.
      marker (optional; without it documents are opened one by one, which is slower) and the brand control
      pattern(s).
    - **System 2, where the account snapshots are retrieved from:** a page that shows "logout" when signed in, the
-     account summary page (with `{account}`), the text that marks a party profile link, and the party links page
-     (with `{party}`).
+     account summary page (with `{account}`), the text that marks a party profile link, the party links page
+     (with `{party}`), and the nine account-detail pages (each with `{account}`).
 
    These stay only in your local, git-ignored `sender_config.json`. **No System 1 / System 2 address is written in
    the code.** Enter keeps a shown value. Run `Run.cmd setup` again at any time to edit.
@@ -549,6 +549,7 @@ skipped, not failed.
 | Part 1 downloads: viewer address paired by document ID (position only when no address names an ID and counts match); a viewer page's own file fetched; a document window read without clicking inside it (its address, the file it shows, a download it starts, its own toolbar button only) | **Tested here** (fake responses / window; pairing run in Node). Real System 1 viewer: **needs your VDI** |
 | Part 2: Access Denied vs expired sign-in vs normal page; Access Denied twice stops the run; expired → pause → fresh cookies; only System 2 cookies read; the failing page kept with addresses cut | **Tested here** (synthetic pages) |
 | Part 2 party profile (2026-11-03): every email / phone / address record read from the page's setup script (never run), finished rows by id prefix (any suffix, td.TableHead headers, placeholders left out), empty only when the script says so, an unreadable section 'Not captured', rows vs script disagreement, repeated labels, compliance by control ID, dialogs left out, signature present / absent / unreadable, a record lost while writing caught, Interested Party Link tab coverage | **Tested here** (synthetic page in the shape of the sanitised sample). Real System 2 profile pages: **needs your VDI** |
+| Part 2 nine account-detail pages (2026-11-03): visible values only, selected controls, blanks, repeated labels, actions, nested tables, table order; all nine readers; optional parts; ticked / unticked / missing; several bank accounts and instructions; explicit no-record messages; flags active / inactive / unknown; right account, wrong account, redirect; retry, pause, Access-Denied stop, cancellation; a page not captured writes nothing; exact four-block layout; read-back; an old three-block snapshot never reused | **Tested here** (`tests/test_account_details.py`, synthetic pages). Real System 2 pages: **needs your VDI** |
 | Purple pointer (2026-11-03): drawn on System 1 tabs only; removed from every tab on finish, stop, failure and a hung clean-up; a silent tab cannot hold it; twice is safe; the coordinator's sweep after Part 1 has ended; the in-page scripts in a DOM (jsdom, when `JSDOM_NODE_MODULES` is set) | **Tested here** (fake tabs; jsdom). Real systems Edge: **needs your VDI** |
 | Copilot refusals: blocked chat (with and without a reply) ends the case, nothing clicked; refusal resent and confirmed; responses file with replies, buttons and `...` menu | **Tested here** (fake page). Real refusal page: **needs your VDI** |
 | One whole run with real processes (coordinator + stand-ins for the three parts): skipped row, held case, two cases sent, daily report | **Tested here** |

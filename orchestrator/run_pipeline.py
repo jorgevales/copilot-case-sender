@@ -61,6 +61,16 @@ def pipeline_problems(cfg) -> list:
     for key, slot in (("system2_account_page", "{account}"), ("system2_party_links_page", "{party}")):
         if getattr(cfg, key, "") and slot not in getattr(cfg, key):
             out.append(f"{key} must contain {slot} where the value goes")
+    pages = getattr(cfg, "system2_detail_pages", None) or {}
+    for name in P.DETAIL_SECTIONS:                  # every account-detail page is mandatory for a complete snapshot
+        page = pages.get(name, "") if isinstance(pages, dict) else ""
+        u = urlparse(page or "")
+        if not page:
+            out.append(f"System 2 account-detail page '{name}' is not set (run setup)")
+        elif u.scheme not in ("https", "http") or not u.netloc:
+            out.append(f"System 2 account-detail page '{name}' is not a web address")
+        elif "{account}" not in page:
+            out.append(f"System 2 account-detail page '{name}' must contain {{account}} where the account number goes")
     if cfg.completion_mode == "json_result" and not cfg.result_contract_path:
         out.append("the result contract file is not set")
     if int(cfg.systems_cdp_port) == int(cfg.cdp_port):

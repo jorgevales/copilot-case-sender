@@ -1,10 +1,13 @@
 # Part 2 — System 2 snapshots
 
 `system2_snapshots.py` builds one JSON snapshot per account, in bulk, with parallel signed-in requests. Each snapshot
-holds the account summary, its linked Interested Parties and their other customer/account links. It is saved as
-`RUNTIME_ROOT\pipeline\snapshots\<day>\<ACCOUNT>_Account_Summary_Interested_Parties_and_Links.json`. The
-coordinator copies it into every case folder of that account once Part 1 has finished the case. A snapshot made
-earlier the same day is reused.
+holds exactly four blocks: `Account Summary`, `Interested Parties linked to the account`, `Interested Party links to
+other account numbers` and `Nine Account Detail Sections`. It is saved as
+`RUNTIME_ROOT\pipeline\snapshots\<day>\<ACCOUNT>_Complete_Account_Profile.json` (the name is decided only in
+`shared/pipeline.py`). The coordinator copies it into every case folder of that account once Part 1 has finished the
+case. A snapshot made earlier the same day is reused only if it reads back complete for that account (four blocks,
+nine sections in order, each with a valid result); otherwise it is set aside as `.incomplete.json` and fetched again.
+The older three-block snapshots have another name and are never reused.
 
 - **Started by** the coordinator, in the background. Its output goes to `...\logs\part2.log`, and its progress shows
   on the sender's console as `system2`.
@@ -28,7 +31,36 @@ repository is public):
 - `system2_url`: the signed-in check;
 - `system2_account_page`: with `{account}`;
 - `system2_party_marker`: the text in the party profile links;
-- `system2_party_links_page`: with `{party}`.
+- `system2_party_links_page`: with `{party}`;
+- `system2_detail_pages`: the nine account-detail pages, each with `{account}` (setup asks for them one by one; the
+  run does not start while one is missing).
+
+**Nine account-detail pages** (2026-11-03): `01 Personal Details`, `02 Contact Details`, `03 Correspondence Details`,
+`04 Trading Details`, `05 Banking Details`, `06 Other Details`, `07 Suspended Activity`, `08 Future Dated
+Instructions`, `09 Flags and Custom Details`. The readers follow the user's sanitised parser reference (element ids,
+headings and wording of the real pages):
+- requested for each account whose summary was read, in the SAME 40-worker pool as the party/link pages (no more
+  requests at once than before), through the same session, retry, pause, Access-Denied stop and stop signal; pending
+  pages are cancelled on a stop; results always in the order above;
+- each page must stay on its configured address (a redirect = `Request failed`) and, when it shows an account code,
+  show the requested account (another one = `Account validation failed`);
+- only visible values: hidden attribute, `hidden` / `hide` / `d-none` classes, `display:none`, `visibility:hidden`
+  are left out; a folded (`collapse`) section is visible. A drop-down gives its chosen option, never its option list;
+  a static display wins over its control unless it is empty; a tick box is `true` / `false`, or `null` when the control
+  is not on the page; repeated labels become lists; action labels and columns are dropped; tables keep columns, rows and
+  blank cells in order, with no-records text under `message`;
+- each section is `{captureStatus, data, completeness}`. Outcome: `Extracted successfully`, `Confirmed empty`,
+  `Not found`, `Extraction failed`, `Account validation failed`, `Request failed` or `Unexpected page layout` (none of
+  the page's own landmarks found). An empty result is never success: `Confirmed empty` needs proof - Future Dated
+  Instructions: the page says "No FDT Instructions linked to Account."; Banking: no `BANK ACCOUNT n` row on a page with
+  the main form, the account header and a "Banking Details" title. Optional parts not shown (e.g. Interest
+  Distribution Options) are listed under `optionalSectionsNotShown`, only once the page was read;
+- **any section not `Extracted successfully` or `Confirmed empty` fails the account**: nothing is written, its cases are
+  held with the page names, and the page is kept in `captures\<run>\system2-<account>-<page>.txt/.html`;
+- the file is written under a staging name, read back (four blocks, nine sections in order, valid results, the
+  account, party / link / contact / bank-account / instruction / table-row counts) and only then given its real name;
+- `diagnostics\part2\accounts.json` adds counts only: sections extracted / confirmed empty / not found / failed, the
+  failed page names, bank accounts and instruction rows written, file size and time - never a value.
 
 **Interested Party profile** (2026-11-03; the snapshot missed email, phone and address records). The page System 2
 sends holds those records only inside its own setup functions (`AddExistingCustomerInterestedPartyEmails`, `...PhoneNumbers`,

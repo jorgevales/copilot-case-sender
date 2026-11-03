@@ -15,6 +15,10 @@ __pycache__/
 /result_contract.md
 /bank_holidays.txt
 
+# Local design notes from the real pages (sanitised, but kept off the public repository)
+/System_2_Claude_Handover.md
+/account_nine_sections_parser_reference_SANITIZED_FOR_CLAUDE.py
+
 # Local graphify knowledge graph and Claude Code config: keep out of the repo unless requested
 graphify-out/
 .claude/

@@ -10,7 +10,7 @@ The parts never call each other.  They only read and write the small files descr
   RUNTIME_ROOT\\pipeline\\
     downloads\\<id>.json         Part 1: every document + Audit Trail of this case is saved in .work (persistent)
     cases\\<id>.json             Coordinator: the case folder is complete in CASES_ROOT, ready for Part 3 (persistent)
-    snapshots\\<YYYY-MM-DD>\\     Part 2: <ACCOUNT>_Account_Summary_Interested_Parties_and_Links.json (reused the same day)
+    snapshots\\<YYYY-MM-DD>\\     Part 2: <ACCOUNT>_Complete_Account_Profile.json (reused the same day only if it checks out)
     runs\\<run id>\\
       plan.json                 Coordinator: the CSV rows of this run and what each one needs
       control\\                  go / check / stop / pause / resume / feed-closed / <part>-finished
@@ -37,7 +37,11 @@ from pathlib import Path
 from urllib.parse import parse_qsl, urlsplit
 
 WORK_DIR = ".work"                      # inside CASES_ROOT (same share, so the hand-over is one rename)
-SNAPSHOT_SUFFIX = "_Account_Summary_Interested_Parties_and_Links.json"
+SNAPSHOT_SUFFIX = "_Complete_Account_Profile.json"   # the ONE place the snapshot's file name is decided (Paths.snapshot)
+# The nine account-detail pages of System 2, in the order the snapshot keeps them; their addresses are pasted in setup.
+DETAIL_SECTIONS = ("01 Personal Details", "02 Contact Details", "03 Correspondence Details", "04 Trading Details",
+                   "05 Banking Details", "06 Other Details", "07 Suspended Activity", "08 Future Dated Instructions",
+                   "09 Flags and Custom Details")
 ID_RE = re.compile(r"^[0-9a-f]{32}$")
 REVIEWED_STATUS = "ended"               # only this Process Status is reviewed; every other value is skipped and listed
 UNKNOWN_SUB = "Unknown Sub WorkType"    # what Part 1 records when System 1 shows no Sub WorkType
