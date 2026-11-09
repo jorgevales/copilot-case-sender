@@ -27,6 +27,7 @@ import ctypes
 import datetime
 import fnmatch
 import functools
+import getpass
 import hashlib
 import json
 import ntpath
@@ -385,11 +386,24 @@ DEFAULTS = {
     "system2_customer_summary_page": "",  # the customer summary page (Charity Commission Number), {customer} = Client Number
     "systems_cdp_port": 9223,         # Edge for System 1 + 2 (its own remembered profile); Copilot stays on cdp_port
     "last_csv_path": "",              # the daily CSV used last time (offered as the default)
+    # Part 3 can be this Copilot sender (default, unchanged) or the Azure reviewer (3_azure_reviewer/).  Endpoints and
+    # keys live ONLY in the git-ignored sender_config.json; reports and check show a key as "set" / "not set".
+    "reviewer": "copilot",            # "copilot" = Edge + Microsoft 365 Copilot (this script); "azure" = 3_azure_reviewer
+    "azure_docintel_endpoint": "",    # Azure Document Intelligence (Layout reads every page)
+    "azure_openai_endpoint": "",      # Azure language model (fills each form, reviews the case)
+    "azure_auth": "key",              # "key" (typed in setup; the VDI) or "signin" (keyless Azure sign-in; the laptop)
+    "azure_docintel_key": "", "azure_openai_key": "",      # SECRET: never printed, never in a report
+    "azure_form_model": "", "azure_review_model": "",      # deployment names (the same name twice is fine)
+    "azure_docintel_tier": "free",    # "free" (2 pages per request, 500 pages a month) or "paid"
+    "azure_parallel_cases": 3, "azure_low_confidence": 0.80,
+    "az_cli_path": "",                # optional: az.cmd for the sign-in route
 }
+SECRET_KEYS = ("azure_docintel_key", "azure_openai_key")   # shown as "set" / "not set" wherever settings are listed
+REVIEWERS = ("copilot", "azure")
 REQUIRED = ["cases_root", "base_message_path", "daily_instructions_path", "python_executable", "edge_executable",
             "runtime_root"]
 PATH_KEYS = REQUIRED + ["instructions_path", "result_contract_path", "node_executable", "dependency_directory", "approved_root",
-                        "approved_unc_root", "driver_cache_dir", "guidance_dir", "last_csv_path"]
+                        "approved_unc_root", "driver_cache_dir", "guidance_dir", "last_csv_path", "az_cli_path"]
 HERE = Path(os.path.abspath(__file__)).parent   # never .resolve(): it turns a mapped drive (S:) into its UNC form
 PROJECT = HERE.parent                           # the tool's top folder: Run.cmd, sender_config.json, guidance/, shared/
 if str(PROJECT) not in sys.path:                # embedded Python does not add the script folder: shared/ is found here
@@ -423,6 +437,85 @@ def load_config(required: bool = True):
 def save_config(cfg) -> None:
     keep = {k: v for k, v in vars(cfg).items() if k in DEFAULTS or k in REQUIRED}
     write_atomic(config_path(), json.dumps(keep, indent=2))
+
+
+def public_settings(cfg) -> dict:
+    """Every setting, for a report or the console: each secret key replaced by "set" / "not set"."""
+    items = vars(cfg) if not isinstance(cfg, dict) else cfg
+    return {k: (("set" if v else "not set") if k in SECRET_KEYS else v) for k, v in items.items()}
+
+
+def azure_script() -> Path:
+    return PROJECT / "3_azure_reviewer" / "azure_case_reviewer.py"
+
+
+def ask_secret(prompt: str, current: str) -> str:
+    """A key typed without echo (getpass).  Enter keeps the saved one; the value is never printed back."""
+    shown = " [set - Enter keeps it]" if current else ""
+    try:
+        answer = getpass.getpass(f"{prompt} (typed, not shown){shown}: ").strip()
+    except EOFError:
+        raise SenderError("setup needs an interactive console") from None
+    return answer or current
+
+
+def ask_azure(cur: dict) -> None:
+    """Part 3 = the Azure reviewer: endpoints, sign-in kind, keys (only for key), deployments, tier, limits."""
+    print("\nAZURE REVIEWER - Document Intelligence reads every page, a language model fills the forms and reviews the case.\n"
+          "  On the VDI: FNZ's approved Azure, endpoint + key.  On the laptop: your test Azure, sign-in (no key).")
+    cur["azure_docintel_endpoint"] = ask_text("  Document Intelligence endpoint (https://...)", cur.get("azure_docintel_endpoint") or "")
+    cur["azure_openai_endpoint"] = ask_text("  Azure language model endpoint (https://...)", cur.get("azure_openai_endpoint") or "")
+    auth = ask_text("  How to sign in to Azure: key (the VDI) or signin (your own sign-in, no key)",
+                    cur.get("azure_auth") or "key").strip().lower()
+    cur["azure_auth"] = auth if auth in ("key", "signin") else "key"
+    if cur["azure_auth"] == "key":
+        cur["azure_docintel_key"] = ask_secret("  Document Intelligence key", cur.get("azure_docintel_key") or "")
+        cur["azure_openai_key"] = ask_secret("  Language model key", cur.get("azure_openai_key") or "")
+    else:                                         # no key kept on disk when it is not used
+        cur["azure_docintel_key"] = cur["azure_openai_key"] = ""
+    cur["azure_form_model"] = ask_text("  Deployment name of the model that fills each form", cur.get("azure_form_model") or "")
+    cur["azure_review_model"] = ask_text("  Deployment name of the model that reviews the case (the same name is fine)",
+                                         cur.get("azure_review_model") or cur["azure_form_model"])
+    tier = ask_text("  Document Intelligence tier: free (2 pages per request, 500 pages a month) or paid",
+                    cur.get("azure_docintel_tier") or "free").strip().lower()
+    cur["azure_docintel_tier"] = tier if tier in ("free", "paid") else "free"
+    value = ask_text("  Cases reviewed at the same time", str(cur.get("azure_parallel_cases") or 3))
+    cur["azure_parallel_cases"] = int(value) if value.strip().isdigit() else value
+    value = ask_text("  Low-confidence mark: fields read below this are flagged yellow (0 to 1)",
+                     str(cur.get("azure_low_confidence") or 0.80))
+    try:
+        cur["azure_low_confidence"] = float(value)
+    except ValueError:
+        cur["azure_low_confidence"] = value
+    value = ask("  Azure CLI az.cmd (optional; only for signin)", cur.get("az_cli_path") or "", True)
+    cur["az_cli_path"] = value
+    keys = ", ".join(f"{k}: {'set' if cur.get(k) else 'not set'}" for k in SECRET_KEYS)
+    print(f"  Keys: {keys}")
+
+
+def azure_problems(cfg) -> list:
+    """Problems of the Azure settings (labels only: never an endpoint or a key in the text)."""
+    out = []
+    for key in ("azure_docintel_endpoint", "azure_openai_endpoint"):
+        u = urlparse(getattr(cfg, key, "") or "")
+        if u.scheme != "https" or not u.netloc:
+            out.append(f"{key} must be an https:// address")
+    if cfg.azure_auth not in ("key", "signin"):
+        out.append("azure_auth must be 'key' or 'signin'")
+    elif cfg.azure_auth == "key":
+        out += [f"{k} is not set (azure_auth is 'key')" for k in SECRET_KEYS if not getattr(cfg, k, "")]
+    for key in ("azure_form_model", "azure_review_model"):
+        if not str(getattr(cfg, key, "") or "").strip():
+            out.append(f"{key} (a deployment name) is not set")
+    if cfg.azure_docintel_tier not in ("free", "paid"):
+        out.append("azure_docintel_tier must be 'free' or 'paid'")
+    if not isinstance(cfg.azure_parallel_cases, int) or isinstance(cfg.azure_parallel_cases, bool) or cfg.azure_parallel_cases < 1:
+        out.append("azure_parallel_cases must be a whole number, 1 or more")
+    if not isinstance(cfg.azure_low_confidence, (int, float)) or not 0 < float(cfg.azure_low_confidence) < 1:
+        out.append("azure_low_confidence must be a number between 0 and 1 (e.g. 0.80)")
+    if getattr(cfg, "az_cli_path", "") and not Path(cfg.az_cli_path).is_file():
+        out.append("az_cli_path was not found")
+    return out
 
 
 def exe_candidates(kind: str):
@@ -534,6 +627,11 @@ def setup_command() -> int:
     cur["system2_customer_summary_page"] = ask_text(
         "  Customer summary page address (it shows the Charity Commission Number), with {customer} where the\n"
         "  CSV's Client Number goes", cur.get("system2_customer_summary_page") or "")
+    who = ask_text("\nPART 3 - which reviewer: copilot (Microsoft 365 Copilot in Edge) or azure (Azure Document "
+                   "Intelligence + an Azure language model)", cur.get("reviewer") or "copilot").strip().lower()
+    cur["reviewer"] = who if who in REVIEWERS else "copilot"
+    if cur["reviewer"] == "azure":
+        ask_azure(cur)
     node = next((str(p) for p in exe_candidates("node") if p.is_file()), "")
     value = ask("Node.js node.exe (optional; Enter = use the copy bundled with Playwright)", cur.get("node_executable") or node, True)
     cur["node_executable"] = str(resolve_file(value, "node.exe") or "") if value else ""
@@ -544,9 +642,10 @@ def setup_command() -> int:
     detail = ask("Console output: 1 = minimal (queue total, ID being sent, attachments, result), 2 = full detail",
                  "2" if cur.get("console_detail") == "full" else "1")
     cur["console_detail"] = "full" if detail.strip() == "2" else "minimal"
-    shown = ask("Moving cursor in Edge so you can follow the tool: ask = ask at every run, on = always, off = never",
-                cur.get("visual_cursor") or "ask").strip().lower()
-    cur["visual_cursor"] = shown if shown in ("ask", "on", "off") else "ask"
+    if cur["reviewer"] == "copilot":              # the moving cursor is drawn in the Copilot Edge only
+        shown = ask("Moving cursor in Edge so you can follow the tool: ask = ask at every run, on = always, off = never",
+                    cur.get("visual_cursor") or "ask").strip().lower()
+        cur["visual_cursor"] = shown if shown in ("ask", "on", "off") else "ask"
     if ask("Change optional settings (port, URL, model, recursion, limits)? y/N", "n").lower().startswith("y"):
         for key in ("cdp_port", "systems_cdp_port", "copilot_url", "requested_model", "recursive_documents", "max_attachments",
                     "over_limit_mode", "warm_tabs", "dependency_directory", "approved_root", "approved_unc_root"):
@@ -615,6 +714,11 @@ def validate_config(cfg):
         problems.append("completion_mode must be 'json_result' or 'submission_only'")
     elif cfg.completion_mode == "json_result" and not cfg.result_contract_path:
         problems.append("completion_mode 'json_result' needs result_contract_path (or use 'submission_only')")
+    reviewer = getattr(cfg, "reviewer", "copilot")
+    if reviewer not in REVIEWERS:
+        problems.append("reviewer must be 'copilot' or 'azure'")
+    elif reviewer == "azure":
+        problems += azure_problems(cfg)
     if not problems:
         try:
             missing = TM.missing_placeholders(load_message(Path(cfg.base_message_path)))
@@ -887,6 +991,8 @@ def register_redactions(red: Redactor, cfg, policy: PathPolicy | None) -> None:
               "approved_unc_root": "APPROVED_UNC_ROOT", "driver_cache_dir": "DRIVER_CACHE_DIR", "guidance_dir": "GUIDANCE_DIR"}
     for key, label in labels.items():
         red.add(getattr(cfg, key, ""), label)
+    for key in SECRET_KEYS:                       # a key that slips into any text (an error message) is replaced too
+        red.add(getattr(cfg, key, ""), "<secret>")
     if policy and policy.unc_root:
         red.add(policy.unc_root, "APPROVED_UNC_ROOT")
     for env in ("USERNAME", "COMPUTERNAME", "USERDOMAIN"):
@@ -4984,7 +5090,7 @@ def write_run_report(ctx, journal, cases, runner, bfacts, started, start_seq, co
                "## 2. System and environment", "```json", redacted_json(system_facts(cfg, rt, ctx.policy), red), "```", "",
                "## 3. The tool and its settings", f"- script: {script.name} sha256[:16]={digest} size={size} bytes (compare with the repository to know which code ran)",
                f"- prompt version: {getattr(runner, 'prompt_version', None)}", "```json",
-               redacted_json(vars(cfg), red.literal), "```", "",
+               redacted_json(public_settings(cfg), red.literal), "```", "",
                "## 4. Browser and session", "```json", redacted_json(
                    {**(bfacts or {}), "pages": [{**p, "url": _url_shape(p["url"], red)} for p in (bfacts or {}).get("pages", [])]}, red.literal), "```", ""]
         if runner:

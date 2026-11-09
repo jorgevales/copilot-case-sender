@@ -22,3 +22,8 @@ __pycache__/
 # Local graphify knowledge graph and Claude Code config: keep out of the repo unless requested
 graphify-out/
 .claude/
+
+# Laptop-only synthetic test data (downloaded CCLA PDFs, dataset images, generated cases): never commit
+tests/azure_synthetic/_downloads/
+tests/azure_synthetic/_generated/
+tests/azure_synthetic/.synthetic-venv/

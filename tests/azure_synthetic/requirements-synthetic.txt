@@ -1,0 +1,5 @@
+# Laptop-only tools for the synthetic test generator (installed ONLY into tests/azure_synthetic/.synthetic-venv)
+pymupdf==1.26.5
+pillow==12.0.0
+numpy==2.3.4
+pytest==8.4.2
