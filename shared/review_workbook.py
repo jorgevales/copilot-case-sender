@@ -1,6 +1,7 @@
 """The results workbook for the human reviewers (stdlib only: an .xlsx is a zip of XML files, nothing to install).
 
   CASES_ROOT\\Copilot review results.xlsx     this run's valid Copilot answers, rewritten after every answer
+  CASES_ROOT\\Azure review results.xlsx       the same for the Azure reviewer (setting reviewer = azure)
 
 It is saved beside the instruction-ID case folders the run picked its cases from (CASES_ROOT; user, 2026-11-03),
 never in RUNTIME_ROOT.  A file there is not a case: case discovery lists only folders.  The folder must already
@@ -14,6 +15,13 @@ Four tabs:
   All checks  every comparison and rule check (audit), a thick line above each new case
 Colours: red = no match / Not satisfied / Incorrect, yellow = could not compare / Not determinable / Inconclusive,
 green = match / Satisfied / Correct, grey = Not applicable.  Empty reviewer columns are for the people who check.
+
+The Azure reviewer's workbook has the same four tabs (its answer key is REVIEW_RESULT; the heading reads "Azure
+result") plus two evidence tabs, from the DOCUMENTS / EXTRACTED_FIELDS of its per-case results (given in `result` or
+in `info` as "documents" / "extracted_fields"):
+  Documents         every document of every case: ID (D1 ...), file, kind, form, pages read
+  Extracted fields  every field read from a form: value, handwritten, confidence; below the low-confidence mark it is
+                    yellow and "could not compare" (a comparison resting on it can never be a match)
 
 At the start of a run an older workbook is renamed 'Copilot review results - older <its time>.xlsx' (`make_room`;
 when Excel holds it open, the run waits for Enter and tries again).  During the run a workbook opened in Excel is
@@ -33,6 +41,7 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 
 NAME = "Copilot review results.xlsx"
+AZURE_NAME = "Azure review results.xlsx"
 WRAP = ' wrapText="1"'
 SELECTED = ' tabSelected="1"'          # the tab Excel opens on
 BAD_XML = re.compile("[" + re.escape("".join(map(chr, [*range(0, 9), 11, 12, *range(14, 32), 0xFFFE, 0xFFFF]))) + "]")
@@ -42,6 +51,23 @@ RED, YELLOW, GREEN, GREY = "FFC7CE", "FFEB9C", "C6EFCE", "E7E6E6"
 COLOUR = {"No match": RED, "Could not compare": YELLOW, "Match": GREEN, "Not satisfied": RED,
           "Not determinable": YELLOW, "Satisfied": GREEN, "Not applicable": GREY,
           "Incorrect": RED, "Inconclusive": YELLOW, "Correct": GREEN}
+LABEL = {"copilot": "Copilot", "azure": "Azure"}
+
+
+def name_for(reviewer: str) -> str:
+    """The workbook's file name for this reviewer (copilot / azure)."""
+    return AZURE_NAME if reviewer == "azure" else NAME
+
+
+def verdict_of(result: dict) -> str:
+    """The answer's verdict: COPILOT_RESULT (Copilot) or REVIEW_RESULT (the Azure reviewer)."""
+    return result.get("COPILOT_RESULT") or result.get("REVIEW_RESULT") or ""
+
+
+def reviewer_of(cases: list) -> str:
+    """'azure' when the answers carry REVIEW_RESULT and none COPILOT_RESULT, else 'copilot'."""
+    results = [r for _, r in cases]
+    return "azure" if results and all("REVIEW_RESULT" in r and "COPILOT_RESULT" not in r for r in results) else "copilot"
 ISSUE_WORDS = ("No match", "Could not compare", "Not satisfied", "Not determinable")
 FIXED_PHRASES = ("Blank on Register", "Not available in Register snapshot", "Not captured", "Not retrieved")
 REVIEWER = [("Reviewer agrees (Y/N)", 12), ("Reviewer correction", 30), ("Reviewer notes", 30)]
@@ -102,36 +128,90 @@ class Sheet:
 
 # "Discrepancy type" sits with the timing facts, away from "Copilot result": beside the result it read as the reason
 # for an Incorrect (user, 2026-11-03).  An aged case is Incorrect only because a comparison did not match.
-CASE_HEAD = (["Instruction ID", "Client Account Number", "Sub Worktype", "Copilot result", "Headline",
-              "Issues", "Issue details (one per field)", "Client request", "Justification", "Comparisons", "Matches",
-              "No match", "Could not compare", "Rule checks", "Not satisfied", "Not determinable",
-              "Case end date/time (UK)", "Register snapshot date/time", "Business days gap", "Case age statement",
-              "Discrepancy type", "Client Number"] + [h for h, _ in REVIEWER] + ["Reviewer corrected result"])
-CASE_WIDTHS = [34, 16, 22, 13, 40, 8, 70, 45, 60, 11, 9, 9, 11, 10, 11, 12, 20, 26, 10, 30, 26, 14, 12, 30, 30, 16]
-ISSUE_HEAD = (["Instruction ID", "Sub Worktype", "Copilot result", "Issue no.", "Type", "Field or rule",
-               "Discrepancy ({field}: {discrepancy})", "Customer expectation", "Customer source", "Register value",
-               "Register source", "Evidence"] + [h for h, _ in REVIEWER])
+def case_head(result_label: str = "Copilot result") -> list:
+    return (["Instruction ID", "Client Account Number", "Sub Worktype", result_label, "Headline",
+             "Issues", "Issue details (one per field)", "Client request", "Justification", "Comparisons", "Matches",
+             "No match", "Could not compare", "Rule checks", "Not satisfied", "Not determinable",
+             "Case end date/time (UK)", "Register snapshot date/time", "Business days gap", "Case age statement",
+             "Discrepancy type", "Client Number", "Case source"] + [h for h, _ in REVIEWER] + ["Reviewer corrected result"])
+
+
+def issue_head(result_label: str = "Copilot result") -> list:
+    return (["Instruction ID", "Sub Worktype", result_label, "Issue no.", "Type", "Field or rule",
+             "Discrepancy ({field}: {discrepancy})", "Customer expectation", "Customer source", "Register value",
+             "Register source", "Evidence"] + [h for h, _ in REVIEWER])
+
+
+def check_head(result_label: str = "Copilot result") -> list:
+    return ["Instruction ID", "Client Account Number", "Sub Worktype", result_label, "Type", "What was checked",
+            "Customer expectation", "Customer source", "Register value", "Register source", "Outcome",
+            "Explanation / note", "Evidence"]
+
+
+CASE_HEAD = case_head()
+CASE_WIDTHS = [34, 16, 22, 13, 40, 8, 70, 45, 60, 11, 9, 9, 11, 10, 11, 12, 20, 26, 10, 30, 26, 14, 16, 12, 30, 30, 16]
+ISSUE_HEAD = issue_head()
 ISSUE_WIDTHS = [34, 22, 13, 8, 17, 30, 70, 26, 32, 26, 32, 32] + [w for _, w in REVIEWER]
-CHECK_HEAD = ["Instruction ID", "Client Account Number", "Sub Worktype", "Copilot result", "Type", "What was checked",
-              "Customer expectation", "Customer source", "Register value", "Register source", "Outcome",
-              "Explanation / note", "Evidence"]
+CHECK_HEAD = check_head()
 CHECK_WIDTHS = [34, 16, 22, 13, 11, 32, 28, 32, 28, 32, 16, 60, 32]
 SHEETS = ("Summary", "Cases", "Issues", "All checks")
+AZURE_SHEETS = SHEETS + ("Documents", "Extracted fields")
+DOC_HEAD = ["Instruction ID", "Document", "File", "Kind", "Form", "Pages", "Pages read"]
+DOC_WIDTHS = [34, 10, 50, 14, 40, 8, 10]
+FIELD_HEAD = (["Instruction ID", "Field ID", "Document", "Form", "Field", "Label", "Value read", "Handwritten",
+               "Confidence", "Low confidence (could not compare)", "Where on the page"] + [h for h, _ in REVIEWER])
+FIELD_WIDTHS = [34, 26, 10, 34, 26, 30, 40, 12, 11, 16, 30] + [w for _, w in REVIEWER]
 
 
-def build(cases: list) -> list:
-    """The four sheets from [(info, result)].  info: iid, account, sub_worktype, client_number, gap, age."""
+def _yes(value) -> str:
+    return "" if value is None else "Yes" if value is True else "No" if value is False else _text(value)
+
+
+def evidence_sheets(cases: list) -> list:
+    """The Azure reviewer's Documents and Extracted fields tabs (one row per document / per field read)."""
+    docs = Sheet("Documents", DOC_WIDTHS)
+    fields = Sheet("Extracted fields", FIELD_WIDTHS, lists={1 + FIELD_HEAD.index("Reviewer agrees (Y/N)"): "Y,N"})
+    docs.add(DOC_HEAD, fill=HEAD, wrap=True, bold=True)
+    fields.add(FIELD_HEAD, fill=HEAD, wrap=True, bold=True)
+    for info, result in cases:
+        iid = info.get("iid")
+        first = True
+        for d in result.get("DOCUMENTS") or info.get("documents") or []:
+            docs.add([iid, d.get("DOC_ID"), d.get("FILE"), d.get("KIND"), d.get("FORM"), d.get("PAGES"),
+                      d.get("PAGES_READ")], wrap=True, thick=first)
+            first = False
+        first = True
+        for f in result.get("EXTRACTED_FIELDS") or info.get("extracted_fields") or []:
+            low = bool(f.get("LOW_CONFIDENCE"))
+            conf = f.get("CONFIDENCE")
+            fields.add([iid, f.get("FIELD_ID"), f.get("DOC_ID"), f.get("FORM"), f.get("FIELD"), f.get("LABEL"),
+                        f.get("VALUE"), _yes(f.get("HANDWRITTEN")),
+                        f"{conf:.2f}" if isinstance(conf, (int, float)) and not isinstance(conf, bool) else _text(conf),
+                        _yes(low), ", ".join(map(str, f.get("CITATIONS") or [])), "", "", ""],
+                       wrap=True, thick=first, fill=YELLOW if low else "")
+            first = False
+    return [docs, fields]
+
+
+def build(cases: list, reviewer: str | None = None) -> list:
+    """The sheets from [(info, result)].  info: iid, account, sub_worktype, client_number, case_source, gap, age.
+    Copilot: the four tabs.  Azure (reviewer='azure', or every answer carries REVIEW_RESULT): the same four tabs
+    headed "Azure result", plus Documents and Extracted fields."""
+    reviewer = reviewer or reviewer_of(cases)
+    who = LABEL.get(reviewer, "Copilot")
+    label = f"{who} result"
     summary = Sheet("Summary", [46, 14, 12, 12, 12], frozen=False, filter_=False)
-    cases_sh = Sheet("Cases", CASE_WIDTHS, lists={1 + CASE_HEAD.index("Reviewer agrees (Y/N)"): "Y,N",
-                                                   1 + CASE_HEAD.index("Reviewer corrected result"): "Correct,Incorrect,Inconclusive"})
-    issues_sh = Sheet("Issues", ISSUE_WIDTHS, lists={1 + ISSUE_HEAD.index("Reviewer agrees (Y/N)"): "Y,N"})
+    head_c, head_i, head_k = case_head(label), issue_head(label), check_head(label)
+    cases_sh = Sheet("Cases", CASE_WIDTHS, lists={1 + head_c.index("Reviewer agrees (Y/N)"): "Y,N",
+                                                   1 + head_c.index("Reviewer corrected result"): "Correct,Incorrect,Inconclusive"})
+    issues_sh = Sheet("Issues", ISSUE_WIDTHS, lists={1 + head_i.index("Reviewer agrees (Y/N)"): "Y,N"})
     checks_sh = Sheet("All checks", CHECK_WIDTHS)
-    for sh, head in ((cases_sh, CASE_HEAD), (issues_sh, ISSUE_HEAD), (checks_sh, CHECK_HEAD)):
+    for sh, head in ((cases_sh, head_c), (issues_sh, head_i), (checks_sh, head_k)):
         sh.add(head, fill=HEAD, wrap=True, bold=True)
     totals, kinds, subs = collections.Counter(), collections.Counter(), {}
     issue_types, phrases = collections.Counter(), collections.Counter()
     for info, result in cases:
-        verdict, kind = result.get("COPILOT_RESULT", ""), result.get("DISCREPANCY_TYPE", "")
+        verdict, kind = verdict_of(result), result.get("DISCREPANCY_TYPE", "")
         rows, rules = result.get("A_B_COMPARISONS") or [], result.get("RULE_CHECKS") or []
         items = issues_of(result)
         flags, statuses = [r.get("MATCH") for r in rows], [r.get("STATUS") for r in rules]
@@ -145,7 +225,8 @@ def build(cases: list) -> list:
              len(items), issue_details(result), result.get("CLIENT_REQUEST"), result.get("JUSTIFICATION"), len(rows),
              flags.count(True), flags.count(False), flags.count(None), len(rules), statuses.count("Not satisfied"),
              statuses.count("Not determinable"), result.get("CASE_END_DATETIME"), result.get("REGISTER_SNAPSHOT_DATETIME"),
-             info.get("gap"), info.get("age"), kind, info.get("client_number"), "", "", "", ""],
+             info.get("gap"), info.get("age"), kind, info.get("client_number"), info.get("case_source") or "",
+             "", "", "", ""],
             wrap=True, fills={3: COLOUR.get(verdict, "")})
         for n, (k, name, line, comp, rule) in enumerate(items, 1):
             src = comp or {}
@@ -159,7 +240,9 @@ def build(cases: list) -> list:
             out = outcome_of(r.get("MATCH"))
             checks_sh.add([info.get("iid"), info.get("account"), info.get("sub_worktype"), verdict, "Comparison",
                            r.get("ITEM"), r.get("Customer_expectation"), r.get("CUSTOMER_SOURCE"), r.get("System_data"),
-                           r.get("SYSTEM_SOURCE"), out, r.get("EXPLANATION"), ""], fill=COLOUR.get(out, ""), wrap=True,
+                           r.get("SYSTEM_SOURCE"), out, r.get("EXPLANATION"),
+                           ("Fields read: " + ", ".join(map(str, r["FIELD_IDS"]))) if r.get("FIELD_IDS") else ""],
+                          fill=COLOUR.get(out, ""), wrap=True,
                           thick=first)
             first = False
         for r in rules:
@@ -167,9 +250,9 @@ def build(cases: list) -> list:
                            r.get("RULE"), "", "", "", "", r.get("STATUS"), r.get("NOTE"), r.get("EVIDENCE")],
                           fill=COLOUR.get(r.get("STATUS"), ""), wrap=True, thick=first)
             first = False
-    summary.add(["Copilot review results", f"{datetime.datetime.now():%d/%m/%Y %H:%M}"], bold=True)
+    summary.add([f"{who} review results", f"{datetime.datetime.now():%d/%m/%Y %H:%M}"], bold=True)
     summary.add([])
-    summary.add(["Cases with a valid Copilot answer", len(cases)], bold=True)
+    summary.add([f"Cases with a valid {who} answer", len(cases)], bold=True)
     for word in ("Correct", "Incorrect", "Inconclusive"):
         summary.add([word, totals[word]], fills={0: COLOUR[word]})
     summary.add([])
@@ -190,7 +273,8 @@ def build(cases: list) -> list:
     for phrase in FIXED_PHRASES:
         summary.add([phrase, phrases[phrase]])
     summary.add(["(a real Register value)", sum(n for p, n in phrases.items() if p not in FIXED_PHRASES)])
-    return [summary, cases_sh, issues_sh, checks_sh]
+    sheets = [summary, cases_sh, issues_sh, checks_sh]
+    return sheets + evidence_sheets(cases) if reviewer == "azure" else sheets
 
 
 # ---------------------------------------------------------------------------------------------- the .xlsx file
@@ -289,9 +373,9 @@ def sheet_xml(sh: Sheet, styles: Styles) -> str:
     return "".join(xml)
 
 
-def xlsx_bytes(cases: list) -> bytes:
+def xlsx_bytes(cases: list, reviewer: str | None = None) -> bytes:
     """The whole workbook from [(info, result)]; it opens on the Cases tab."""
-    sheets, styles = build(cases), Styles()
+    sheets, styles = build(cases, reviewer), Styles()
     bodies = [sheet_xml(sh, styles) for sh in sheets]         # first: registers every style the sheets use
     n = len(sheets)
     names = "".join(f'<sheet name="{sh.name}" sheetId="{i}" r:id="rId{i}"/>' for i, sh in enumerate(sheets, 1))
@@ -346,10 +430,10 @@ def _free(path: Path) -> Path:
     return out
 
 
-def set_aside(folder) -> Path | None:
-    """Rename an older 'Copilot review results.xlsx' to '... - older <the time it was made>.xlsx'.  None when there is
-    none.  PermissionError when Windows refuses (Excel has it open)."""
-    path = Path(folder) / NAME
+def set_aside(folder, name: str = NAME) -> Path | None:
+    """Rename an older 'Copilot review results.xlsx' (or `name`) to '... - older <the time it was made>.xlsx'.  None
+    when there is none.  PermissionError when Windows refuses (Excel has it open)."""
+    path = Path(folder) / name
     if not path.exists():
         return None
     st = path.stat()
@@ -359,20 +443,21 @@ def set_aside(folder) -> Path | None:
     return target
 
 
-def make_room(folder, wait=input, say=print) -> Path | None:
-    """Start of a run: set the older workbook aside.  While Excel holds it open: say so, wait for Enter, try again."""
+def make_room(folder, wait=input, say=print, name: str = NAME) -> Path | None:
+    """Start of a run: set the older workbook (`name`: Copilot's or the Azure reviewer's) aside.  While Excel holds it
+    open: say so, wait for Enter, try again."""
     if not Path(folder).is_dir():
-        raise RuntimeError(f"the folder for '{NAME}' (CASES_ROOT) was not found - is the drive connected?")
+        raise RuntimeError(f"the folder for '{name}' (CASES_ROOT) was not found - is the drive connected?")
     while True:
         try:
-            moved = set_aside(folder)
+            moved = set_aside(folder) if name == NAME else set_aside(folder, name)
         except PermissionError:
-            say(f"\n'{NAME}' is open (probably in Excel), so it cannot be renamed before this run.\n"
+            say(f"\n'{name}' is open (probably in Excel), so it cannot be renamed before this run.\n"
                 "Close it in Excel, then press Enter to try again (Ctrl+C stops).")
             try:
                 wait("")
             except EOFError:
-                raise RuntimeError(f"'{NAME}' is open in Excel and there is no console to wait on - close it and run again") from None
+                raise RuntimeError(f"'{name}' is open in Excel and there is no console to wait on - close it and run again") from None
             continue
         if moved:
             say(f"Results workbook from an earlier run renamed to: {moved.name}")
@@ -382,9 +467,9 @@ def make_room(folder, wait=input, say=print) -> Path | None:
 class ReviewWorkbook:
     """This run's results workbook, rewritten whole (temp file + one replace) after every valid answer."""
 
-    def __init__(self, folder):
-        self.folder = Path(folder)
-        self.path = self.folder / NAME
+    def __init__(self, folder, reviewer: str = "copilot"):
+        self.folder, self.reviewer = Path(folder), reviewer
+        self.path = self.folder / name_for(reviewer)
         self.cases = []                   # [(info, result)] in the order the answers arrived
         self.dirty = False                # an answer is not in the file yet (Excel had it open)
 
@@ -399,7 +484,7 @@ class ReviewWorkbook:
         tmp = target.with_name(f".{target.stem}.tmp-{uuid.uuid4().hex[:8]}.xlsx")
         try:
             with open(tmp, "wb") as fh:
-                fh.write(xlsx_bytes(self.cases))
+                fh.write(xlsx_bytes(self.cases, self.reviewer))
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(tmp, target)

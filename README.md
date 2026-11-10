@@ -7,6 +7,7 @@ Three parts work **at the same time**, so Copilot can review case 1 while System
 | `1_system1_documents/` | **Part 1** | Per case: every Received Document + the Audit Trail from System 1 | the ONE System 1 tab of the **systems Edge** (port 9223) |
 | `2_system2_snapshots/` | **Part 2** | All account snapshots from System 2, in bulk (usually done before case 1) | signed-in requests with the systems Edge's cookies (no tab) |
 | `3_copilot_sender/` | **Part 3** | Sends each complete case to Copilot, one fresh chat, sent once, answer read back | the **Copilot Edge** (port 9333) |
+| `3_azure_reviewer/` | **Part 3 (alternative)** | With the setting `reviewer = azure`: reads every document with Azure Document Intelligence and reviews the case with an Azure language model, instead of Copilot (see [The Azure reviewer](#the-azure-reviewer-instead-of-copilot)) | no browser |
 | `orchestrator/` | Coordinator | Asks for the CSV, starts everything, hands complete cases over, writes the daily report | no browser |
 | `shared/pipeline.py` | Contract | The small files the parts use to work together (read its header) | — |
 | `shared/timing.py` | Case timing | The four case-timing values typed into each case's message (End Date, snapshot time, business days, age) | — |
@@ -49,10 +50,14 @@ stay in your local, git-ignored `sender_config.json`.
 
 ## A daily run (`Run.cmd` / `Run.cmd run`)
 
-1. **The CSV.** Paste its path (the last one is offered). It needs the columns `instruction id` (the old
-   `instrcution id` spelling also works), `Client Account Number`, `Client Number`, `Process Status` and
-   `Sub Worktype`, and (optional, last) **`End Date`** - when the case ended, in UK time. Only **Ended** rows are
-   reviewed. Every other row (Voided, blank, an invalid ID, a duplicate, no account) is listed under **SKIPPED** with
+1. **The CSV** - the **BAM Studio report** saved as CSV. Paste its path (the last one is offered). It needs the
+   columns `Request Id` (the older `Instruction Id` / `instrcution id` spellings also work), `Client Account Number`,
+   `Client Number`, `Process Status` and `Sub Worktype`, and (optional) **`End Date`** - when the case ended, in UK
+   time - and the **case source**: the first column whose name contains "source" (e.g. `Case Source`), i.e. where the
+   customer request came in (email, post ...). Other columns are ignored. The case source is given to the reviewer
+   (Copilot or Azure) as one line of the case's facts - right under the case timing in the base message - and shown in
+   the daily report and the results workbook; blank or no such column = `not stated`. Any rule about it belongs in
+   your Sub Worktype files, not in the code. Only **Ended** rows are reviewed. Every other row (Voided, blank, an invalid ID, a duplicate, no account) is listed under **SKIPPED** with
    its reason before anything starts. A CSV without any End Date is sent anyway (see [Case timing](#case-timing)).
    Before this, an older results workbook is renamed (see [Results workbook](#results-workbook-copilot-review-resultsxlsx)).
 2. **The plan.** For each Ended row: *download and send*, *complete already* (send only), *already sent earlier*
@@ -76,8 +81,8 @@ stay in your local, git-ignored `sender_config.json`.
      message with this case's timing filled in, sends once and collects the answer while the next case is still
      downloading.
 7. **The daily report**: on screen (a "Reviewed X of Y ... N need you" line, then everything that needs you) and as
-   `RUNTIME_ROOT\reports\daily-report-<run>.csv`. One line per CSV row: sent + Copilot's verdict, held + why,
-   skipped + why, left-out files and the Copilot chat's address. A valid answer's detail gives the discrepancy type and
+   `RUNTIME_ROOT\reports\daily-report-<run>.csv`. One line per CSV row: its case source, sent + Copilot's verdict,
+   held + why, skipped + why, left-out files and the Copilot chat's address. A valid answer's detail gives the discrepancy type and
    the counts (comparisons, differences, not compared, rule checks, not satisfied, not determinable). Case timing sent as
    'Not provided' is marked `CHECK:` there, so the row is listed as needing you. Under the report the console names
    this run's **results workbook**.
@@ -129,6 +134,62 @@ everything but never repeat company details (names, IDs, account numbers, hosts,
 
 `Run.cmd send-only` is Part 3 alone, as before the pipeline. It sends the folders already in CASES_ROOT with one
 general review guidance file (`instructions_path`).
+
+## The Azure reviewer (instead of Copilot)
+
+An alternative Part 3. Parts 1 and 2 and the hand-over are the same; only the review changes. Copilot stays the
+default and stays available: switch with `Run.cmd setup` (question *PART 3 - which reviewer*).
+
+**What it does, per case** (`3_azure_reviewer/`, no browser, no Copilot Edge, no cursor or model question):
+1. **Azure Document Intelligence** reads every page of every document (text, handwriting, ticked boxes), with a
+   confidence for each word.
+2. An **Azure language model** fills in each recognised form (the field list is in `3_azure_reviewer/form_maps.json`),
+   pointing to where on the page it read each value.
+3. The same or a second model **reviews the case** with your `daily_review_instructions.md`, its Sub Worktype file and
+   the result contract - the same Correct / Incorrect / Inconclusive logic as Copilot - and every comparison points to
+   the fields it used.
+4. **Low confidence is never guessed**: a value read below the low-confidence mark (0.80) is flagged and its comparison
+   is "could not compare", so the case cannot come out Correct on it.
+
+**Setup** (`Run.cmd setup`, answer `azure`; the result contract is then required):
+- **On the laptop (made-up data only):** your own test Azure. Endpoints of your Document Intelligence and language
+  model resources, sign-in = `signin` (no key: you sign in with `az login` yourself; the tool asks Azure for a short
+  token), the two deployment names, tier `free`.
+- **On the VDI (real cases):** FNZ's approved Azure. Paste the FNZ **endpoints** and **keys** (typed hidden), sign-in =
+  `key`, the deployment names FNZ gives you, and the tier (`paid` if FNZ's Document Intelligence is not the free one).
+- Endpoints and keys are kept **only** in your git-ignored `sender_config.json`. Keys are shown as `set` / `not set`
+  everywhere and replaced with `<secret>` in every report.
+- `Run.cmd check` also checks that Azure answers (Document Intelligence and each deployment) when the reviewer is azure.
+
+**A run** is the same `Run.cmd` as always (Studio report CSV, sign in to System 1 and 2, Enter). Results:
+- `CASES_ROOT\Azure review results.xlsx` - Copilot's four tabs (headed **Azure result**) plus **Documents** (every
+  document and the pages read) and **Extracted fields** (every value read, handwritten or not, its confidence; low
+  confidence in yellow). An older one is renamed at the start, as for Copilot's.
+- The daily report says `reviewed - Azure: Correct` (etc.); held cases and their reasons as before.
+- `RUNTIME_ROOT\results-azure\<id>.json` per case, `RUNTIME_ROOT\logs\azure-responses-<time>.md` (every request and
+  answer, for review), and its own already-reviewed list `RUNTIME_ROOT\azure_reviewed_instructions.txt` (separate from
+  Copilot's `sent_instructions.txt`: a case sent to Copilot can still be reviewed by Azure; delete a line to review
+  again).
+
+**Testing it before the VDI: `Run.cmd azure-test` (laptop only, made-up data).** It makes 10 made-up cases (7 forms,
+handwriting from a research dataset of block capitals plus 5 typed baselines, and four trap cases: a wrong value, a
+wrong signer, a missing page, an unreadable key field), reviews them on your laptop Azure and writes an **accuracy
+report** in `RUNTIME_ROOT\azure-test\<time>\accuracy-report.md`. The **pass bar** before using it on the VDI:
+- **no trap case comes out Correct**;
+- **at least 95% of the handwritten fields are read right** (strict: same value ignoring capitals and extra spaces;
+  flagged fields still count - the report also shows the score of the unflagged ones);
+- **every field read below 0.80 confidence is flagged**.
+
+`--case-model <deployment>` tries another case-review deployment for one test; `--limit N` reviews only N cases. The
+test's Python packages live only in `tests\azure_synthetic\.synthetic-venv` (see `tests/azure_synthetic/README.md`);
+the downloaded forms and images are never committed (this repository is public).
+
+**Free-tier budget:** Document Intelligence's free tier reads only the first 2 pages per request and **500 pages a
+month**. The reviewer sends 2-page pieces and keeps every result in a cache by file fingerprint, and the test data is
+made identical every time, so an unchanged re-run costs no pages. A full test is roughly 90 pages.
+
+**Status:** keep `reviewer = copilot` on the VDI until the latest `azure-test` meets the pass bar. *Locally verified*
+with fakes (tests); laptop Azure: see the latest accuracy report; FNZ Azure: **needs your VDI**.
 
 ---
 
@@ -354,7 +415,7 @@ for a case (case discovery lists folders only), and the folder is never created 
     number of issues, **Issue details** (every wrong / not-comparable field and failed / undeterminable rule as its own
     numbered paragraph `1. [No match] {field}: {discrepancy}`, a blank line between them), client request,
     justification, counts, timing, **discrepancy type** (right after the case age statement, 2026-11-03: beside the
-    result it read as the reason for an Incorrect), Client Number and reviewer columns (Y/N and result lists). An aged
+    result it read as the reason for an Incorrect), Client Number, case source and reviewer columns (Y/N and result lists). An aged
     case is Incorrect only because a comparison did not match; its type then reads `Possible discrepancy due to aged case`.
   - **Issues** - one row per red / yellow item (the reviewers' to-do list): `{field}: {discrepancy}`, both values and
     both sources; the ID links back to the case's row in Cases; a thick line above each new case.
@@ -540,6 +601,9 @@ skipped, not failed.
 | Check | Status |
 |---|---|
 | Daily CSV: only Ended reviewed, every other row listed with its reason, column spellings, `;` CSVs | **Tested here** |
+| BAM Studio report: `Request Id` and the older ID spellings, case source from the first column containing "source" (optional, `not stated` when blank), in plan, daily report, workbook and the Copilot message (under the case timing) | **Tested here** (`tests/test_azure_integration.py`) |
+| Azure reviewer wiring: setup requires the result contract, coordinator starts the Azure reviewer (no Copilot port check), its own ledger, `Azure review results.xlsx` set aside, daily report worded for Azure with the results-azure fallback of this run only, workbook `Azure result` heading + Documents / Extracted fields tabs, `Run.cmd check` runs the Azure check, `Run.cmd azure-test` steps and refusals | **Tested here** (fake reviewer / fake commands, no Azure call) |
+| Azure reviewer on made-up cases against the pass bar | **Live on the laptop Azure** (`Run.cmd azure-test`, see its accuracy report); FNZ Azure: **needs your VDI** |
 | Hand-over only when documents + Audit Trail + snapshot + Sub Worktype instructions are all there; held reasons; stop leaves `.work` alone; a crashed part counts as finished | **Tested here** |
 | Part 3 live queue: a case finished mid-run is sent; its own instructions + contract, then snapshot, Audit Trail, documents in order; over the limit the last documents are left out | **Tested here** (real Runner, fake page) |
 | Stop after a send: nothing new sent, the sent answer still collected; sign-in check names what is missing; pause → Enter → resume | **Tested here** |

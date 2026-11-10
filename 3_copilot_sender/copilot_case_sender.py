@@ -412,6 +412,7 @@ from shared import timing as TM                 # noqa: E402  the four case-timi
 from shared import review_workbook as WB        # noqa: E402  Copilot review results.xlsx for the human reviewers
 from shared.pipeline import SNAPSHOT_SUFFIX      # noqa: E402  Part 2's account snapshot, copied into each case folder
 from shared.pipeline import DETAIL_SECTIONS      # noqa: E402  Part 2's nine account-detail pages (asked in setup)
+from shared import pipeline as PL               # noqa: E402  the Studio report's case source line of a case's message
 
 
 def config_path() -> Path:
@@ -632,6 +633,11 @@ def setup_command() -> int:
     cur["reviewer"] = who if who in REVIEWERS else "copilot"
     if cur["reviewer"] == "azure":
         ask_azure(cur)
+        while not cur["result_contract_path"]:       # the Azure reviewer always answers in the contract's format
+            print("  The Azure reviewer needs the Result contract .md (its answers are always collected and checked).")
+            value = ask("Path of the Result contract .md", "", True)
+            cur["result_contract_path"] = str(resolve_file(value, "result_contract.md") or "") if value else ""
+        cur["completion_mode"] = "json_result"
     node = next((str(p) for p in exe_candidates("node") if p.is_file()), "")
     value = ask("Node.js node.exe (optional; Enter = use the copy bundled with Playwright)", cur.get("node_executable") or node, True)
     cur["node_executable"] = str(resolve_file(value, "node.exe") or "") if value else ""
@@ -719,6 +725,8 @@ def validate_config(cfg):
         problems.append("reviewer must be 'copilot' or 'azure'")
     elif reviewer == "azure":
         problems += azure_problems(cfg)
+        if not cfg.result_contract_path or cfg.completion_mode != "json_result":
+            problems.append("the Azure reviewer needs result_contract_path (its answers are always collected) - run setup")
     if not problems:
         try:
             missing = TM.missing_placeholders(load_message(Path(cfg.base_message_path)))
@@ -3679,8 +3687,10 @@ class Runner:
             except Exception as exc:  # pipeline is an optimisation: failing here only loses the head start
                 self.log("prefetch", case.alias, note=safe_exc(self.redact, exc))
         self.timing[case.key] = timing
-        return Prepared(case, plan, tab=tab, generation=self.browser.generation, left_out=left_out,
-                        message=TM.fill(self.message, timing))
+        message = TM.fill(self.message, timing)
+        if self.feed is not None:          # pipeline: where the customer request came in (Studio report), one line
+            message = PL.with_case_source(message, self.feed.case_source(case))
+        return Prepared(case, plan, tab=tab, generation=self.browser.generation, left_out=left_out, message=message)
 
     def collecting(self) -> bool:
         return self.cfg.completion_mode == "json_result"
@@ -4414,11 +4424,16 @@ class PipelineFeed:
         """The CSV's End Date of this case ('' when the CSV has none for it)."""
         return (self.rows.get(case.id) or {}).get("end_date", "")
 
+    def case_source(self, case) -> str:
+        """The Studio report's case source of this case - where the customer request came in ('' = not stated)."""
+        return (self.rows.get(case.id) or {}).get("case_source", "")
+
     def info(self, case) -> dict:
         """What the results workbook shows about the case besides Copilot's answer."""
         row = self.rows.get(case.id) or {}
         return {"iid": case.id, "account": row.get("account", ""), "client_number": row.get("client_number", ""),
-                "sub_worktype": self.sub_of.get(case.key) or row.get("sub_worktype_csv", "")}
+                "sub_worktype": self.sub_of.get(case.key) or row.get("sub_worktype_csv", ""),
+                "case_source": row.get("case_source", "")}
 
     def arrange(self, case) -> None:
         """Snapshot, Audit Trail, then documents in System 1's Received Documents order; anything else after, by name."""
@@ -4678,8 +4693,27 @@ def check_command(args) -> int:
     line("edge executable", Path(cfg.edge_executable).is_file())
     if args.browser:
         line("browser connect + renderer", asyncio.run(browser_probe(ctx_)))
+    if getattr(cfg, "reviewer", "copilot") == "azure":
+        line("Azure reviewer (settings + Azure reachable)", azure_check(), "see its lines above")
     print("\nAll checks passed." if ok else "\nSome checks failed.")
     return 0 if ok else 1
+
+
+def azure_check(run=subprocess.run) -> bool:
+    """reviewer = azure: the Azure reviewer's own `check` (its settings, Document Intelligence and each model deployment
+    answer).  It prints its own plain-English lines (never a key or a whole endpoint); True when it exits 0."""
+    script = azure_script()
+    print("\n  AZURE REVIEWER CHECK")
+    if not script.is_file():
+        print("  the Azure reviewer (3_azure_reviewer\\azure_case_reviewer.py) is missing from this folder")
+        return False
+    try:
+        done = run([sys.executable, "-B", "-E", "-s", str(script), "check"], stdin=subprocess.DEVNULL, timeout=300)
+    except subprocess.TimeoutExpired:
+        print("  the Azure reviewer check did not finish within 300 s")
+        return False
+    print()
+    return done.returncode == 0
 
 
 async def browser_probe(ctx) -> bool:

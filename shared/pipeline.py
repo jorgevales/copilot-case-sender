@@ -3,6 +3,7 @@
   Part 1  System 1 documents   1_system1_documents/   downloads each case into CASES_ROOT\\.work\\<id> - <ACCOUNT>
   Part 2  System 2 snapshots   2_system2_snapshots/   one JSON snapshot per account, in bulk
   Part 3  Copilot sender       3_copilot_sender/      sends every case that is complete, one fresh chat each
+     or   Azure reviewer       3_azure_reviewer/      (setting reviewer = azure) reviews it with Azure instead of Copilot
   Coordinator                  orchestrator/          starts the parts, hands finished cases over, writes the daily report
 
 The parts never call each other.  They only read and write the small files described here:
@@ -12,7 +13,7 @@ The parts never call each other.  They only read and write the small files descr
     cases\\<id>.json             Coordinator: the case folder is complete in CASES_ROOT, ready for Part 3 (persistent)
     snapshots\\<YYYY-MM-DD>\\     Part 2: <ACCOUNT>_Complete_Account_Profile.json (reused the same day only if it checks out)
     runs\\<run id>\\
-      plan.json                 Coordinator: the CSV rows of this run and what each one needs
+      plan.json                 Coordinator: the CSV rows of this run, what each one needs and the reviewer (copilot/azure)
       control\\                  go / check / stop / pause / resume / feed-closed / <part>-finished
       status\\                   answers to the sign-in check, Part 2's failed accounts
       events\\<part>.jsonl        progress lines Part 3 shows on the one console
@@ -43,6 +44,10 @@ DETAIL_SECTIONS = ("01 Personal Details", "02 Contact Details", "03 Corresponden
                    "05 Banking Details", "06 Other Details", "07 Suspended Activity", "08 Future Dated Instructions",
                    "09 Flags and Custom Details")
 ID_RE = re.compile(r"^[0-9a-f]{32}$")
+REVIEWERS = ("copilot", "azure")       # Part 3: the Copilot sender (default) or the Azure reviewer
+AZURE_LEDGER = "azure_reviewed_instructions.txt"   # in RUNTIME_ROOT: the Azure reviewer's own "already reviewed" list
+AZURE_RESULTS = "results-azure"         # in RUNTIME_ROOT: the Azure reviewer's <instruction id>.json per case
+CASE_SOURCE_NOT_STATED = "not stated"   # the Studio report has no case source for the case
 REVIEWED_STATUS = "ended"               # only this Process Status is reviewed; every other value is skipped and listed
 UNKNOWN_SUB = "Unknown Sub WorkType"    # what Part 1 records when System 1 shows no Sub WorkType
 
@@ -142,13 +147,23 @@ def _norm_head(text) -> str:
     return re.sub(r"[^a-z0-9]", "", str(text or "").casefold())
 
 
-def read_case_list(path) -> tuple[list, list]:
-    """The daily CSV -> (cases to review, skipped rows).
+ID_HEADS = ("requestid", "instructionid", "instrcutionid")   # BAM Studio report: "Request Id"; older CSVs: "Instruction Id"
 
-    Columns (header spelling is loose): instruction id (also the 'instrcution id' spelling), Client Account Number,
-    Client Number, Process Status, Sub Worktype, and (optional, last) End Date - the case end in UK time, as text or
-    as an Excel serial number (shared/timing.py).  Only Process Status 'Ended' is reviewed; every other row is returned
-    in `skipped` with the reason, so it can be shown clearly - nothing is dropped silently."""
+
+def source_head(heads: dict):
+    """The case source column: the first header (in file order) containing 'source' - e.g. 'Case Source'."""
+    return next((h for k, h in heads.items() if "source" in k), None)
+
+
+def read_case_list(path) -> tuple[list, list]:
+    """The daily CSV (the BAM Studio report saved as CSV) -> (cases to review, skipped rows).
+
+    Columns (header spelling is loose): Request Id (also the older 'Instruction Id' / 'instrcution id' spellings),
+    Client Account Number, Client Number, Process Status, Sub Worktype, (optional) End Date - the case end in UK time,
+    as text or as an Excel serial number (shared/timing.py) - and (optional) the case source: the first header that
+    contains 'source', i.e. where the customer request came in (email, post ...); '' when there is none.  Other
+    columns are ignored.  Only Process Status 'Ended' is reviewed; every other row is returned in `skipped` with the
+    reason, so it can be shown clearly - nothing is dropped silently."""
     path = Path(path)
     if not path.is_file():
         raise CsvError("the CSV file was not found")
@@ -160,10 +175,11 @@ def read_case_list(path) -> tuple[list, list]:
     with path.open("r", encoding="utf-8-sig", newline="") as fh:
         reader = csv.DictReader(fh, dialect=dialect)
         heads = {_norm_head(h): h for h in reader.fieldnames or [] if h}
-        col = {"iid": heads.get("instrcutionid") or heads.get("instructionid"),
+        col = {"iid": next((heads[k] for k in ID_HEADS if k in heads), None),
                "account": heads.get("clientaccountnumber"), "client": heads.get("clientnumber"),
-               "status": heads.get("processstatus"), "sub": heads.get("subworktype"), "end": heads.get("enddate")}
-        missing = [name for key, name in (("iid", "instruction id"), ("account", "Client Account Number"),
+               "status": heads.get("processstatus"), "sub": heads.get("subworktype"), "end": heads.get("enddate"),
+               "source": source_head(heads)}
+        missing = [name for key, name in (("iid", "Request Id"), ("account", "Client Account Number"),
                                           ("status", "Process Status"), ("sub", "Sub Worktype")) if not col[key]]
         if missing:
             raise CsvError("the CSV has no column for: " + ", ".join(missing))
@@ -172,7 +188,7 @@ def read_case_list(path) -> tuple[list, list]:
             get = lambda key: " ".join(str(row.get(col[key]) or "").split()) if col[key] else ""
             item = {"row_number": n, "iid": get("iid").lower(), "account": norm_account(get("account")),
                     "client_number": get("client"), "status": get("status"), "sub_worktype_csv": get("sub"),
-                    "end_date": get("end"),
+                    "end_date": get("end"), "case_source": get("source"),
                     "row": {" ".join(str(k).split()): " ".join(str(v or "").split()) for k, v in row.items() if k}}
             if not any(item["row"].values()):
                 continue                                    # an empty line
@@ -188,6 +204,25 @@ def read_case_list(path) -> tuple[list, list]:
                 seen.add(item["iid"])
                 cases.append(item)
     return cases, skipped
+
+
+CASE_SOURCE_LABEL = "Case source (where the customer request came in, from the Studio report)"
+
+
+def case_source_line(source) -> str:
+    """The one line of case context both reviewers get: '- Case source (...): Email' ('not stated' when blank)."""
+    return f"- {CASE_SOURCE_LABEL}: {' '.join(str(source or '').split()) or CASE_SOURCE_NOT_STATED}"
+
+
+def with_case_source(message: str, source) -> str:
+    """A case's message with its case source line: right after the case-timing line 'Case age statement' when the
+    base message has one (the line stays inside the case facts), else as the message's first line."""
+    line = case_source_line(source)
+    lines = str(message or "").split("\n")
+    for n, text in enumerate(lines):
+        if "case age statement" in text.casefold():
+            return "\n".join(lines[:n + 1] + [line] + lines[n + 1:])
+    return line + "\n\n" + str(message or "")
 
 
 # ---------------------------------------------------------------------------------------------- guidance per Sub Worktype
@@ -414,38 +449,71 @@ OUTCOMES = {
     "preflight_blocked": "not sent - blocked", "failed_exhausted": "not sent - failed after all tries",
     "not_sent_stopped": "not sent - run stopped", "skipped_already_sent": "already sent earlier",
 }
+# reviewer = azure: the same states, worded for a review that never leaves the computer through a chat.
+AZURE_OUTCOMES = {
+    "result_correct": "reviewed - Azure: Correct", "result_incorrect": "reviewed - Azure: Incorrect",
+    "result_inconclusive": "reviewed - Azure: Inconclusive", "result_invalid": "reviewed - answer not in the required format",
+    "held": "held", "not_sent_stopped": "not reviewed - run stopped", "skipped_already_sent": "already reviewed earlier",
+}
 REPORT_COLUMNS = ["row", "instruction_id", "client_account_number", "client_number", "process_status", "sub_worktype",
-                  "outcome", "detail", "left_out_files", "copilot_chat"]
-REVIEWED = ("sent - Copilot: Correct", "sent - Copilot: Incorrect", "sent - Copilot: Inconclusive")
+                  "case_source", "outcome", "detail", "left_out_files", "copilot_chat"]
+REVIEWED = ("sent - Copilot: Correct", "sent - Copilot: Incorrect", "sent - Copilot: Inconclusive",
+            "reviewed - Azure: Correct", "reviewed - Azure: Incorrect", "reviewed - Azure: Inconclusive")
+EARLIER = ("already sent earlier", "already reviewed earlier")
+
+
+def azure_result(paths: Paths, iid: str, since: str = ""):
+    """RUNTIME_ROOT\\results-azure\\<id>.json written by the Azure reviewer - only when written during this run (on or
+    after `since`, the plan's creation time), so an earlier run's answer is never reported as this run's."""
+    path = paths.runtime_root / AZURE_RESULTS / f"{iid}.json"
+    try:
+        made = datetime.datetime.fromtimestamp(path.stat().st_mtime, datetime.timezone.utc)
+    except OSError:
+        return None
+    try:
+        if since and made < datetime.datetime.fromisoformat(since):
+            return None
+    except ValueError:
+        pass
+    rec = read_json(path)
+    return rec if isinstance(rec, dict) and rec.get("state") else None
 
 
 def daily_report(paths: Paths, plan: dict, control: Control) -> list:
-    """One row per CSV row, in CSV order: what happened to it this run and why."""
+    """One row per CSV row, in CSV order: what happened to it this run and why.  With reviewer = azure, a case missing
+    from status\\part3-results.json (the reviewer ended early) is taken from its results-azure file of this run."""
     held = control.held()
     sent = read_json(paths.sub("status") / "part3-results.json", {}) or {}
+    azure = plan.get("reviewer") == "azure"
+    words = AZURE_OUTCOMES if azure else OUTCOMES
+    earlier = EARLIER[1] if azure else EARLIER[0]
     rows = []
     for c in plan["skipped"]:
         rows.append({"row": c["row_number"], "instruction_id": c["iid"], "client_account_number": c["account"],
                      "client_number": c["client_number"], "process_status": c["status"],
-                     "sub_worktype": c["sub_worktype_csv"], "outcome": "skipped", "detail": c["reason"],
-                     "left_out_files": "", "copilot_chat": ""})
+                     "sub_worktype": c["sub_worktype_csv"], "case_source": c.get("case_source", ""), "outcome": "skipped",
+                     "detail": c["reason"], "left_out_files": "", "copilot_chat": ""})
     for c in plan["cases"]:
         iid = c["iid"]
         m = read_json(paths.downloads / f"{iid}.json") or {}
         row = {"row": c["row_number"], "instruction_id": iid, "client_account_number": c["account"],
                "client_number": c["client_number"], "process_status": c["status"],
-               "sub_worktype": m.get("sub_worktype") or c["sub_worktype_csv"], "outcome": "", "detail": "",
+               "sub_worktype": m.get("sub_worktype") or c["sub_worktype_csv"],
+               "case_source": c.get("case_source") or CASE_SOURCE_NOT_STATED, "outcome": "", "detail": "",
                "left_out_files": "", "copilot_chat": ""}
+        r = sent.get(iid) or (azure_result(paths, iid, plan.get("created", "")) if azure else None)
         if c["needs"] in ("done", "held"):
-            row.update(outcome="already sent earlier" if c["needs"] == "done" else "held", detail=c["note"])
-        elif iid in sent:
-            r = sent[iid]
-            row.update(outcome=OUTCOMES.get(r["state"], r["state"]), detail=r.get("reason", ""),
+            row.update(outcome=earlier if c["needs"] == "done" else "held", detail=c["note"])
+        elif r and not (azure and r["state"] == "held"):
+            row.update(outcome=words.get(r["state"], r["state"]), detail=r.get("reason", ""),
                        left_out_files=r.get("left_out_files") or "", copilot_chat=r.get("chat", ""))
         elif iid in held:
             row.update(outcome="held", detail=held[iid]["reason"])
+        elif r:                                         # azure: held, but its held file is missing
+            row.update(outcome="held", detail=r.get("reason", ""))
         elif m:
-            row.update(outcome="not sent - run ended", detail="downloaded, not handed over or not sent yet")
+            row.update(outcome="not sent - run ended" if not azure else "not reviewed - run ended",
+                       detail="downloaded, not handed over or not " + ("reviewed" if azure else "sent") + " yet")
         else:
             row.update(outcome="not reached - run ended", detail="")
         if m.get("warnings"):
@@ -457,7 +525,7 @@ def daily_report(paths: Paths, plan: dict, control: Control) -> list:
 
 def needs_you(row: dict) -> bool:
     """A row you have to look at: anything but a clean verdict, an earlier send or a skipped row."""
-    return row["outcome"] not in REVIEWED + ("already sent earlier", "skipped") or "CHECK" in str(row.get("detail", ""))
+    return row["outcome"] not in REVIEWED + EARLIER + ("skipped",) or "CHECK" in str(row.get("detail", ""))
 
 
 def workload_line(rows: list) -> str:

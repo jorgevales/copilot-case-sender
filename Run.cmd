@@ -1,12 +1,15 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
-title Daily review - System 1 + System 2 + Copilot
-rem Double-click = the daily review (Part 1 System 1 documents + Part 2 System 2 snapshots + Part 3 Copilot, together).
+title Daily review - System 1 + System 2 + Copilot or Azure
+rem Double-click = the daily review (Part 1 System 1 documents + Part 2 System 2 snapshots + Part 3 Copilot - or the
+rem Azure reviewer when setup says reviewer = azure - together).
 rem   Run.cmd run         the daily review (same as double-click; asks for the daily CSV)
 rem   Run.cmd setup       paste/edit your paths, URLs and options (saved in sender_config.json)
-rem   Run.cmd check       validate everything without sending (add --browser to also test Edge)
+rem   Run.cmd check       validate everything without sending (add --browser to also test Edge); with the Azure
+rem                       reviewer it also checks that Azure answers
 rem   Run.cmd plan        dry run of what is in CASES_ROOT now
 rem   Run.cmd send-only   Part 3 alone: send the case folders already in CASES_ROOT (general review guidance)
+rem   Run.cmd azure-test  LAPTOP ONLY: the Azure reviewer on made-up cases + accuracy report (--case-model, --limit)
 rem Keep this folder together on S:.  The only thing asked here is where python.exe is (saved once in local_python.cmd,
 rem never committed).
 
@@ -37,6 +40,7 @@ if /i "%~1"=="setup" set "TARGET=%~dp03_copilot_sender\copilot_case_sender.py"
 if /i "%~1"=="check" set "TARGET=%~dp03_copilot_sender\copilot_case_sender.py"
 if /i "%~1"=="plan" set "TARGET=%~dp03_copilot_sender\copilot_case_sender.py"
 if /i "%~1"=="send-only" set "TARGET=%~dp03_copilot_sender\copilot_case_sender.py"
+if /i "%~1"=="azure-test" set "TARGET=%~dp0orchestrator\azure_test.py"
 "%SENDER_PY%" -B -E -s "%TARGET%" %*
 set "SENDER_EXIT=%ERRORLEVEL%"
 echo.

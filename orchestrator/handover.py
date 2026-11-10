@@ -27,9 +27,11 @@ def _special(contract) -> list:
     return [p for p in (contract if isinstance(contract, (list, tuple)) else [contract]) if p]
 
 
-def build_plan(cases: list, skipped: list, paths: P.Paths, sent: set, guidance_dir, contract) -> dict:
+def build_plan(cases: list, skipped: list, paths: P.Paths, sent: set, guidance_dir, contract,
+               reviewer: str = "copilot") -> dict:
     """What each CSV row needs this run: 'download' (Parts 1 + 2, then sent), 'send' (complete from an earlier run),
-    'done' (sent in an earlier run) or 'held' (cannot be done safely - with the reason)."""
+    'done' (sent / reviewed in an earlier run: `sent` is the ledger of THIS reviewer) or 'held' (cannot be done safely
+    - with the reason).  `reviewer` (copilot / azure) is recorded so the daily report words the outcomes for it."""
     try:
         existing = {e.name[:32].lower(): e.name for e in os.scandir(paths.cases_root)
                     if e.is_dir() and P.ID_RE.match(e.name[:32].lower())}
@@ -52,8 +54,8 @@ def build_plan(cases: list, skipped: list, paths: P.Paths, sent: set, guidance_d
     downloads = [c for c in out if c["needs"] == "download"]
     no_guidance = sorted({c["sub_worktype_csv"] for c in downloads
                           if not P.guidance_for(c["sub_worktype_csv"], guidance_dir, exclude=_special(contract))})
-    return {"run": paths.run.name, "day": P.today(), "created": P.now(), "cases": out, "skipped": skipped,
-            "parts": {"part1": bool(downloads), "part2": bool(downloads)}, "no_guidance": no_guidance}
+    return {"run": paths.run.name, "day": P.today(), "created": P.now(), "reviewer": reviewer, "cases": out,
+            "skipped": skipped, "parts": {"part1": bool(downloads), "part2": bool(downloads)}, "no_guidance": no_guidance}
 
 
 # ---------------------------------------------------------------------------------------------- the hand-over
@@ -131,10 +133,12 @@ class Handover:
         order = [snap.name] + ([m["audit"]] if m.get("audit") else []) + list(m.get("documents") or [])
         P.write_json(self.paths.cases / f"{iid}.json", {
             "iid": iid, "account": c["account"], "folder": m["folder"], "sub_worktype": m["sub_worktype"],
-            "guidance": str(guidance), "order": order, "warnings": m.get("warnings", []), "handed": P.now()})
+            "guidance": str(guidance), "order": order, "warnings": m.get("warnings", []),
+            "case_source": c.get("case_source", ""), "handed": P.now()})
         self.done.add(iid)
         self.handed.append(iid)
-        self.control.event("coordinator", f"{iid} complete ({len(order)} files) - handed to Copilot", iid=iid)
+        who = "the Azure reviewer" if self.plan.get("reviewer") == "azure" else "Copilot"
+        self.control.event("coordinator", f"{iid} complete ({len(order)} files) - handed to {who}", iid=iid)
 
 
 # ---------------------------------------------------------------------------------------------- the daily report
@@ -208,9 +212,11 @@ def pipeline_report(paths: P.Paths, plan: dict, rows: list, edge_offset=None) ->
     try:
         out = [f"# Pipeline report - run {paths.run.name}", "", "> " + P.REVIEWER_NOTE, "", PIPELINE_GUIDE, "", "## 1. Whole workload",
                f"- {P.workload_line(rows)}", "",
-               "| row | instruction ID | account | status | Sub Worktype | outcome | detail |", "|---|---|---|---|---|---|---|"]
+               f"- Part 3 reviewer: {plan.get('reviewer') or 'copilot'}", "",
+               "| row | instruction ID | account | status | Sub Worktype | case source | outcome | detail |",
+               "|---|---|---|---|---|---|---|---|"]
         out += [f"| {r['row']} | {r['instruction_id']} | {r['client_account_number']} | {r['process_status']} | {r['sub_worktype']} | "
-                f"{r['outcome']} | {str(r['detail']).replace('|', '/')} |" for r in rows]
+                f"{r.get('case_source', '')} | {r['outcome']} | {str(r['detail']).replace('|', '/')} |" for r in rows]
         if plan.get("no_guidance"):
             out += ["", "- Sub Worktypes of the CSV with no guidance file at the start: " + ", ".join(plan["no_guidance"])]
         out += ["", "## 2. Part 1 - System 1 documents, per case"]

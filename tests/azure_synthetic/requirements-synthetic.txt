@@ -3,3 +3,7 @@ pymupdf==1.26.5
 pillow==12.0.0
 numpy==2.3.4
 pytest==8.4.2
+# generate.py builds each case's Register snapshot with Part 2's own parsers, which need BeautifulSoup
+beautifulsoup4==4.13.4
+soupsieve==4.1
+typing_extensions==4.16.0

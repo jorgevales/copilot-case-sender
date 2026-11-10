@@ -11,6 +11,10 @@ An optional `bank_holidays.txt` beside `daily_review_instructions.md` adds Engla
   value wins over the CSV's.
 - No file for a Sub Worktype = those cases are **held** (never sent with the wrong instructions). The run warns
   about this at the start.
+- The same files are used by the **Azure reviewer** (setting `reviewer = azure`); it always needs the result contract.
+- Every case's message also carries its **case source** from the BAM Studio report (where the customer request came
+  in: email, post ...; `not stated` when blank). A rule that depends on it (for example "an emailed instruction needs
+  an email instruction authority on the account") belongs in the Sub Worktype file: the code applies none.
 
 Your real instruction files are private: keep them in the folder you chose as `guidance_dir` in `Run.cmd setup`
 (on S:). The result contract and the daily instructions may sit there too: they are never taken for a Sub Worktype's

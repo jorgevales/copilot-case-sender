@@ -4,8 +4,9 @@
   1. Asks for the daily CSV, lists the rows that are skipped (Process Status other than Ended) and plans the run.
   2. Opens the systems Edge (System 1 + System 2, port systems_cdp_port, its own remembered profile).
   3. Starts Part 1 (System 1 documents) and Part 2 (System 2 snapshots) as background programs - they wait for go.
-  4. Starts Part 3 (the Copilot sender) in this console: moving-cursor question, Copilot Edge, model choice, then
-     "sign in everywhere and press Enter" - every part checks its own sign-in, then everything starts together.
+  4. Starts Part 3 in this console - the Copilot sender (moving-cursor question, Copilot Edge, model choice) or, with
+     the setting reviewer = azure, the Azure reviewer (3_azure_reviewer: no Copilot Edge, no cursor or model question) -
+     then "sign in everywhere and press Enter" - every part checks its own sign-in, then everything starts together.
   5. Meanwhile hands each complete case over (snapshot copied in, folder moved from .work into CASES_ROOT), so Copilot
      works on case 1 while System 1 downloads case 2.
   6. At the end: the daily report - one line per CSV row (sent + verdict, held + why, skipped + why).
@@ -39,6 +40,7 @@ import studio_visual_cursor as VC                  # noqa: E402  only its clean-
 PART_SCRIPTS = {"part1": PROJECT / "1_system1_documents" / "system1_documents.py",
                 "part2": PROJECT / "2_system2_snapshots" / "system2_snapshots.py"}
 SENDER_SCRIPT = PROJECT / "3_copilot_sender" / "copilot_case_sender.py"
+AZURE_SCRIPT = PROJECT / "3_azure_reviewer" / "azure_case_reviewer.py"
 PART_NAMES = {"part1": "Part 1 (System 1 documents)", "part2": "Part 2 (System 2 snapshots)"}
 EDGE_SECONDS = 30                                   # the systems Edge's debugging endpoint should answer by then
 STOP_WAIT_SECONDS = 600                            # after the sender ends: how long Part 1 / Part 2 may take to finish
@@ -76,11 +78,26 @@ def pipeline_problems(cfg) -> list:
             out.append(f"System 2 account-detail page '{name}' is not a web address")
         elif "{account}" not in page:
             out.append(f"System 2 account-detail page '{name}' must contain {{account}} where the account number goes")
-    if cfg.completion_mode == "json_result" and not cfg.result_contract_path:
-        out.append("the result contract file is not set")
-    if int(cfg.systems_cdp_port) == int(cfg.cdp_port):
+    azure = reviewer_of(cfg) == "azure"
+    if (cfg.completion_mode == "json_result" or azure) and not cfg.result_contract_path:
+        out.append("the result contract file is not set" + (" (the Azure reviewer always needs it)" if azure else ""))
+    if azure and not AZURE_SCRIPT.is_file():
+        out.append("reviewer is 'azure' but 3_azure_reviewer\\azure_case_reviewer.py is missing from this folder")
+    if not azure and int(cfg.systems_cdp_port) == int(cfg.cdp_port):   # no Copilot Edge with the Azure reviewer
         out.append("systems_cdp_port must differ from cdp_port (System 1/2 and Copilot run in two separate Edges)")
     return out
+
+
+def reviewer_of(cfg) -> str:
+    """Part 3 of this run: 'copilot' (the sender, default) or 'azure' (the Azure reviewer)."""
+    who = str(getattr(cfg, "reviewer", "") or "copilot").strip().lower()
+    return who if who in P.REVIEWERS else "copilot"
+
+
+def ledger_path(cfg, rt) -> Path:
+    """The 'already done' list of this reviewer: Copilot's sent_instructions.txt, or the Azure reviewer's own list
+    (RUNTIME_ROOT\\azure_reviewed_instructions.txt) - a case sent to Copilot can still be reviewed by Azure."""
+    return rt.root / P.AZURE_LEDGER if reviewer_of(cfg) == "azure" else rt.ledger
 
 
 def ask_csv(cfg) -> Path:
@@ -212,9 +229,11 @@ def sweep_pointer(cfg, procs: dict, control: P.Control) -> str:
     return line
 
 
-def run_sender(paths: P.Paths, detail) -> int:
-    """Part 3 in THIS console (its questions and the Enter).  Ctrl+C belongs to it: the first press stops it safely."""
-    cmd = [sys.executable, "-B", "-E", "-s", str(SENDER_SCRIPT), "run", "--pipeline", str(paths.run)]
+def run_sender(paths: P.Paths, detail, reviewer: str = "copilot") -> int:
+    """Part 3 in THIS console (its questions and the Enter): the Copilot sender, or the Azure reviewer.  Ctrl+C belongs
+    to it: the first press stops it safely."""
+    script = AZURE_SCRIPT if reviewer == "azure" else SENDER_SCRIPT
+    cmd = [sys.executable, "-B", "-E", "-s", str(script), "run", "--pipeline", str(paths.run)]
     proc = subprocess.Popen(cmd + (["--detail", detail] if detail else []))
     while True:
         try:
@@ -229,7 +248,7 @@ def main(argv=None) -> int:
             stream.reconfigure(errors="replace")
         except Exception:
             pass
-    ap = argparse.ArgumentParser(description="Daily review: System 1 documents + System 2 snapshots + Copilot, together.")
+    ap = argparse.ArgumentParser(description="Daily review: System 1 documents + System 2 snapshots + Copilot (or Azure), together.")
     ap.add_argument("command", nargs="?", choices=["run"], help="(the default)")
     ap.add_argument("--detail", choices=("minimal", "full"), help="console detail for this run")
     ap.add_argument("--csv", help="the daily CSV (else asked)")
@@ -246,9 +265,10 @@ def main(argv=None) -> int:
             return 2
         ctx = sender.context(cfg)                   # validates paths, storage rules (nothing on the system drive)
         sender.ensure_dependencies(cfg, ctx.rt, ctx.log)
-        if cfg.completion_mode == "json_result":    # before anything starts: the older results workbook is renamed
-            try:                                    # (open in Excel = wait for Enter, then try again)
-                WB.make_room(Path(cfg.cases_root))   # the workbook lives beside the case folders
+        reviewer = reviewer_of(cfg)
+        if cfg.completion_mode == "json_result" or reviewer == "azure":   # before anything starts: the older results
+            try:                                    # workbook is renamed (open in Excel = wait for Enter, then try again)
+                WB.make_room(Path(cfg.cases_root), name=WB.name_for(reviewer))   # beside the case folders
             except RuntimeError as exc:
                 raise sender.SenderError(str(exc)) from None
         csv_path = Path(sender.clean_path(args.csv)) if args.csv else ask_csv(cfg)
@@ -263,10 +283,10 @@ def main(argv=None) -> int:
         print_skipped(skipped)
         if cases and not any(c["end_date"] for c in cases):
             print("NOTE: no End Date in this CSV - every case is sent with case timing 'Not provided' (flagged CHECK).\n")
-        sent = set(sender.Ledger(ctx.rt.ledger, cfg.persist_retries).read())
+        sent = set(sender.Ledger(ledger_path(cfg, ctx.rt), cfg.persist_retries).read())
         paths = P.Paths.new_run(cfg.runtime_root, cfg.cases_root).create()
         special = [cfg.result_contract_path, cfg.daily_instructions_path]     # never taken for a Sub Worktype's file
-        plan = H.build_plan(cases, skipped, paths, sent, cfg.guidance_dir, special)
+        plan = H.build_plan(cases, skipped, paths, sent, cfg.guidance_dir, special, reviewer=reviewer)
         P.write_json(paths.plan, plan)
         print_plan(plan)
         control = P.Control(paths)
@@ -300,10 +320,11 @@ def main(argv=None) -> int:
                 quit_.wait(0.5)
         worker = threading.Thread(target=coordinate, daemon=True)
         worker.start()
-        print("\nStarting the Copilot sender (Part 3) ...\n", flush=True)
-        code = run_sender(paths, args.detail)
+        who = "the Azure reviewer" if reviewer == "azure" else "the Copilot sender"
+        print(f"\nStarting {who} (Part 3) ...\n", flush=True)
+        code = run_sender(paths, args.detail, reviewer)
         if code != 0 or not control.feed_closed():
-            control.stop("coordinator", f"the Copilot sender ended (code {code})")
+            control.stop("coordinator", f"{who} ended (code {code})")
         quit_.set()
         worker.join(5)
         t0 = time.monotonic()
@@ -347,7 +368,8 @@ def finish(paths: P.Paths, plan: dict, control: P.Control, code: int, edge_offse
     print(f"Full report (every CSV row): {report}")
     book = (P.read_json(paths.sub("status") / "workbook.json", {}) or {}).get("path")
     if book:
-        print(f"Copilot review results (Excel, every valid answer of this run): {book}")
+        who = "Azure" if plan.get("reviewer") == "azure" else "Copilot"
+        print(f"{who} review results (Excel, every valid answer of this run): {book}")
     detail = H.pipeline_report(paths, plan, rows, edge_offset)
     if detail:
         print(f"What System 1 / System 2 saw (for review): {detail}")

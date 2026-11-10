@@ -1,0 +1,3157 @@
+{
+ "version": 1,
+ "note": "Fields of the CCLA static-detail forms a reviewer compares with Register. id/label/section/page/kind/key are for the reviewer; widget/widget_index/rect (PDF points, page origin top-left) are for the synthetic test generator.",
+ "forms": {
+  "change-address-form": {
+   "title": "Change of address form",
+   "match": [
+    "Change of address form",
+    "Use this form to change the address"
+   ],
+   "pages": 4,
+   "fields": [
+    {
+     "id": "account_name",
+     "label": "Account name",
+     "section": "Section 1 About your organisation",
+     "page": 1,
+     "widget": "Text Field 1.1",
+     "rect": [
+      42.5,
+      420.6,
+      552.8,
+      454.7
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "account_number_1",
+     "label": "Account number(s) to which this change applies (1)",
+     "section": "Section 1 About your organisation",
+     "page": 1,
+     "widget": "Text Field 1.2",
+     "rect": [
+      42.5,
+      471.7,
+      292.0,
+      491.5
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "account_number_2",
+     "label": "Account number(s) to which this change applies (2)",
+     "section": "Section 1 About your organisation",
+     "page": 1,
+     "widget": "Text Field 1.3",
+     "rect": [
+      303.3,
+      471.7,
+      552.8,
+      491.5
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "old_address",
+     "label": "Old address",
+     "section": "Section 1 About your organisation",
+     "page": 1,
+     "widget": "Text Field 1.8",
+     "rect": [
+      42.5,
+      558.0,
+      552.8,
+      626.0
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "old_postcode",
+     "label": "Old address - Postcode",
+     "section": "Section 1 About your organisation",
+     "page": 1,
+     "widget": "Text Field 1.9",
+     "rect": [
+      42.5,
+      643.5,
+      194.2,
+      663.4
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "new_address",
+     "label": "New address",
+     "section": "Section 1 About your organisation",
+     "page": 1,
+     "widget": "Text Field 1.10",
+     "rect": [
+      42.5,
+      681.0,
+      552.8,
+      749.0
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "new_postcode",
+     "label": "New address - Postcode",
+     "section": "Section 1 About your organisation",
+     "page": 1,
+     "widget": "Text Field 1.11",
+     "rect": [
+      42.5,
+      766.0,
+      194.2,
+      785.9
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "effective_date",
+     "label": "With effect from (dd/mm/yyyy)",
+     "section": "Section 1 About your organisation",
+     "page": 1,
+     "widget": "Text Field 1.12",
+     "rect": [
+      205.5,
+      766.0,
+      357.2,
+      785.9
+     ],
+     "kind": "date",
+     "key": false
+    },
+    {
+     "id": "email",
+     "label": "Email address",
+     "section": "Section 1 About your organisation",
+     "page": 2,
+     "widget": "Text Field 1.13",
+     "rect": [
+      42.5,
+      39.6,
+      552.8,
+      59.5
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_1_title",
+     "label": "First trustee/executive director - Title",
+     "section": "Section 2 Trustees' authorisation",
+     "page": 2,
+     "widget": "Text Field 2-1",
+     "rect": [
+      75.1,
+      331.0,
+      292.0,
+      350.8
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_1_forename",
+     "label": "First trustee/executive director - Forename",
+     "section": "Section 2 Trustees' authorisation",
+     "page": 2,
+     "widget": "Text Field 2-2",
+     "rect": [
+      303.3,
+      330.9,
+      552.8,
+      350.7
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "trustee_1_surname",
+     "label": "First trustee/executive director - Surname",
+     "section": "Section 2 Trustees' authorisation",
+     "page": 2,
+     "widget": "Text Field 2-4",
+     "rect": [
+      303.3,
+      367.8,
+      552.8,
+      387.7
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "trustee_1_date_of_birth",
+     "label": "First trustee/executive director - Date of birth (dd/mm/yyyy)",
+     "section": "Section 2 Trustees' authorisation",
+     "page": 2,
+     "widget": "Text Field 2-5",
+     "rect": [
+      75.1,
+      404.8,
+      194.2,
+      424.7
+     ],
+     "kind": "date",
+     "key": true
+    },
+    {
+     "id": "trustee_1_position",
+     "label": "First trustee/executive director - Position",
+     "section": "Section 2 Trustees' authorisation",
+     "page": 2,
+     "widget": "Text Field 2-6",
+     "rect": [
+      205.5,
+      404.8,
+      552.8,
+      424.7
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_1_email",
+     "label": "First trustee/executive director - Email address",
+     "section": "Section 2 Trustees' authorisation",
+     "page": 2,
+     "widget": "Text Field 2-9",
+     "rect": [
+      75.1,
+      479.2,
+      552.8,
+      499.1
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_1_home_address",
+     "label": "First trustee/executive director - Home address",
+     "section": "Section 2 Trustees' authorisation",
+     "page": 2,
+     "widget": "Text Field 2-10",
+     "rect": [
+      75.1,
+      516.6,
+      552.8,
+      584.6
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_1_postcode",
+     "label": "First trustee/executive director - Postcode",
+     "section": "Section 2 Trustees' authorisation",
+     "page": 2,
+     "widget": "Text Field 2-11",
+     "rect": [
+      75.1,
+      601.7,
+      226.8,
+      621.5
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_1_signature",
+     "label": "First trustee/executive director - Signature",
+     "section": "Section 2 Trustees' authorisation",
+     "page": 2,
+     "widget": "",
+     "rect": [
+      75.1,
+      678.4,
+      325.1,
+      720.4
+     ],
+     "kind": "signature",
+     "key": true
+    },
+    {
+     "id": "trustee_1_signed_date",
+     "label": "First trustee/executive director - Date signed (dd/mm/yyyy)",
+     "section": "Section 2 Trustees' authorisation",
+     "page": 2,
+     "widget": "Text Field 2-14",
+     "rect": [
+      335.9,
+      678.2,
+      455.0,
+      698.0
+     ],
+     "kind": "date",
+     "key": false
+    },
+    {
+     "id": "trustee_2_title",
+     "label": "Second trustee/executive director - Title",
+     "section": "Section 2 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 2-16",
+     "rect": [
+      75.1,
+      53.5,
+      292.0,
+      73.4
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_2_forename",
+     "label": "Second trustee/executive director - Forename",
+     "section": "Section 2 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 2-17",
+     "rect": [
+      303.3,
+      53.4,
+      552.8,
+      73.3
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "trustee_2_surname",
+     "label": "Second trustee/executive director - Surname",
+     "section": "Section 2 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 2-19",
+     "rect": [
+      303.3,
+      90.4,
+      552.8,
+      110.3
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "trustee_2_date_of_birth",
+     "label": "Second trustee/executive director - Date of birth (dd/mm/yyyy)",
+     "section": "Section 2 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 2-20",
+     "rect": [
+      75.1,
+      127.4,
+      194.2,
+      147.2
+     ],
+     "kind": "date",
+     "key": true
+    },
+    {
+     "id": "trustee_2_position",
+     "label": "Second trustee/executive director - Position",
+     "section": "Section 2 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 2-21",
+     "rect": [
+      205.5,
+      127.4,
+      552.8,
+      147.2
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_2_email",
+     "label": "Second trustee/executive director - Email address",
+     "section": "Section 2 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 2-24",
+     "rect": [
+      75.1,
+      201.8,
+      552.8,
+      221.7
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_2_home_address",
+     "label": "Second trustee/executive director - Home address",
+     "section": "Section 2 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 2-25",
+     "rect": [
+      75.1,
+      239.2,
+      552.8,
+      307.2
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_2_postcode",
+     "label": "Second trustee/executive director - Postcode",
+     "section": "Section 2 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 2-26",
+     "rect": [
+      75.1,
+      324.2,
+      226.8,
+      344.1
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_2_signature",
+     "label": "Second trustee/executive director - Signature",
+     "section": "Section 2 Trustees' authorisation",
+     "page": 3,
+     "widget": "",
+     "rect": [
+      75.1,
+      401.0,
+      325.1,
+      443.0
+     ],
+     "kind": "signature",
+     "key": true
+    },
+    {
+     "id": "trustee_2_signed_date",
+     "label": "Second trustee/executive director - Date signed (dd/mm/yyyy)",
+     "section": "Section 2 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 2-29",
+     "rect": [
+      335.9,
+      400.8,
+      455.0,
+      420.6
+     ],
+     "kind": "date",
+     "key": false
+    }
+   ]
+  },
+  "email-instruction-authority-form": {
+   "title": "Email instructions authority form",
+   "match": [
+    "Email instructions authority form",
+    "Authority to accept email instructions"
+   ],
+   "pages": 2,
+   "fields": [
+    {
+     "id": "client_name",
+     "label": "Client name",
+     "section": "Authority to accept email instructions",
+     "page": 1,
+     "widget": "Text Field 1",
+     "rect": [
+      42.5,
+      404.4,
+      552.8,
+      438.4
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "client_id_numbers",
+     "label": "Client ID number(s)",
+     "section": "Authority to accept email instructions",
+     "page": 1,
+     "widget": "Text Field 2",
+     "rect": [
+      42.5,
+      455.9,
+      552.8,
+      475.7
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "signatory_1_signature",
+     "label": "First signatory - Signature",
+     "section": "Authorisation",
+     "page": 1,
+     "widget": "",
+     "rect": [
+      42.5,
+      621.1,
+      228.1,
+      663.1
+     ],
+     "kind": "signature",
+     "key": true
+    },
+    {
+     "id": "signatory_1_name",
+     "label": "First signatory - Print name",
+     "section": "Authorisation",
+     "page": 1,
+     "widget": "Text Field 3",
+     "rect": [
+      238.1,
+      619.7,
+      552.8,
+      639.6
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "signatory_1_phone",
+     "label": "First signatory - Daytime telephone number",
+     "section": "Authorisation",
+     "page": 1,
+     "widget": "Text Field 4",
+     "rect": [
+      238.1,
+      657.1,
+      422.4,
+      676.9
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "signatory_2_signature",
+     "label": "Second signatory - Signature",
+     "section": "Authorisation",
+     "page": 1,
+     "widget": "",
+     "rect": [
+      42.5,
+      696.8,
+      228.1,
+      738.8
+     ],
+     "kind": "signature",
+     "key": true
+    },
+    {
+     "id": "signatory_2_name",
+     "label": "Second signatory - Print name",
+     "section": "Authorisation",
+     "page": 1,
+     "widget": "Text Field 5",
+     "rect": [
+      238.1,
+      695.3,
+      552.8,
+      715.1
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "signatory_2_phone",
+     "label": "Second signatory - Daytime telephone number",
+     "section": "Authorisation",
+     "page": 1,
+     "widget": "Text Field 6",
+     "rect": [
+      238.1,
+      732.7,
+      422.4,
+      752.6
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "signed_date",
+     "label": "Date (dd/mm/yyyy)",
+     "section": "Authorisation",
+     "page": 1,
+     "widget": "Text Field 7",
+     "rect": [
+      433.7,
+      732.6,
+      552.8,
+      752.5
+     ],
+     "kind": "date",
+     "key": false
+    }
+   ]
+  },
+  "change-organisation-name": {
+   "title": "Change of organisation name form",
+   "match": [
+    "Change of organisation name",
+    "Previous client name",
+    "New client name"
+   ],
+   "pages": 4,
+   "fields": [
+    {
+     "id": "previous_client_name",
+     "label": "Previous client name",
+     "section": "Section 1",
+     "page": 1,
+     "widget": "Text Field 1-1",
+     "rect": [
+      75.1,
+      376.4,
+      552.8,
+      410.4
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "client_id_numbers",
+     "label": "Client ID number(s)",
+     "section": "Section 1",
+     "page": 1,
+     "widget": "Text Field 1-2",
+     "rect": [
+      75.1,
+      432.9,
+      552.8,
+      458.4
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "new_client_name",
+     "label": "New client name",
+     "section": "Section 1",
+     "page": 1,
+     "widget": "Text Field 1-3",
+     "rect": [
+      75.1,
+      480.9,
+      552.8,
+      514.9
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "old_charity_reference",
+     "label": "Old charity reference",
+     "section": "Section 1",
+     "page": 1,
+     "widget": "Text Field 1-4",
+     "rect": [
+      75.1,
+      563.1,
+      292.0,
+      582.9
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "new_charity_reference",
+     "label": "New charity reference",
+     "section": "Section 1",
+     "page": 1,
+     "widget": "Text Field 1-5",
+     "rect": [
+      303.3,
+      563.0,
+      552.8,
+      582.8
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "trustee_1_title",
+     "label": "First trustee/executive director - Title",
+     "section": "Section 2 Trustees' authorisation",
+     "page": 2,
+     "widget": "Text Field 2-1",
+     "rect": [
+      75.1,
+      187.5,
+      292.0,
+      207.3
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_1_forename",
+     "label": "First trustee/executive director - Forename",
+     "section": "Section 2 Trustees' authorisation",
+     "page": 2,
+     "widget": "Text Field 2-2",
+     "rect": [
+      303.3,
+      187.4,
+      552.8,
+      207.2
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "trustee_1_surname",
+     "label": "First trustee/executive director - Surname",
+     "section": "Section 2 Trustees' authorisation",
+     "page": 2,
+     "widget": "Text Field 2-4",
+     "rect": [
+      303.3,
+      224.4,
+      552.8,
+      244.2
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "trustee_1_date_of_birth",
+     "label": "First trustee/executive director - Date of birth (dd/mm/yyyy)",
+     "section": "Section 2 Trustees' authorisation",
+     "page": 2,
+     "widget": "Text Field 2-5",
+     "rect": [
+      75.1,
+      261.3,
+      194.2,
+      281.2
+     ],
+     "kind": "date",
+     "key": true
+    },
+    {
+     "id": "trustee_1_position",
+     "label": "First trustee/executive director - Position",
+     "section": "Section 2 Trustees' authorisation",
+     "page": 2,
+     "widget": "Text Field 2-6",
+     "rect": [
+      205.5,
+      261.3,
+      552.8,
+      281.2
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_1_email",
+     "label": "First trustee/executive director - Email address",
+     "section": "Section 2 Trustees' authorisation",
+     "page": 2,
+     "widget": "Text Field 2-9",
+     "rect": [
+      75.1,
+      335.8,
+      552.8,
+      355.6
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_1_home_address",
+     "label": "First trustee/executive director - Home address",
+     "section": "Section 2 Trustees' authorisation",
+     "page": 2,
+     "widget": "Text Field 2-10",
+     "rect": [
+      75.1,
+      373.1,
+      552.8,
+      441.1
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_1_postcode",
+     "label": "First trustee/executive director - Postcode",
+     "section": "Section 2 Trustees' authorisation",
+     "page": 2,
+     "widget": "Text Field 2-11",
+     "rect": [
+      75.1,
+      458.2,
+      226.8,
+      478.0
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_1_signature",
+     "label": "First trustee/executive director - Signature",
+     "section": "Section 2 Trustees' authorisation",
+     "page": 2,
+     "widget": "",
+     "rect": [
+      75.1,
+      534.9,
+      325.1,
+      576.9
+     ],
+     "kind": "signature",
+     "key": true
+    },
+    {
+     "id": "trustee_1_signed_date",
+     "label": "First trustee/executive director - Date signed (dd/mm/yyyy)",
+     "section": "Section 2 Trustees' authorisation",
+     "page": 2,
+     "widget": "Text Field 2-14",
+     "rect": [
+      335.9,
+      534.7,
+      455.0,
+      554.5
+     ],
+     "kind": "date",
+     "key": false
+    },
+    {
+     "id": "trustee_2_title",
+     "label": "Second trustee/executive director - Title",
+     "section": "Section 2 Trustees' authorisation",
+     "page": 2,
+     "widget": "Text Field 2-15",
+     "rect": [
+      75.1,
+      615.2,
+      292.0,
+      635.0
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_2_forename",
+     "label": "Second trustee/executive director - Forename",
+     "section": "Section 2 Trustees' authorisation",
+     "page": 2,
+     "widget": "Text Field 2-16",
+     "rect": [
+      303.3,
+      615.1,
+      552.8,
+      634.9
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "trustee_2_surname",
+     "label": "Second trustee/executive director - Surname",
+     "section": "Section 2 Trustees' authorisation",
+     "page": 2,
+     "widget": "Text Field 2-18",
+     "rect": [
+      303.3,
+      652.1,
+      552.8,
+      671.9
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "trustee_2_date_of_birth",
+     "label": "Second trustee/executive director - Date of birth (dd/mm/yyyy)",
+     "section": "Section 2 Trustees' authorisation",
+     "page": 2,
+     "widget": "Text Field 2-19",
+     "rect": [
+      75.1,
+      689.1,
+      194.2,
+      708.9
+     ],
+     "kind": "date",
+     "key": true
+    },
+    {
+     "id": "trustee_2_position",
+     "label": "Second trustee/executive director - Position",
+     "section": "Section 2 Trustees' authorisation",
+     "page": 2,
+     "widget": "Text Field 2-20",
+     "rect": [
+      205.5,
+      689.1,
+      552.8,
+      708.9
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_2_email",
+     "label": "Second trustee/executive director - Email address",
+     "section": "Section 2 Trustees' authorisation",
+     "page": 2,
+     "widget": "Text Field 2-23",
+     "rect": [
+      75.1,
+      763.5,
+      552.8,
+      783.3
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_2_signature",
+     "label": "Second trustee/executive director - Signature",
+     "section": "Section 2 Trustees' authorisation",
+     "page": 3,
+     "widget": "",
+     "rect": [
+      75.1,
+      201.5,
+      325.1,
+      243.5
+     ],
+     "kind": "signature",
+     "key": true
+    },
+    {
+     "id": "trustee_2_signed_date",
+     "label": "Second trustee/executive director - Date signed (dd/mm/yyyy)",
+     "section": "Section 2 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 2-28",
+     "rect": [
+      335.9,
+      201.2,
+      455.0,
+      221.1
+     ],
+     "kind": "date",
+     "key": false
+    }
+   ]
+  },
+  "change-signatory-form": {
+   "title": "Change of authorised signatories form",
+   "match": [
+    "Removal of authorised signatories",
+    "authorised signator"
+   ],
+   "pages": 6,
+   "fields": [
+    {
+     "id": "todays_date",
+     "label": "Today's date (dd/mm/yyyy)",
+     "section": "Section 1 About your organisation",
+     "page": 1,
+     "widget": "Text Field 1-1",
+     "rect": [
+      75.1,
+      428.4,
+      226.8,
+      448.2
+     ],
+     "kind": "date",
+     "key": false
+    },
+    {
+     "id": "organisation_name",
+     "label": "Your organisation's name",
+     "section": "Section 1 About your organisation",
+     "page": 1,
+     "widget": "Text Field 1-2",
+     "rect": [
+      75.1,
+      470.8,
+      552.8,
+      490.7
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "account_number_1",
+     "label": "CCLA account number(s) (1)",
+     "section": "Section 1 About your organisation",
+     "page": 1,
+     "widget": "Text Field 1-3",
+     "rect": [
+      75.1,
+      526.2,
+      308.3,
+      546.0
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "account_number_2",
+     "label": "CCLA account number(s) (2)",
+     "section": "Section 1 About your organisation",
+     "page": 1,
+     "widget": "Text Field 1-4",
+     "rect": [
+      319.6,
+      526.2,
+      552.8,
+      546.0
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "removed_1_title",
+     "label": "Signatory to remove 1 - Title",
+     "section": "Section 2 Removal of authorised signatories",
+     "page": 1,
+     "widget": "Text Field 2-1",
+     "rect": [
+      75.1,
+      664.0,
+      292.0,
+      683.9
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "removed_1_forename",
+     "label": "Signatory to remove 1 - Forename",
+     "section": "Section 2 Removal of authorised signatories",
+     "page": 1,
+     "widget": "Text Field 2-2",
+     "rect": [
+      303.3,
+      663.9,
+      552.8,
+      683.8
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "removed_1_surname",
+     "label": "Signatory to remove 1 - Surname",
+     "section": "Section 2 Removal of authorised signatories",
+     "page": 1,
+     "widget": "Text Field 2-4",
+     "rect": [
+      303.3,
+      700.9,
+      552.8,
+      720.8
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "new_signatory_1_title",
+     "label": "First new signatory - Title",
+     "section": "Section 3 Addition of authorised signatories",
+     "page": 2,
+     "widget": "Text Field 3-1",
+     "rect": [
+      75.1,
+      304.9,
+      292.0,
+      324.7
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "new_signatory_1_forename",
+     "label": "First new signatory - Forename",
+     "section": "Section 3 Addition of authorised signatories",
+     "page": 2,
+     "widget": "Text Field 3-2",
+     "rect": [
+      303.3,
+      304.8,
+      552.8,
+      324.6
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "new_signatory_1_surname",
+     "label": "First new signatory - Surname",
+     "section": "Section 3 Addition of authorised signatories",
+     "page": 2,
+     "widget": "Text Field 3-4",
+     "rect": [
+      303.3,
+      341.7,
+      552.8,
+      361.6
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "new_signatory_1_date_of_birth",
+     "label": "First new signatory - Date of birth (dd/mm/yyyy)",
+     "section": "Section 3 Addition of authorised signatories",
+     "page": 2,
+     "widget": "Text Field 3-5",
+     "rect": [
+      75.1,
+      378.7,
+      194.2,
+      398.6
+     ],
+     "kind": "date",
+     "key": true
+    },
+    {
+     "id": "new_signatory_1_position",
+     "label": "First new signatory - Position",
+     "section": "Section 3 Addition of authorised signatories",
+     "page": 2,
+     "widget": "Text Field 3-6",
+     "rect": [
+      205.5,
+      378.7,
+      552.8,
+      398.6
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "new_signatory_1_email",
+     "label": "First new signatory - Email address",
+     "section": "Section 3 Addition of authorised signatories",
+     "page": 2,
+     "widget": "Text Field 3-9",
+     "rect": [
+      75.1,
+      453.1,
+      552.8,
+      473.0
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "new_signatory_1_home_address",
+     "label": "First new signatory - Home address",
+     "section": "Section 3 Addition of authorised signatories",
+     "page": 2,
+     "widget": "Text Field 3-10",
+     "rect": [
+      75.1,
+      490.5,
+      552.8,
+      558.5
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "new_signatory_1_postcode",
+     "label": "First new signatory - Postcode",
+     "section": "Section 3 Addition of authorised signatories",
+     "page": 2,
+     "widget": "Text Field 3-11",
+     "rect": [
+      75.1,
+      575.6,
+      226.8,
+      595.4
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "new_signatory_1_signature",
+     "label": "First new signatory - Signature",
+     "section": "Section 3 Addition of authorised signatories",
+     "page": 2,
+     "widget": "",
+     "rect": [
+      75.1,
+      652.3,
+      325.1,
+      694.3
+     ],
+     "kind": "signature",
+     "key": true
+    },
+    {
+     "id": "new_signatory_1_signed_date",
+     "label": "First new signatory - Date signed (dd/mm/yyyy)",
+     "section": "Section 3 Addition of authorised signatories",
+     "page": 2,
+     "widget": "Text Field 3-14",
+     "rect": [
+      335.9,
+      652.1,
+      455.0,
+      671.9
+     ],
+     "kind": "date",
+     "key": false
+    },
+    {
+     "id": "trustee_1_title",
+     "label": "First trustee/executive director - Title",
+     "section": "Section 4 Trustees' authorisation",
+     "page": 4,
+     "widget": "Text Field 4-1",
+     "rect": [
+      75.1,
+      380.5,
+      292.0,
+      400.3
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_1_forename",
+     "label": "First trustee/executive director - Forename",
+     "section": "Section 4 Trustees' authorisation",
+     "page": 4,
+     "widget": "Text Field 4-2",
+     "rect": [
+      303.3,
+      380.4,
+      552.8,
+      400.2
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "trustee_1_surname",
+     "label": "First trustee/executive director - Surname",
+     "section": "Section 4 Trustees' authorisation",
+     "page": 4,
+     "widget": "Text Field 4-4",
+     "rect": [
+      303.3,
+      417.4,
+      552.8,
+      437.2
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "trustee_1_date_of_birth",
+     "label": "First trustee/executive director - Date of birth (dd/mm/yyyy)",
+     "section": "Section 4 Trustees' authorisation",
+     "page": 4,
+     "widget": "Text Field 4-5",
+     "rect": [
+      75.1,
+      454.3,
+      194.2,
+      474.2
+     ],
+     "kind": "date",
+     "key": true
+    },
+    {
+     "id": "trustee_1_position",
+     "label": "First trustee/executive director - Position",
+     "section": "Section 4 Trustees' authorisation",
+     "page": 4,
+     "widget": "Text Field 4-6",
+     "rect": [
+      205.5,
+      454.3,
+      552.8,
+      474.2
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_1_email",
+     "label": "First trustee/executive director - Email address",
+     "section": "Section 4 Trustees' authorisation",
+     "page": 4,
+     "widget": "Text Field 4-9",
+     "rect": [
+      75.1,
+      528.7,
+      552.8,
+      548.6
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_1_home_address",
+     "label": "First trustee/executive director - Home address",
+     "section": "Section 4 Trustees' authorisation",
+     "page": 4,
+     "widget": "Text Field 4-11",
+     "rect": [
+      75.1,
+      566.1,
+      552.8,
+      634.1
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_1_postcode",
+     "label": "First trustee/executive director - Postcode",
+     "section": "Section 4 Trustees' authorisation",
+     "page": 4,
+     "widget": "Text Field 4-12",
+     "rect": [
+      75.1,
+      651.2,
+      226.8,
+      671.0
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_1_signature",
+     "label": "First trustee/executive director - Signature",
+     "section": "Section 4 Trustees' authorisation",
+     "page": 4,
+     "widget": "",
+     "rect": [
+      75.1,
+      727.9,
+      325.1,
+      769.9
+     ],
+     "kind": "signature",
+     "key": true
+    },
+    {
+     "id": "trustee_1_signed_date",
+     "label": "First trustee/executive director - Date signed (dd/mm/yyyy)",
+     "section": "Section 4 Trustees' authorisation",
+     "page": 4,
+     "widget": "Text Field 6-7",
+     "rect": [
+      335.9,
+      727.7,
+      455.0,
+      747.5
+     ],
+     "kind": "date",
+     "key": false
+    },
+    {
+     "id": "trustee_2_title",
+     "label": "Second trustee/executive director - Title",
+     "section": "Section 4 Trustees' authorisation",
+     "page": 5,
+     "widget": "Text Field 4-17",
+     "rect": [
+      75.1,
+      53.5,
+      292.0,
+      73.4
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_2_forename",
+     "label": "Second trustee/executive director - Forename",
+     "section": "Section 4 Trustees' authorisation",
+     "page": 5,
+     "widget": "Text Field 4-18",
+     "rect": [
+      303.3,
+      53.4,
+      552.8,
+      73.3
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "trustee_2_surname",
+     "label": "Second trustee/executive director - Surname",
+     "section": "Section 4 Trustees' authorisation",
+     "page": 5,
+     "widget": "Text Field 4-20",
+     "rect": [
+      303.3,
+      90.4,
+      552.8,
+      110.3
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "trustee_2_date_of_birth",
+     "label": "Second trustee/executive director - Date of birth (dd/mm/yyyy)",
+     "section": "Section 4 Trustees' authorisation",
+     "page": 5,
+     "widget": "Text Field 4-21",
+     "rect": [
+      75.1,
+      127.4,
+      194.2,
+      147.2
+     ],
+     "kind": "date",
+     "key": true
+    },
+    {
+     "id": "trustee_2_position",
+     "label": "Second trustee/executive director - Position",
+     "section": "Section 4 Trustees' authorisation",
+     "page": 5,
+     "widget": "Text Field 4-22",
+     "rect": [
+      205.5,
+      127.4,
+      552.8,
+      147.2
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_2_email",
+     "label": "Second trustee/executive director - Email address",
+     "section": "Section 4 Trustees' authorisation",
+     "page": 5,
+     "widget": "Text Field 4-25",
+     "rect": [
+      75.1,
+      201.8,
+      552.8,
+      221.7
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_2_home_address",
+     "label": "Second trustee/executive director - Home address",
+     "section": "Section 4 Trustees' authorisation",
+     "page": 5,
+     "widget": "Text Field 4-27",
+     "rect": [
+      75.1,
+      239.2,
+      552.8,
+      307.2
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_2_postcode",
+     "label": "Second trustee/executive director - Postcode",
+     "section": "Section 4 Trustees' authorisation",
+     "page": 5,
+     "widget": "Text Field 4-28",
+     "rect": [
+      75.1,
+      324.2,
+      226.8,
+      344.1
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_2_signature",
+     "label": "Second trustee/executive director - Signature",
+     "section": "Section 4 Trustees' authorisation",
+     "page": 5,
+     "widget": "",
+     "rect": [
+      75.1,
+      401.0,
+      325.1,
+      443.0
+     ],
+     "kind": "signature",
+     "key": true
+    },
+    {
+     "id": "trustee_2_signed_date",
+     "label": "Second trustee/executive director - Date signed (dd/mm/yyyy)",
+     "section": "Section 4 Trustees' authorisation",
+     "page": 5,
+     "widget": "Text Field 4-31",
+     "rect": [
+      335.9,
+      400.8,
+      455.0,
+      420.6
+     ],
+     "kind": "date",
+     "key": false
+    }
+   ]
+  },
+  "change-correspondent-form": {
+   "title": "Change of correspondent form",
+   "match": [
+    "Change of correspondent",
+    "Address for correspondence"
+   ],
+   "pages": 5,
+   "fields": [
+    {
+     "id": "todays_date",
+     "label": "Today's date (dd/mm/yyyy)",
+     "section": "Section 1 About your organisation",
+     "page": 1,
+     "widget": "Text Field 1-1",
+     "rect": [
+      75.1,
+      386.9,
+      226.8,
+      406.7
+     ],
+     "kind": "date",
+     "key": false
+    },
+    {
+     "id": "organisation_name",
+     "label": "Your organisation's name",
+     "section": "Section 1 About your organisation",
+     "page": 1,
+     "widget": "Text Field 1-2",
+     "rect": [
+      75.1,
+      429.3,
+      552.8,
+      449.2
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "account_number_1",
+     "label": "CCLA account number(s) (1)",
+     "section": "Section 1 About your organisation",
+     "page": 1,
+     "widget": "Text Field 1-3",
+     "rect": [
+      75.1,
+      484.7,
+      308.3,
+      504.5
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "account_number_2",
+     "label": "CCLA account number(s) (2)",
+     "section": "Section 1 About your organisation",
+     "page": 1,
+     "widget": "Text Field 1-4",
+     "rect": [
+      319.6,
+      484.7,
+      552.8,
+      504.5
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "new_correspondent_title",
+     "label": "New correspondent - Title",
+     "section": "Section 2 New correspondent",
+     "page": 2,
+     "widget": "Text Field 2-4",
+     "rect": [
+      75.1,
+      39.7,
+      292.0,
+      59.6
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "new_correspondent_forename",
+     "label": "New correspondent - Forename",
+     "section": "Section 2 New correspondent",
+     "page": 2,
+     "widget": "Text Field 2-5",
+     "rect": [
+      303.3,
+      39.6,
+      552.8,
+      59.5
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "new_correspondent_surname",
+     "label": "New correspondent - Surname",
+     "section": "Section 2 New correspondent",
+     "page": 2,
+     "widget": "Text Field 2-7",
+     "rect": [
+      303.3,
+      76.6,
+      552.8,
+      96.5
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "new_correspondent_date_of_birth",
+     "label": "New correspondent - Date of birth (dd/mm/yyyy)",
+     "section": "Section 2 New correspondent",
+     "page": 2,
+     "widget": "Text Field 2-8",
+     "rect": [
+      75.1,
+      113.6,
+      194.2,
+      133.4
+     ],
+     "kind": "date",
+     "key": true
+    },
+    {
+     "id": "new_correspondent_position",
+     "label": "New correspondent - Position",
+     "section": "Section 2 New correspondent",
+     "page": 2,
+     "widget": "Text Field 2-9",
+     "rect": [
+      205.5,
+      113.6,
+      552.8,
+      133.4
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "new_correspondent_mobile",
+     "label": "New correspondent - Mobile number",
+     "section": "Section 2 New correspondent",
+     "page": 2,
+     "widget": "Text Field 2-10",
+     "rect": [
+      75.1,
+      163.7,
+      292.0,
+      183.5
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "new_correspondent_email",
+     "label": "New correspondent - Email address",
+     "section": "Section 2 New correspondent",
+     "page": 2,
+     "widget": "Text Field 2-12",
+     "rect": [
+      75.1,
+      201.0,
+      552.8,
+      220.9
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "new_correspondent_home_address",
+     "label": "New correspondent - Home address",
+     "section": "Section 2 New correspondent",
+     "page": 2,
+     "widget": "Text Field 2-13",
+     "rect": [
+      75.1,
+      238.4,
+      552.8,
+      306.4
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "new_correspondent_postcode",
+     "label": "New correspondent - Postcode",
+     "section": "Section 2 New correspondent",
+     "page": 2,
+     "widget": "Text Field 2-14",
+     "rect": [
+      75.1,
+      323.4,
+      226.8,
+      343.3
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "correspondence_address",
+     "label": "Address for correspondence",
+     "section": "Section 2 New correspondent",
+     "page": 2,
+     "widget": "Text Field 2-16",
+     "rect": [
+      75.1,
+      378.9,
+      552.8,
+      446.9
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "correspondence_postcode",
+     "label": "Address for correspondence - Postcode",
+     "section": "Section 2 New correspondent",
+     "page": 2,
+     "widget": "Text Field 2-17",
+     "rect": [
+      75.1,
+      463.9,
+      226.8,
+      483.8
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "new_correspondent_signature",
+     "label": "New correspondent - Signature",
+     "section": "Section 2 New correspondent",
+     "page": 2,
+     "widget": "",
+     "rect": [
+      75.1,
+      540.7,
+      325.1,
+      582.7
+     ],
+     "kind": "signature",
+     "key": true
+    },
+    {
+     "id": "trustee_1_title",
+     "label": "First trustee/executive director - Title",
+     "section": "Section 3 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 3-1",
+     "rect": [
+      75.1,
+      53.5,
+      292.0,
+      73.4
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_1_forename",
+     "label": "First trustee/executive director - Forename",
+     "section": "Section 3 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 3-2",
+     "rect": [
+      303.3,
+      53.4,
+      552.8,
+      73.3
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "trustee_1_surname",
+     "label": "First trustee/executive director - Surname",
+     "section": "Section 3 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 3-4",
+     "rect": [
+      303.3,
+      90.4,
+      552.8,
+      110.3
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "trustee_1_date_of_birth",
+     "label": "First trustee/executive director - Date of birth (dd/mm/yyyy)",
+     "section": "Section 3 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 3-5",
+     "rect": [
+      75.1,
+      127.4,
+      194.2,
+      147.2
+     ],
+     "kind": "date",
+     "key": true
+    },
+    {
+     "id": "trustee_1_position",
+     "label": "First trustee/executive director - Position",
+     "section": "Section 3 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 3-6",
+     "rect": [
+      205.5,
+      127.4,
+      552.8,
+      147.2
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_1_email",
+     "label": "First trustee/executive director - Email address",
+     "section": "Section 3 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 3-9",
+     "rect": [
+      75.1,
+      201.8,
+      552.8,
+      221.7
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_1_home_address",
+     "label": "First trustee/executive director - Home address",
+     "section": "Section 3 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 3-10",
+     "rect": [
+      75.1,
+      239.2,
+      552.8,
+      307.2
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_1_postcode",
+     "label": "First trustee/executive director - Postcode",
+     "section": "Section 3 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 3-11",
+     "rect": [
+      75.1,
+      324.2,
+      226.8,
+      344.1
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_1_signature",
+     "label": "First trustee/executive director - Signature",
+     "section": "Section 3 Trustees' authorisation",
+     "page": 3,
+     "widget": "",
+     "rect": [
+      75.1,
+      401.0,
+      325.1,
+      443.0
+     ],
+     "kind": "signature",
+     "key": true
+    },
+    {
+     "id": "trustee_1_signed_date",
+     "label": "First trustee/executive director - Date signed (dd/mm/yyyy)",
+     "section": "Section 3 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 3-14",
+     "rect": [
+      335.9,
+      400.8,
+      455.0,
+      420.6
+     ],
+     "kind": "date",
+     "key": false
+    },
+    {
+     "id": "trustee_2_title",
+     "label": "Second trustee/executive director - Title",
+     "section": "Section 3 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 3-16",
+     "rect": [
+      75.1,
+      481.2,
+      292.0,
+      501.1
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_2_forename",
+     "label": "Second trustee/executive director - Forename",
+     "section": "Section 3 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 3-17",
+     "rect": [
+      303.3,
+      481.2,
+      552.8,
+      501.0
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "trustee_2_surname",
+     "label": "Second trustee/executive director - Surname",
+     "section": "Section 3 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 3-19",
+     "rect": [
+      303.3,
+      518.1,
+      552.8,
+      538.0
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "trustee_2_date_of_birth",
+     "label": "Second trustee/executive director - Date of birth (dd/mm/yyyy)",
+     "section": "Section 3 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 3-20",
+     "rect": [
+      75.1,
+      555.1,
+      194.2,
+      575.0
+     ],
+     "kind": "date",
+     "key": true
+    },
+    {
+     "id": "trustee_2_position",
+     "label": "Second trustee/executive director - Position",
+     "section": "Section 3 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 3-21",
+     "rect": [
+      205.5,
+      555.1,
+      552.8,
+      575.0
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_2_email",
+     "label": "Second trustee/executive director - Email address",
+     "section": "Section 3 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 3-24",
+     "rect": [
+      75.1,
+      629.5,
+      552.8,
+      649.4
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_2_home_address",
+     "label": "Second trustee/executive director - Home address",
+     "section": "Section 3 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 3-25",
+     "rect": [
+      75.1,
+      666.9,
+      552.8,
+      734.9
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_2_postcode",
+     "label": "Second trustee/executive director - Postcode",
+     "section": "Section 3 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 3-26",
+     "rect": [
+      75.1,
+      751.9,
+      226.8,
+      771.8
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_2_signature",
+     "label": "Second trustee/executive director - Signature",
+     "section": "Section 3 Trustees' authorisation",
+     "page": 4,
+     "widget": "",
+     "rect": [
+      75.1,
+      77.7,
+      325.1,
+      119.7
+     ],
+     "kind": "signature",
+     "key": true
+    },
+    {
+     "id": "trustee_2_signed_date",
+     "label": "Second trustee/executive director - Date signed (dd/mm/yyyy)",
+     "section": "Section 3 Trustees' authorisation",
+     "page": 4,
+     "widget": "Text Field 3-29",
+     "rect": [
+      335.9,
+      77.5,
+      455.0,
+      97.3
+     ],
+     "kind": "date",
+     "key": false
+    }
+   ]
+  },
+  "coif-charities-funds-mandate-form": {
+   "title": "COIF Charity Funds mandate form",
+   "match": [
+    "Mandate form",
+    "COIF Charity Funds",
+    "About your charity"
+   ],
+   "pages": 19,
+   "fields": [
+    {
+     "id": "todays_date",
+     "label": "Today's date (dd/mm/yyyy)",
+     "section": "Section 1 About your charity",
+     "page": 1,
+     "widget": "Text Field 1-1",
+     "rect": [
+      75.1,
+      475.4,
+      226.8,
+      495.2
+     ],
+     "kind": "date",
+     "key": false
+    },
+    {
+     "id": "charity_name",
+     "label": "Charity name",
+     "section": "Section 1 About your charity",
+     "page": 1,
+     "widget": "Text Field 1-2",
+     "rect": [
+      75.1,
+      517.8,
+      552.8,
+      537.7
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "account_number_1",
+     "label": "CCLA account numbers to which this mandate form applies (1)",
+     "section": "Section 1 About your charity",
+     "page": 1,
+     "widget": "Text Field 1-5",
+     "rect": [
+      92.8,
+      626.7,
+      308.1,
+      646.0
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "account_number_2",
+     "label": "CCLA account numbers to which this mandate form applies (2)",
+     "section": "Section 1 About your charity",
+     "page": 1,
+     "widget": "Text Field 1-6",
+     "rect": [
+      337.2,
+      626.7,
+      552.5,
+      646.0
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "charity_registration_number",
+     "label": "Charity's registration number",
+     "section": "Section 1 About your charity",
+     "page": 2,
+     "widget": "Text Field 1-14",
+     "rect": [
+      75.1,
+      40.9,
+      226.8,
+      60.7
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "office_address",
+     "label": "Charity's office address",
+     "section": "Section 1 About your charity",
+     "page": 2,
+     "widget": "Text Field 1-17",
+     "rect": [
+      75.1,
+      259.4,
+      552.8,
+      327.5
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "office_postcode",
+     "label": "Charity's office address - Postcode",
+     "section": "Section 1 About your charity",
+     "page": 2,
+     "widget": "Text Field 1-18",
+     "rect": [
+      75.1,
+      345.0,
+      226.8,
+      364.8
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "general_email",
+     "label": "General email address",
+     "section": "Section 1 About your charity",
+     "page": 2,
+     "widget": "Text Field 1-19",
+     "rect": [
+      75.1,
+      382.4,
+      552.8,
+      402.2
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "daytime_phone",
+     "label": "Daytime telephone number",
+     "section": "Section 1 About your charity",
+     "page": 2,
+     "widget": "Text Field 1-20",
+     "rect": [
+      75.1,
+      419.7,
+      292.0,
+      439.6
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_1_name",
+     "label": "Trustee/executive director 1 - Name",
+     "section": "Section 2 Trustees",
+     "page": 5,
+     "widget": "Text Field 2-26",
+     "rect": [
+      75.1,
+      53.9,
+      552.8,
+      73.7
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "trustee_1_date_of_birth",
+     "label": "Trustee/executive director 1 - Date of birth (dd/mm/yyyy)",
+     "section": "Section 2 Trustees",
+     "page": 5,
+     "widget": "Text Field 2-27",
+     "rect": [
+      75.1,
+      91.2,
+      194.2,
+      111.1
+     ],
+     "kind": "date",
+     "key": false
+    },
+    {
+     "id": "trustee_1_position",
+     "label": "Trustee/executive director 1 - Position",
+     "section": "Section 2 Trustees",
+     "page": 5,
+     "widget": "Text Field 2-28",
+     "rect": [
+      205.5,
+      91.2,
+      552.8,
+      111.1
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_2_name",
+     "label": "Trustee/executive director 2 - Name",
+     "section": "Section 2 Trustees",
+     "page": 5,
+     "widget": "Text Field 2-31",
+     "rect": [
+      75.1,
+      272.1,
+      552.8,
+      292.0
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "trustee_2_date_of_birth",
+     "label": "Trustee/executive director 2 - Date of birth (dd/mm/yyyy)",
+     "section": "Section 2 Trustees",
+     "page": 5,
+     "widget": "Text Field 2-32",
+     "rect": [
+      75.1,
+      309.5,
+      194.2,
+      329.3
+     ],
+     "kind": "date",
+     "key": false
+    },
+    {
+     "id": "trustee_2_position",
+     "label": "Trustee/executive director 2 - Position",
+     "section": "Section 2 Trustees",
+     "page": 5,
+     "widget": "Text Field 2-33",
+     "rect": [
+      205.5,
+      309.5,
+      552.8,
+      329.3
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "bank_name",
+     "label": "Bank/building society name",
+     "section": "Section 5 Nominated bank details",
+     "page": 9,
+     "widget": "Text Field 5-2",
+     "rect": [
+      75.1,
+      325.6,
+      552.8,
+      345.4
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "bank_account_name",
+     "label": "Bank account name",
+     "section": "Section 5 Nominated bank details",
+     "page": 9,
+     "widget": "Text Field 5-3",
+     "rect": [
+      75.1,
+      362.9,
+      552.8,
+      382.7
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "bank_sort_code",
+     "label": "Sort code",
+     "section": "Section 5 Nominated bank details",
+     "page": 9,
+     "widget": "Text Field 5-4",
+     "rect": [
+      75.1,
+      402.5,
+      292.0,
+      422.3
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "bank_account_number",
+     "label": "Bank account number",
+     "section": "Section 5 Nominated bank details",
+     "page": 9,
+     "widget": "Text Field 5-5",
+     "rect": [
+      303.3,
+      402.4,
+      552.8,
+      422.2
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "correspondent_title",
+     "label": "Correspondent - Title",
+     "section": "Section 6 Correspondent",
+     "page": 9,
+     "widget": "Text Field 6-1",
+     "rect": [
+      75.1,
+      576.8,
+      292.0,
+      596.6
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "correspondent_forename",
+     "label": "Correspondent - Forename",
+     "section": "Section 6 Correspondent",
+     "page": 9,
+     "widget": "Text Field 6-2",
+     "rect": [
+      303.3,
+      576.7,
+      552.8,
+      596.6
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "correspondent_surname",
+     "label": "Correspondent - Surname",
+     "section": "Section 6 Correspondent",
+     "page": 9,
+     "widget": "Text Field 6-4",
+     "rect": [
+      303.3,
+      613.7,
+      552.8,
+      633.5
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "correspondent_email",
+     "label": "Correspondent - Email address",
+     "section": "Section 6 Correspondent",
+     "page": 9,
+     "widget": "Text Field 6-9",
+     "rect": [
+      75.1,
+      738.1,
+      552.8,
+      757.9
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "correspondent_signature",
+     "label": "Correspondent - Signature",
+     "section": "Section 6 Correspondent",
+     "page": 10,
+     "widget": "",
+     "rect": [
+      75.1,
+      236.6,
+      325.1,
+      278.6
+     ],
+     "kind": "signature",
+     "key": true
+    },
+    {
+     "id": "signatory_1_title",
+     "label": "Authorised signatory 1 - Title",
+     "section": "Section 7 Authorised signatories",
+     "page": 10,
+     "widget": "Text Field 7-1",
+     "rect": [
+      75.1,
+      377.8,
+      292.0,
+      397.7
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "signatory_1_forename",
+     "label": "Authorised signatory 1 - Forename",
+     "section": "Section 7 Authorised signatories",
+     "page": 10,
+     "widget": "Text Field 7-2",
+     "rect": [
+      303.3,
+      377.7,
+      552.8,
+      397.6
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "signatory_1_surname",
+     "label": "Authorised signatory 1 - Surname",
+     "section": "Section 7 Authorised signatories",
+     "page": 10,
+     "widget": "Text Field 7-4",
+     "rect": [
+      303.3,
+      414.7,
+      552.8,
+      434.6
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "signatory_1_date_of_birth",
+     "label": "Authorised signatory 1 - Date of birth (dd/mm/yyyy)",
+     "section": "Section 7 Authorised signatories",
+     "page": 10,
+     "widget": "Text Field 7-5",
+     "rect": [
+      75.1,
+      451.7,
+      194.2,
+      471.5
+     ],
+     "kind": "date",
+     "key": false
+    },
+    {
+     "id": "signatory_1_signature",
+     "label": "Authorised signatory 1 - Signature",
+     "section": "Section 7 Authorised signatories",
+     "page": 10,
+     "widget": "",
+     "rect": [
+      75.1,
+      738.3,
+      325.1,
+      780.3
+     ],
+     "kind": "signature",
+     "key": true
+    },
+    {
+     "id": "signatory_2_title",
+     "label": "Authorised signatory 2 - Title",
+     "section": "Section 7 Authorised signatories",
+     "page": 11,
+     "widget": "Text Field 7-16",
+     "rect": [
+      75.1,
+      53.5,
+      292.0,
+      73.4
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "signatory_2_forename",
+     "label": "Authorised signatory 2 - Forename",
+     "section": "Section 7 Authorised signatories",
+     "page": 11,
+     "widget": "Text Field 7-17",
+     "rect": [
+      303.3,
+      53.4,
+      552.8,
+      73.3
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "signatory_2_surname",
+     "label": "Authorised signatory 2 - Surname",
+     "section": "Section 7 Authorised signatories",
+     "page": 11,
+     "widget": "Text Field 7-19",
+     "rect": [
+      303.3,
+      90.4,
+      552.8,
+      110.3
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "signatory_2_date_of_birth",
+     "label": "Authorised signatory 2 - Date of birth (dd/mm/yyyy)",
+     "section": "Section 7 Authorised signatories",
+     "page": 11,
+     "widget": "Text Field 7-20",
+     "rect": [
+      75.1,
+      127.4,
+      194.2,
+      147.2
+     ],
+     "kind": "date",
+     "key": false
+    },
+    {
+     "id": "signatory_2_signature",
+     "label": "Authorised signatory 2 - Signature",
+     "section": "Section 7 Authorised signatories",
+     "page": 11,
+     "widget": "",
+     "rect": [
+      75.1,
+      414.0,
+      325.1,
+      456.0
+     ],
+     "kind": "signature",
+     "key": true
+    },
+    {
+     "id": "trustee_declaration_1_name",
+     "label": "Trustee declaration 1 - Name",
+     "section": "Section 10 Trustees' declaration",
+     "page": 17,
+     "widget": "Text Field 10-1",
+     "rect": [
+      42.5,
+      51.4,
+      552.8,
+      71.2
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "trustee_declaration_1_signature",
+     "label": "Trustee declaration 1 - Signature",
+     "section": "Section 10 Trustees' declaration",
+     "page": 17,
+     "widget": "",
+     "rect": [
+      42.5,
+      164.2,
+      292.5,
+      206.2
+     ],
+     "kind": "signature",
+     "key": true
+    },
+    {
+     "id": "trustee_declaration_1_date",
+     "label": "Trustee declaration 1 - Date (dd/mm/yyyy)",
+     "section": "Section 10 Trustees' declaration",
+     "page": 17,
+     "widget": "Text Field 10-5",
+     "rect": [
+      303.3,
+      162.6,
+      422.4,
+      182.4
+     ],
+     "kind": "date",
+     "key": false
+    },
+    {
+     "id": "trustee_declaration_2_name",
+     "label": "Trustee declaration 2 - Name",
+     "section": "Section 10 Trustees' declaration",
+     "page": 17,
+     "widget": "Text Field 10-6",
+     "rect": [
+      42.5,
+      243.7,
+      552.8,
+      263.5
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "trustee_declaration_2_signature",
+     "label": "Trustee declaration 2 - Signature",
+     "section": "Section 10 Trustees' declaration",
+     "page": 17,
+     "widget": "",
+     "rect": [
+      42.5,
+      356.5,
+      292.5,
+      398.5
+     ],
+     "kind": "signature",
+     "key": true
+    },
+    {
+     "id": "trustee_declaration_2_date",
+     "label": "Trustee declaration 2 - Date (dd/mm/yyyy)",
+     "section": "Section 10 Trustees' declaration",
+     "page": 17,
+     "widget": "Text Field 10-10",
+     "rect": [
+      303.3,
+      354.9,
+      422.4,
+      374.7
+     ],
+     "kind": "date",
+     "key": false
+    }
+   ]
+  },
+  "coif-charities-funds-amendment-income-and-withdrawal-payments-form": {
+   "title": "COIF Charity Funds income and withdrawal payments amendment form",
+   "match": [
+    "Income and withdrawal payments amendment form",
+    "COIF Charity Funds",
+    "Nominated bank details"
+   ],
+   "pages": 4,
+   "fields": [
+    {
+     "id": "todays_date",
+     "label": "Today's date (dd/mm/yyyy)",
+     "section": "Section 1 About your charity",
+     "page": 1,
+     "widget": "Text Field 1-1",
+     "rect": [
+      75.1,
+      445.1,
+      226.8,
+      465.0
+     ],
+     "kind": "date",
+     "key": false
+    },
+    {
+     "id": "charity_name",
+     "label": "Charity name",
+     "section": "Section 1 About your charity",
+     "page": 1,
+     "widget": "Text Field 1-2",
+     "rect": [
+      75.1,
+      487.6,
+      552.8,
+      521.6
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "account_number_1",
+     "label": "CCLA account number(s) to which this change applies (1)",
+     "section": "Section 1 About your charity",
+     "page": 1,
+     "widget": "Text Field 1-3",
+     "rect": [
+      92.8,
+      544.4,
+      308.1,
+      563.8
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "account_number_2",
+     "label": "CCLA account number(s) to which this change applies (2)",
+     "section": "Section 1 About your charity",
+     "page": 1,
+     "widget": "Text Field 1-4",
+     "rect": [
+      337.2,
+      544.4,
+      552.5,
+      563.8
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "deposit_income_add_to_balance",
+     "label": "2.1 Deposit Fund: Add income to the balance of this account(s)",
+     "section": "Section 2 Income",
+     "page": 1,
+     "widget": "Check Box 2-1",
+     "widget_index": 0,
+     "rect": [
+      75.1,
+      721.8,
+      86.5,
+      733.2
+     ],
+     "kind": "checkbox",
+     "key": false
+    },
+    {
+     "id": "deposit_income_pay_to_deposit_account",
+     "label": "2.1 Deposit Fund: Pay income to another COIF Charities Deposit Fund account",
+     "section": "Section 2 Income",
+     "page": 1,
+     "widget": "Check Box 2-1",
+     "widget_index": 1,
+     "rect": [
+      75.1,
+      750.3,
+      86.5,
+      761.7
+     ],
+     "kind": "checkbox",
+     "key": false
+    },
+    {
+     "id": "deposit_income_pay_to_bank",
+     "label": "2.1 Deposit Fund: Pay income to the nominated bank account (in Section 3)",
+     "section": "Section 2 Income",
+     "page": 2,
+     "widget": "Check Box 2-1",
+     "widget_index": 0,
+     "rect": [
+      75.1,
+      40.6,
+      86.5,
+      51.9
+     ],
+     "kind": "checkbox",
+     "key": false
+    },
+    {
+     "id": "bank_name",
+     "label": "Bank/building society name",
+     "section": "Section 3 Nominated bank details",
+     "page": 2,
+     "widget": "Text Field 3-1",
+     "rect": [
+      42.5,
+      462.4,
+      552.8,
+      482.3
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "bank_account_name",
+     "label": "Bank account name",
+     "section": "Section 3 Nominated bank details",
+     "page": 2,
+     "widget": "Text Field 3-2",
+     "rect": [
+      42.5,
+      499.8,
+      552.8,
+      519.6
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "bank_sort_code",
+     "label": "Sort code",
+     "section": "Section 3 Nominated bank details",
+     "page": 2,
+     "widget": "Text Field 3-3",
+     "rect": [
+      42.5,
+      536.6,
+      292.0,
+      556.5
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "bank_account_number",
+     "label": "Bank account number",
+     "section": "Section 3 Nominated bank details",
+     "page": 2,
+     "widget": "Text Field 3-4",
+     "rect": [
+      303.3,
+      536.6,
+      552.8,
+      556.5
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "trustee_1_title",
+     "label": "First trustee/executive director - Title",
+     "section": "Section 4 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 4-1",
+     "rect": [
+      75.1,
+      53.5,
+      292.0,
+      73.4
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_1_forename",
+     "label": "First trustee/executive director - Forename",
+     "section": "Section 4 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 4-2",
+     "rect": [
+      303.3,
+      53.4,
+      552.8,
+      73.3
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "trustee_1_surname",
+     "label": "First trustee/executive director - Surname",
+     "section": "Section 4 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 4-4",
+     "rect": [
+      303.3,
+      90.4,
+      552.8,
+      110.3
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "trustee_1_date_of_birth",
+     "label": "First trustee/executive director - Date of birth (dd/mm/yyyy)",
+     "section": "Section 4 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 4-5",
+     "rect": [
+      75.1,
+      127.4,
+      194.2,
+      147.2
+     ],
+     "kind": "date",
+     "key": true
+    },
+    {
+     "id": "trustee_1_position",
+     "label": "First trustee/executive director - Position",
+     "section": "Section 4 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 4-6",
+     "rect": [
+      205.5,
+      127.4,
+      552.8,
+      147.2
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_1_email",
+     "label": "First trustee/executive director - Email address",
+     "section": "Section 4 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 4-9",
+     "rect": [
+      75.1,
+      201.8,
+      552.8,
+      221.7
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_1_home_address",
+     "label": "First trustee/executive director - Home address",
+     "section": "Section 4 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 4-10",
+     "rect": [
+      75.1,
+      239.2,
+      552.8,
+      307.2
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_1_postcode",
+     "label": "First trustee/executive director - Postcode",
+     "section": "Section 4 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 4-11",
+     "rect": [
+      75.1,
+      324.2,
+      226.8,
+      344.1
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_1_signature",
+     "label": "First trustee/executive director - Signature",
+     "section": "Section 4 Trustees' authorisation",
+     "page": 3,
+     "widget": "",
+     "rect": [
+      75.1,
+      401.0,
+      325.1,
+      443.0
+     ],
+     "kind": "signature",
+     "key": true
+    },
+    {
+     "id": "trustee_1_signed_date",
+     "label": "First trustee/executive director - Date signed (dd/mm/yyyy)",
+     "section": "Section 4 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 4-14",
+     "rect": [
+      335.9,
+      400.8,
+      455.0,
+      420.6
+     ],
+     "kind": "date",
+     "key": false
+    },
+    {
+     "id": "trustee_2_title",
+     "label": "Second trustee/executive director - Title",
+     "section": "Section 4 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 4-16",
+     "rect": [
+      75.1,
+      481.2,
+      292.0,
+      501.1
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_2_forename",
+     "label": "Second trustee/executive director - Forename",
+     "section": "Section 4 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 4-17",
+     "rect": [
+      303.3,
+      481.2,
+      552.8,
+      501.0
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "trustee_2_surname",
+     "label": "Second trustee/executive director - Surname",
+     "section": "Section 4 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 4-19",
+     "rect": [
+      303.3,
+      518.1,
+      552.8,
+      538.0
+     ],
+     "kind": "text",
+     "key": true
+    },
+    {
+     "id": "trustee_2_date_of_birth",
+     "label": "Second trustee/executive director - Date of birth (dd/mm/yyyy)",
+     "section": "Section 4 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 4-20",
+     "rect": [
+      75.1,
+      555.1,
+      194.2,
+      575.0
+     ],
+     "kind": "date",
+     "key": true
+    },
+    {
+     "id": "trustee_2_position",
+     "label": "Second trustee/executive director - Position",
+     "section": "Section 4 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 4-21",
+     "rect": [
+      205.5,
+      555.1,
+      552.8,
+      575.0
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_2_email",
+     "label": "Second trustee/executive director - Email address",
+     "section": "Section 4 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 4-24",
+     "rect": [
+      75.1,
+      629.5,
+      552.8,
+      649.4
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_2_home_address",
+     "label": "Second trustee/executive director - Home address",
+     "section": "Section 4 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 4-25",
+     "rect": [
+      75.1,
+      666.9,
+      552.8,
+      734.9
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_2_postcode",
+     "label": "Second trustee/executive director - Postcode",
+     "section": "Section 4 Trustees' authorisation",
+     "page": 3,
+     "widget": "Text Field 4-26",
+     "rect": [
+      75.1,
+      751.9,
+      226.8,
+      771.8
+     ],
+     "kind": "text",
+     "key": false
+    },
+    {
+     "id": "trustee_2_signature",
+     "label": "Second trustee/executive director - Signature",
+     "section": "Section 4 Trustees' authorisation",
+     "page": 4,
+     "widget": "",
+     "rect": [
+      75.1,
+      77.7,
+      325.1,
+      119.7
+     ],
+     "kind": "signature",
+     "key": true
+    },
+    {
+     "id": "trustee_2_signed_date",
+     "label": "Second trustee/executive director - Date signed (dd/mm/yyyy)",
+     "section": "Section 4 Trustees' authorisation",
+     "page": 4,
+     "widget": "Text Field 4-29",
+     "rect": [
+      335.9,
+      77.5,
+      455.0,
+      97.3
+     ],
+     "kind": "date",
+     "key": false
+    }
+   ]
+  }
+ }
+}
