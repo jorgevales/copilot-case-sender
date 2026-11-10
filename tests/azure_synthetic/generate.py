@@ -67,6 +67,17 @@ def _ink_png(alpha) -> bytes:
     return buf.getvalue()
 
 
+def signer(case, field_id) -> str:
+    """Who signs in this signature box: the name written in the same block of the form."""
+    prefix = field_id[: -len("_signature")]
+    v = case["values"]
+    for key in ("_name", "_surname"):
+        if v.get(prefix + key):
+            first = v.get(prefix + "_forename", "")
+            return (first[:1] + " " + v[prefix + key]).strip() if key == "_surname" else v[prefix + key]
+    return "SIGNED"
+
+
 def _widget(page, name, index):
     found = [w for w in page.widgets() or [] if w.field_name == name]
     if index >= len(found):
@@ -87,7 +98,7 @@ def typed_form(case, fmap) -> bytes:
         if fd["kind"] == "signature":
             x0, y0, x1, y1 = fd["rect"]
             w, h = int((x1 - x0) * 3), int((y1 - y0) * 3)
-            png = _ink_png(hw.signature(fd["id"] + case["iid"], w, h, case["n"]))
+            png = _ink_png(hw.signature(signer(case, fd["id"]), w, h, case["n"]))
             page.insert_image(fitz.Rect(x0 + 2, y0 + 2, x1 - 2, y1 - 2), stream=png)
             continue
         wd = _widget(page, fd["widget"], fd.get("widget_index", 0))
@@ -132,7 +143,7 @@ def handwritten_form(case, fmap, seed) -> bytes:
             x0, y0, x1, y1 = (int(round(v * scale)) for v in fd["rect"])
             w, h = x1 - x0, y1 - y0
             if fd["kind"] == "signature":
-                ink = hw.signature(fd["id"] + case["iid"], w - 6, h - 6, seed * 100 + case["n"])
+                ink = hw.signature(signer(case, fd["id"]), w - 6, h - 6, seed * 100 + case["n"])
                 x0, y0 = x0 + 3, y0 + 3
             elif fd["kind"] == "checkbox":
                 ink = Image.new("L", (w, h), 0)
@@ -189,8 +200,8 @@ def audit_trail(case, doc_names) -> bytes:
 def email(case, attachment) -> bytes:
     text = (f"From: {case['email_from']}\r\nTo: clientservices@example.invalid\r\nDate: {case['received']} 09:10\r\n"
             f"Subject: {case['sub']} - {case['register']['name']} ({case['account']})\r\nX-Note: {BANNER}\r\n\r\n"
-            f"Dear Client Services,\r\n\r\nPlease find attached our signed {C.DOC_TITLE[case['form']].lower()} for "
-            f"account {case['account']} ({attachment}).\r\n\r\nKind regards\r\n{case['register']['name']}\r\n")
+            f"Dear Client Services,\r\n\r\nPlease find our signed instruction attached for account {case['account']} "
+            f"({attachment}).\r\n\r\nKind regards\r\n{case['register']['name']}\r\n")
     return text.encode("utf-8")
 
 
@@ -247,7 +258,7 @@ def generate(out: Path, seed: int = 7, only=None) -> dict:
                           "case_source": case["source"], "form": case["form"], "style": case["style"], "trap": case["trap"],
                           "expected": case["expected"], "files": sorted(p.name for p in folder.iterdir()),
                           "di_pages": n_pages, "fields": expected_fields(case, fmap, form_file)})
-    rows.append({"Request Id": C.iid(99), "Client Account Number": "CO400199", "Client Number": "7000199",
+    rows.append({"Request Id": C.iid(99), "Client Account Number": "CO4000199", "Client Number": "7000199",
                  "Process Status": "Voided", "Sub Worktype": C.SUB_ADDRESS, "End Date": "", "Case Source": "Post"})
     buf = io.StringIO()
     w = csv.DictWriter(buf, fieldnames=CSV_HEADER, lineterminator="\r\n")

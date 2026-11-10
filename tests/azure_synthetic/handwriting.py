@@ -163,12 +163,10 @@ def render_line(text: str, height: int, rng: np.random.Generator, writer: int, i
         region = canvas.crop((x, y, x + g.width, y + g.height))
         canvas.paste(Image.fromarray(np.maximum(np.asarray(region), np.asarray(g))), (x, y))
         x += g.width + gap
-    if illegible:
+    if illegible:                   # one wavy line through it, as when a word is crossed out
         d = ImageDraw.Draw(canvas)
-        for k in range(3):          # crossed out and written over: a reviewer cannot be sure what it says
-            pts = [(i * canvas.width / 10, canvas.height * (0.5 + 0.3 * math.sin(i * (1.3 + k) + writer + k)))
-                   for i in range(11)]
-            d.line(pts, fill=235, width=pen + k)
+        pts = [(i * canvas.width / 10, canvas.height * (0.5 + 0.18 * math.sin(i * 1.3 + writer))) for i in range(11)]
+        d.line(pts, fill=235, width=pen)
     return canvas
 
 
@@ -180,6 +178,13 @@ def render_box(value: str, box_w: int, box_h: int, rng: np.random.Generator, wri
     y = max(1, (box_h - len(lines) * int(line_h * 1.2)) // 2) if len(lines) == 1 else 3
     for ln in lines:
         img = render_line(ln, line_h, rng, writer, illegible)
+        if illegible:               # crossed out and written over with other words: handwriting, but unreadable
+            over = render_line(" ".join(reversed(ln.split())), line_h, rng, writer + 1, True)
+            both = Image.new("L", (max(img.width, over.width), img.height + line_h // 3), 0)
+            both.paste(img, (0, 0))
+            region = both.crop((0, line_h // 3, over.width, line_h // 3 + over.height))
+            both.paste(Image.fromarray(np.maximum(np.asarray(region), np.asarray(over))), (0, line_h // 3))
+            img = both
         if img.width > box_w - 8:
             img = img.resize((box_w - 8, img.height), Image.BILINEAR)
         oy = min(max(0, y - img.height // 6), max(0, box_h - img.height))
@@ -190,23 +195,25 @@ def render_box(value: str, box_w: int, box_h: int, rng: np.random.Generator, wri
 
 
 def signature(name: str, box_w: int, box_h: int, seed: int) -> Image.Image:
-    """A cursive-looking scribble (not text), deterministic per name + seed, as an ink-alpha image."""
+    """A signature as people often sign: their name written fast - slanted, letters run together, a flourish under it.
+    Real handwriting strokes (EMNIST), so a document reader sees handwriting in the box, as on a real signed form.
+    Deterministic per name + seed; ink-alpha image like render_box."""
     rng = np.random.default_rng([seed, sum(map(ord, name)), len(name)])
-    scale = 3
-    W, H = box_w * scale, box_h * scale
-    img = Image.new("L", (W, H), 0)
-    d = ImageDraw.Draw(img)
-    pen = max(3, int(H * 0.035))
-    x, mid = W * 0.08, H * 0.55
-    pts = []
-    loops = int(rng.integers(5, 9))
-    step = (W * 0.78) / loops
-    for i in range(loops):
-        amp = H * float(rng.uniform(0.15, 0.32))
-        for t in np.linspace(0, 1, 14):
-            ang = 2 * math.pi * t
-            pts.append((x + step * t + math.sin(ang) * step * 0.35, mid - amp * math.sin(ang + i) * (1 if i % 2 else 0.7)))
-        x += step
+    text = " ".join(w for w in str(name or "SIGNED").upper().split() if w)[:22] or "SIGNED"
+    h = max(10, int(box_h * 0.55))
+    line = render_line(text, h, rng, writer=int(rng.integers(0, 6)))
+    tight = Image.new("L", line.size, 0)
+    tight.paste(line, (0, 0))
+    shear = 0.35
+    slanted = tight.transform((int(tight.width + shear * tight.height), tight.height), Image.AFFINE,
+                              (1, shear, -shear * tight.height, 0, 1, 0), resample=Image.BILINEAR, fillcolor=0)
+    out = Image.new("L", (box_w, box_h), 0)
+    if slanted.width > box_w - 10:
+        slanted = slanted.resize((box_w - 10, slanted.height), Image.BILINEAR)
+    out.paste(slanted, (5, max(0, (box_h - slanted.height) // 2 - box_h // 10)))
+    d = ImageDraw.Draw(out)
+    pen = max(2, box_h // 22)
+    y = box_h * 0.78
+    pts = [(8 + t * (min(box_w - 12, slanted.width + 10) - 8), y + math.sin(t * 5 + seed) * box_h * 0.05) for t in np.linspace(0, 1, 24)]
     d.line(pts, fill=255, width=pen, joint="curve")
-    d.line([(W * 0.1, mid + H * 0.22), (W * 0.9, mid + H * float(rng.uniform(0.12, 0.25)))], fill=255, width=max(2, pen - 1))
-    return img.resize((box_w, box_h), Image.LANCZOS)
+    return out

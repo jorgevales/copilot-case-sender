@@ -36,7 +36,7 @@ def expected_two_cases():
     f = lambda field, value, hand=True, kind="text", **k: {"file": "Form.pdf", "form": "change-address-form", "field": field,
                                                           "value": value, "kind": kind, "handwritten": hand, "illegible": False, **k}
     fields = [f(f"h{i}", f"VALUE {i}") for i in range(20)] + [f("addr", "1 HIGH ST, TOWN"), f("sig", "signed", False, "signature"),
-                                                            f("acct", "400108", alternatives=["CO400108"])]
+                                                            f("acct", "4000108", alternatives=["CO4000108"])]
     return {"generator": {"seed": 7}, "di_pages": 9, "cases": [
         {"iid": "a" * 32, "n": 1, "form": "change-address-form", "trap": None, "expected": ["Correct"], "fields": fields},
         {"iid": "b" * 32, "n": 2, "form": "change-address-form", "trap": "value_mismatch", "expected": ["Incorrect"], "fields": []}]}
@@ -51,7 +51,7 @@ def result(iid, verdict, fields):
 
 def perfect_fields():
     return [(f"h{i}", f"value  {i}", 0.95) for i in range(20)] + [("addr", "1 High St\nTown", 0.9), ("sig", "Signed", 0.9),
-                                                                   ("acct", "CO400108", 0.9)]
+                                                                   ("acct", "CO4000108", 0.9)]
 
 
 def test_a_perfect_run_passes_with_strict_but_case_and_space_blind_matching():
@@ -92,7 +92,25 @@ def test_low_confidence_without_the_flag_fails_the_flagging_bar(root):
 def test_value_normalising_ignores_only_case_and_spacing():
     assert SC.norm("J.SMITH @ EXAMPLE.ORG") == SC.norm("j.smith@example.org")
     assert SC.norm("14 CHAPEL ROW\nWEST HADDON") == SC.norm("14 Chapel Row, West Haddon")
-    assert SC.norm("NN6 7AP") != SC.norm("NN6 7PA") and SC.norm("05/11/2026") != SC.norm("5/11/2026")
+
+
+@pytest.mark.parametrize("field,written,read,ok", [
+    ("new_postcode", "CH1 4HG", "CHI 4HG", True), ("new_postcode", "YO17 7EG", "Y017 7EG", True),
+    ("new_postcode", "HR8 1EE", "HR8IEE", True), ("new_postcode", "NN6 7AP", "NN6 7PA", False),
+    ("account_number_1", "CO4000106", "C04000106", True), ("client_id_numbers", "CO4000109", "C0 4000109", True),
+    ("account_number_1", "CO4000107", "CD4000107", False), ("account_number_1", "CO4000107", "C0400010", False),
+    ("daytime_phone", "01904 901010", "01904901010", True), ("trustee_2_date_of_birth", "17/11/1977", "17////1977", False),
+    ("signed_date", "05/11/2026", "5/11/2O26", True), ("bank_account_number", "43917265", "43917285", False),
+])
+def test_format_safe_normalisation_only_where_the_format_decides(field, written, read, ok):
+    kind = "date" if "date" in field else "text"
+    assert SC.right({"field": field, "kind": kind, "value": written}, read) is ok
+
+
+def test_signatures_are_signed_or_not_however_worded():
+    exp = {"field": "trustee_1_signature", "kind": "signature", "value": "signed"}
+    assert SC.right(exp, "Signed") and SC.right(exp, True)
+    assert not SC.right(exp, "possibly not signed") and not SC.right(exp, "not signed") and not SC.right(exp, "")
 
 
 # ---------------------------------------------------------------------------------------------- generate.py (laptop)
@@ -120,6 +138,36 @@ def test_generator_makes_10_cases_with_one_trap_each_kind_and_is_byte_identical(
     assert all("Correct" not in c["expected"] for c in a["cases"] if c["trap"])
     assert len({c["form"] for c in a["cases"]}) == 7
     assert sum(f["handwritten"] for c in a["cases"] for f in c["fields"]) >= 100
+    import re
+    assert all(re.fullmatch(r"[A-Z]{2}\d{7}", c["account"]) for c in a["cases"])     # CCLA: 2 letters + 7 digits
+    digits_only = [f for c in a["cases"] for f in c["fields"] if f["field"] == "account_number_1" and f["value"].isdigit()]
+    assert digits_only and all(len(f["value"]) == 7 for f in digits_only)
+
+
+def _ink(pdf, page_no, rect):
+    """Share of dark pixels inside `rect` (PDF points) of a page, as a reader would see it."""
+    import fitz
+    import numpy as np
+    page = fitz.open(pdf)[page_no]
+    pix = page.get_pixmap(dpi=100, colorspace=fitz.csGRAY, clip=fitz.Rect(rect))
+    return float((np.frombuffer(pix.samples, np.uint8) < 128).mean())
+
+
+def test_every_signature_box_and_the_illegible_field_carry_visible_handwriting(root):
+    gen = _generator()
+    exp = gen.generate(root / "s", seed=7)
+    sys.path.insert(0, str(PROJECT))
+    from shared import pipeline as P
+    maps = gen.form_maps()
+    import cases as C
+    for case, c in zip([x for x in C.CASES], exp["cases"]):
+        fmap = {f["id"]: f for f in maps[case["form"]]["fields"]}
+        pdf = root / "s" / "cases" / P.folder_name(c["iid"], c["account"]) / c["fields"][0]["file"]
+        for f in c["fields"]:
+            if f["kind"] == "signature" or f["illegible"]:
+                fd = fmap[f["field"]]
+                page = fd["page"] - 1 - sum(p < fd["page"] for p in case["drop_pages"])
+                assert _ink(pdf, page, fd["rect"]) > 0.02, (c["n"], f["field"])
 
 
 def test_generated_cases_read_back_through_the_pipeline_and_part2_checks(root):

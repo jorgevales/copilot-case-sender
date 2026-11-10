@@ -6,9 +6,15 @@ Pass bar (all three must hold; exit 0 = PASS, 1 = FAIL):
   1. No trap case comes out Correct (a trap case with no result at all also fails: nothing proves it was caught).
   2. >= 95% of the handwritten text/date fields are read right.  STRICT: the reviewer's VALUE must equal the value
      written on the form, ignoring only capitals and extra spaces (line breaks and commas between address lines count
-     as spaces; spaces next to . @ / - are ignored).  Fields the reviewer flagged as low confidence still count; the
-     score over the unflagged fields only is shown beside it.  Deliberately illegible fields are left out of the score
-     and must be flagged instead (shown on their own line).
+     as spaces; spaces next to . @ / - are ignored), after the agreed FORMAT-SAFE normalisation, applied to both sides:
+       - phone numbers: digits only;
+       - dates: dd/mm/yyyy (day and month zero-padded; O/I/L/S/B/Z read as 0/1/1/5/8/2);
+       - UK postcodes: no spaces; a letter where the pattern needs a digit (and the reverse) is read by its place
+         (inward code digit + 2 letters; the 3rd/4th outward character of AA9 / AA99 / AA9A);
+       - CCLA account numbers: 2 letters + exactly 7 digits - only then a digit in the 2-letter prefix is read as its
+         letter (C0 -> CO); a value of exactly 7 digits is the number written after a printed prefix.
+     Fields the reviewer flagged as low confidence still count; the score over the unflagged fields only is shown
+     beside it.  Deliberately illegible fields are left out of the score and must be flagged instead.
   3. Every extracted field with CONFIDENCE below 0.80 is marked LOW_CONFIDENCE (in every result file).
 Everything else (typed fields, ticks, signatures, the non-trap verdicts) is reported, not part of the bar.
 """
@@ -32,10 +38,60 @@ def norm(v) -> str:
 
 
 def norm_mark(v) -> str:
-    """Ticks and signatures: present or not, however the reviewer words it."""
+    """Ticks and signatures: present or not, however the reviewer words it ('possibly not signed' = not signed)."""
     if isinstance(v, bool):
         return "yes" if v else ""
-    return "yes" if norm(v) in TRUE_WORDS or norm(v).startswith(("signed", "ticked", "yes")) else ""
+    t = norm(v)
+    if set(re.findall(r"[a-z]+", t)) & {"not", "no", "unsigned", "unticked", "blank", "empty", "absent", "missing"}:
+        return ""
+    return "yes" if t in TRUE_WORDS or t.startswith(("signed", "ticked", "yes")) else ""
+
+
+TO_DIGIT = str.maketrans({"O": "0", "Q": "0", "D": "0", "I": "1", "L": "1", "Z": "2", "S": "5", "B": "8", "G": "6", "T": "7"})
+TO_LETTER = str.maketrans({"0": "O", "1": "I", "2": "Z", "5": "S", "8": "B", "6": "G", "7": "T"})
+
+
+def norm_date(v) -> str:
+    t = re.sub(r"\s+", "", str(v or "")).upper()
+    parts = [x.translate(TO_DIGIT) for x in re.split(r"[/.\-]+", t) if x]
+    if len(parts) == 3 and all(p.isdigit() for p in parts) and len(parts[2]) == 4 and len(parts[0]) <= 2 and len(parts[1]) <= 2:
+        return f"{int(parts[0]):02d}/{int(parts[1]):02d}/{parts[2]}"
+    return norm(v)
+
+
+def norm_postcode(v) -> str:
+    t = re.sub(r"\s+", "", str(v or "")).upper()
+    if not 5 <= len(t) <= 7:
+        return norm(v)
+    out, inward = list(t[:-3]), t[-3:]
+    inward = inward[0].translate(TO_DIGIT) + inward[1:].translate(TO_LETTER)
+    out[0] = out[0].translate(TO_LETTER)
+    if len(out) == 4:                        # AA99 / AA9A: letters, letters, digit
+        out[1], out[2] = out[1].translate(TO_LETTER), out[2].translate(TO_DIGIT)
+    elif len(out) == 3 and out[1].isalpha():  # AA9
+        out[2] = out[2].translate(TO_DIGIT)
+    return ("".join(out) + inward).casefold()
+
+
+def norm_account(v) -> str:
+    t = re.sub(r"\s+", "", str(v or "")).upper()
+    if len(t) == 9 and t[2:].isdigit():
+        return (t[:2].translate(TO_LETTER) + t[2:]).casefold()
+    return norm(v)
+
+
+def norm_field(exp: dict, v) -> str:
+    """The value as compared for this field: the format-safe normalisation for its type, else norm()."""
+    f = exp["field"]
+    if "phone" in f or "mobile" in f:
+        return re.sub(r"\D", "", str(v or ""))
+    if exp["kind"] == "date":
+        return norm_date(v)
+    if "postcode" in f:
+        return norm_postcode(v)
+    if ("account_number" in f and not f.startswith("bank_")) or "client_id" in f:
+        return norm_account(v)
+    return norm(v)
 
 
 def right(exp: dict, got) -> bool:
@@ -43,7 +99,7 @@ def right(exp: dict, got) -> bool:
         return False
     if exp["kind"] in ("checkbox", "signature"):
         return norm_mark(got) == norm_mark(exp["value"])
-    return norm(got) in {norm(exp["value"]), *map(norm, exp.get("alternatives", []))}
+    return norm_field(exp, got) in {norm_field(exp, x) for x in [exp["value"], *exp.get("alternatives", [])]}
 
 
 def load_results(folder: Path) -> dict:

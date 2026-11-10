@@ -7,13 +7,24 @@ live in their guidance folder on the VDI.
 HEAD = ("> SYNTHETIC TEST RULES - made up for testing the reviewer on fake cases. Not FNZ or CCLA procedure.\n\n")
 
 COMMON = """
+## How to read the evidence (all Sub Worktypes)
+- **Formats**: CCLA account numbers are 2 letters + exactly 7 digits (e.g. CO1234567). UK postcodes have a fixed
+  letter/digit pattern; read a handwritten 0/O or 1/I by its place in that pattern, and ignore spacing. Dates are
+  dd/mm/yyyy. Phone numbers are compared by their digits only.
+- **Identity**: a person on the form is the Register person when the printed name matches AND at least one more
+  detail written for them on the form (date of birth, phone number, email address or home address) matches that same
+  Register person. Where the form only asks for a name and a phone number (email instructions authority form), that
+  phone number is the second detail.
+- **Signatures** are checked for presence only: handwriting in the signature box counts as signed (it is not
+  compared with a specimen). An empty box is not signed.
+
 ## Checks for every case of this Sub Worktype
 - **Form complete**: the client's form is the right CCLA form and every page of it is in the case (page numbers
   "Page n of N" run without a gap). A missing page means the instruction cannot be confirmed.
 - **Account identified**: the account name and account number(s) on the form match Register (Account Summary).
 - **Signed by authorised people**: the form is signed by at least two trustees/executive directors (or authorised
-  signatories), each one named on Register as an Interested Party with Signatory = Yes; each printed name on the form
-  matches that Register person. Anyone signing who is not on Register = Not satisfied.
+  signatories), each one identified (see Identity) as a Register Interested Party with Signatory = Yes. Anyone signing
+  who is not on Register = Not satisfied.
 - **Case source**: if the case source is Email, Register must show Email Instruction Authority = Yes (Flags and
   Custom Details). Post needs no check.
 - **Readable evidence**: a value the reviewer cannot read with confidence is never treated as a match; the case is then
@@ -28,6 +39,7 @@ The client asks to change the organisation's correspondence address.
 ## Specific checks
 - **New address applied**: Register's correspondence address and postcode equal the form's NEW address and postcode
   exactly (every line and the postcode, letter by letter).
+- **Effective date**: Register's Address Effective From (Contact Details) equals the form's "With effect from" date.
 - **Old address**: the form's old address is informational only; no check.
 """,
     "Change of Signatory": HEAD + """# Change of Signatory (SYNTHETIC)
@@ -46,10 +58,11 @@ The client removes and/or adds authorised signatories.
 The client changes the organisation's name.
 """ + COMMON + """
 ## Specific checks
-- **Previous name**: the form's previous client name is the name the account had (it may already be replaced on
-  Register; that is expected).
+- **Previous name**: the form's previous client name equals Register's Previous Account Name (Flags and Custom
+  Details).
 - **New name applied**: Register's account name equals the form's NEW client name exactly.
-- **Charity reference**: Register's Charity Commission Number equals the form's new charity reference.
+- **Charity reference**: Register's Charity Commission Number (Account Details / Custom Details) equals the form's
+  new charity reference.
 """,
     "Change of Correspondent": HEAD + """# Change of Correspondent (SYNTHETIC)
 
@@ -78,10 +91,12 @@ form. Apply the checks for the form in the case.
 - **Trustees' authorisation**: Section 4 is signed by two trustees named on Register (both trustee pages present).
 
 ## Specific checks - COIF mandate form
-- Charity name, registration number (Charity Commission Number) and office address match Register.
+- Charity name, registration number (Register's Charity Commission Number) and office address and postcode
+  (Register's Office Address / Office Postcode, Contact Details) match Register.
 - Nominated bank account on Register equals Section 5 of the form.
-- The correspondent (Section 6) is on Register with Correspondent = Yes; the authorised signatories (Section 7) are on
-  Register with Signatory = Yes; names and dates of birth match.
+- The correspondent (Section 6) is on Register with Correspondent = Yes (identified by name + email address) and is
+  Register's Portal Administrator; the authorised signatories (Section 7) are on Register with Signatory = Yes; names
+  and dates of birth match.
 - The trustees' declaration (Section 10) is signed by two trustees named on Register.
 """,
 }

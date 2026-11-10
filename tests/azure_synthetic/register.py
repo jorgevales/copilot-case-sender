@@ -112,7 +112,8 @@ def party_html(p):
               + _js("AddExistingCustomerInterestedPartyEmails", "EmailContacts", "EmailEntry",
                     [{"EmailType": "Personal", "EmailAddress": p["email"]}] if p.get("email") else [])
               + _js("AddExistingCustomerInterestedPartyPhoneNumbers", "PhoneContacts", "PhoneEntry",
-                    [{"PhoneType": "Mobile", "PhoneCountry": "44", "PhoneAreaCode": "", "PhoneNumber": p["mobile"]}] if p.get("mobile") else [])
+                    [{"PhoneType": t, "PhoneCountry": "44", "PhoneAreaCode": "", "PhoneNumber": n}
+                     for t, n in (("Mobile", p.get("mobile")), ("Daytime", p.get("phone"))) if n])
               + _js("AddExistingCustomerInterestedPartyAddresses", "addressList", "AddressEntry",
                     [{"AddressType": "Home", "AddressCountry": "United Kingdom",
                       **{f"AddressLine{i + 1}": v for i, v in enumerate(lines)}, "Postcode": p.get("postcode", "")}]
@@ -173,14 +174,17 @@ def detail_pages(r):
     custom = "".join(f"<tr><td>{e(k)}</td><td>{e(v)}</td></tr>" for k, v in r["custom"].items())
     return {
         "01 Personal Details": page(
-            f"<h3>Account Details</h3><table><tr><td>Account Name</td><td>{e(n)}</td></tr><tr><td>Opened</td><td>{e(r['opened'])}</td></tr></table>"
+            f"<h3>Account Details</h3><table><tr><td>Account Name</td><td>{e(n)}</td></tr><tr><td>Opened</td><td>{e(r['opened'])}</td></tr>"
+            f"<tr><td>Charity Commission Number</td><td>{e(r['charity'])}</td></tr></table>"
             "<table><tr><th>Product</th><th>Status</th><th>Account Number</th><th>Action</th></tr>"
             f"<tr><td>{e(r['fund'])}</td><td>Open</td><td>{e(a)}</td><td><a class='btn'>Edit</a></td></tr></table>"
             "<h3>Customer Details</h3><div class='form-group'><label class='control-label'>Customer Type</label>"
             "<select><option>Individual</option><option selected>Charity</option></select></div>", a, n),
         "02 Contact Details": page(
             "<div class='panel'><div class='panel-heading'>Addresses</div><div class='panel-body'>"
-            + static("Correspondence Address", addr) + static("Correspondence Postcode", r["postcode"]) + "</div></div>"
+            + static("Correspondence Address", addr) + static("Correspondence Postcode", r["postcode"])
+            + static("Address Effective From", r["effective"])
+            + static("Office Address", addr) + static("Office Postcode", r["postcode"]) + "</div></div>"
             "<div class='panel'><div class='panel-heading'>Contact Information</div><div class='panel-body'>"
             f"<div class='form-group'><label class='control-label'>Email</label><input type='text' value='{e(r['email'])}'></div>"
             f"<div class='form-group'><label class='control-label'>Telephone</label><input type='text' value='{e(r['phone'])}'></div></div></div>"

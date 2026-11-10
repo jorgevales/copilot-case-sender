@@ -23,6 +23,14 @@ Before the Azure reviewer is used on real cases, it is tested on 10 fake cases w
   | 8 | missing page | page 3 (first trustee and signature) is not in the file | Incorrect or Inconclusive |
   | 9 | illegible key field | the new organisation name is crossed out and unreadable | Inconclusive |
 
+Account numbers follow the CCLA format: 2 letters + exactly 7 digits (CO4000101 to CO4000110). On the COIF forms,
+where "CO" is printed before the box, only the 7 digits are written. Signatures are the signer's name written fast
+and slanted with a flourish, using real handwriting strokes, so they show up as handwriting.
+
+Each clean case can be fully confirmed from its own files. Everything its rules file asks about is on the made-up
+Register: the Charity Commission Number, the previous name after a rename, the office address, the address
+effective date, and daytime phones for the email-authority signatories.
+
 Each case folder looks exactly like one Part 1 + Part 2 leave in the cases folder: the form, `Audit Trail.pdf`,
 `Email from client.eml` when the case came by email, and the Register snapshot
 `<ACCOUNT>_Complete_Account_Profile.json`. The snapshot is written by **Part 2's own code** from made-up Register
@@ -52,9 +60,16 @@ All three must hold:
    was caught.
 2. **At least 95% of the handwritten fields are read right.** The check is strict: the value must be what is written
    on the form, ignoring only capitals and extra spaces. Line breaks or commas between address lines count as spaces.
+   The agreed format-safe reading is applied to both sides:
+   - phone numbers are compared by their digits only;
+   - dates are read as dd/mm/yyyy;
+   - postcodes are compared without spaces, and a 0/O or 1/I is read by its place in the UK postcode pattern;
+   - account numbers: "C0" is read as "CO" only when exactly 7 digits follow.
    Fields the reviewer flagged as low confidence still count. The report also shows the score over the unflagged
    fields only. The deliberately unreadable field of trap 9 is not part of the score; it must be flagged instead.
 3. **Every field below 0.80 confidence is flagged** (LOW_CONFIDENCE).
+
+Signatures count as "signed" or "not signed". A reply of "possibly not signed" counts as not signed.
 
 The report also lists every field that was not right, and how each case was judged.
 

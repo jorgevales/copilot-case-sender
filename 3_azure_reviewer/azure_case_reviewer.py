@@ -78,7 +78,7 @@ def build(cfg, case_model: str | None = None, stop=None, on_wait=None) -> RV.Rev
     http = AZ.Http(auth, stop=stop, on_wait=on_wait)
     di = AZ.DocIntel(cfg.azure_docintel_endpoint, http, Path(cfg.runtime_root) / "cache" / "azure-di",
                      free=cfg.azure_docintel_tier == "free")
-    chat = AZ.Chat(cfg.azure_openai_endpoint, http)
+    chat = AZ.Chat(cfg.azure_openai_endpoint, http, getattr(cfg, "azure_openai_api_version", "") or "")
     holidays = S.holidays_of(cfg)
     ignore = [pat.lower() for pat in (cfg.ignore_names or [])]
     return RV.Reviewer(
@@ -186,6 +186,8 @@ def run_report_md(cfg, records: list, rv: RV.Reviewer, started: float, code: int
 # ---------------------------------------------------------------------------------------------- check
 
 def check_command(args) -> int:
+    """Proves the exact production calls: Document Intelligence analyze (same model + api-version) on a built-in
+    1-page PDF (costs 1 page) and each deployment with the same strict JSON schema answer format."""
     cfg = S.load_config()
     ok = True
 
@@ -210,23 +212,34 @@ def check_command(args) -> int:
     except ImportError:
         line("Python package 'requests'", False, "not installed - run Run.cmd setup")
         return 1
+    http = rv.di.http
+    mode = "key (keys typed in setup)" if http.auth.mode == "key" else "sign-in (az login, no key on disk)"
     try:
-        rv.di.http.auth.headers("di")
-        line("Azure sign-in", True, "keys set" if cfg.azure_auth == "key" else "signed in (no key on disk)")
+        http.auth.headers("di")
+        line("Azure authentication", True, mode)
     except AZ.AzureError as exc:
-        line("Azure sign-in", False, str(exc))
+        line("Azure authentication", False, f"{mode}: {exc}")
         return 1
     try:
         rv.di.info()
         line("Document Intelligence reachable", True, f"tier {cfg.azure_docintel_tier}")
+        try:
+            text = rv.di.check_analyze()
+            line("Document Intelligence analyze (prebuilt-layout, 1 test page)", "AZURE REVIEWER CHECK" in text,
+                 f"api-version {AZ.DI_API}; read: '{text[:40]}'")
+        except AZ.AzureError as exc:
+            line("Document Intelligence analyze (prebuilt-layout, 1 test page)", False, str(exc))
     except AZ.AzureError as exc:
         line("Document Intelligence reachable", False, str(exc))
-    for name in dict.fromkeys([cfg.azure_form_model, cfg.azure_review_model]):
+    for role, name in (("form model", cfg.azure_form_model), ("case model", cfg.azure_review_model)):
         try:
             reported = rv.chat.ping(name)
-            line(f"model deployment '{name}' answers", True, f"model {reported}")
+            line(f"{role} '{name}' answers in the strict JSON schema", True, f"model {reported}")
         except AZ.AzureError as exc:
-            line(f"model deployment '{name}' answers", False, str(exc))
+            line(f"{role} '{name}' answers in the strict JSON schema", False, str(exc))
+    print(f"  [info] language model address style: {rv.chat.style_used}")
+    print(f"  [info] secure connection (TLS): " + ("Windows certificate store (company proxy certificates)"
+                                                  if http.tls == "windows" else "standard"))
     print("  All checks passed." if ok else "  Fix the FAIL lines above (Run.cmd setup), then check again.")
     return 0 if ok else 1
 

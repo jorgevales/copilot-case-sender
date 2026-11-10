@@ -54,7 +54,7 @@ T1, T2 = "First trustee/executive director", "Second trustee/executive director"
 FORMS = {
     "change-address-form": {
         "title": "Change of address form",
-        "match": ["Change of address form", "Use this form to change the address"],
+        "match": ["Use this form to change the address", "of an existing authorised correspondent", "Change of address form"],
         "fields": [
             f("account_name", "Account name", "Section 1 About your organisation", 1, "Text Field 1.1", key=True),
             f("account_number_1", "Account number(s) to which this change applies (1)", "Section 1 About your organisation", 1, "Text Field 1.2", key=True),
@@ -74,7 +74,7 @@ FORMS = {
         ]},
     "email-instruction-authority-form": {
         "title": "Email instructions authority form",
-        "match": ["Email instructions authority form", "Authority to accept email instructions"],
+        "match": ["Authority to accept email instructions", "Use this form to authorise CCLA", "Email instructions authority form"],
         "fields": [
             f("client_name", "Client name", "Authority to accept email instructions", 1, "Text Field 1", key=True),
             f("client_id_numbers", "Client ID number(s)", "Authority to accept email instructions", 1, "Text Field 2", key=True),
@@ -89,8 +89,8 @@ FORMS = {
             f("signed_date", "Date (dd/mm/yyyy)", "Authorisation", 1, "Text Field 7", "date"),
         ]},
     "change-organisation-name": {
-        "title": "Change of organisation name form",
-        "match": ["Change of organisation name", "Previous client name", "New client name"],
+        "title": "Change of account name form",
+        "match": ["Previous client name", "New client name", "Change of account name form"],
         "fields": [
             f("previous_client_name", "Previous client name", "Section 1", 1, "Text Field 1-1", key=True),
             f("client_id_numbers", "Client ID number(s)", "Section 1", 1, "Text Field 1-2", key=True),
@@ -105,8 +105,8 @@ FORMS = {
                      "Text Field 2-23", None, None], 3, 0, "Text Field 2-28", 3),
         ]},
     "change-signatory-form": {
-        "title": "Change of authorised signatories form",
-        "match": ["Removal of authorised signatories", "authorised signator"],
+        "title": "Change of signatory form",
+        "match": ["Removal of authorised signatories", "Accounts must be operated by at least two authorised signatories", "Change of signatory form"],
         "fields": [
             f("todays_date", "Today's date (dd/mm/yyyy)", "Section 1 About your organisation", 1, "Text Field 1-1", "date"),
             f("organisation_name", "Your organisation's name", "Section 1 About your organisation", 1, "Text Field 1-2", key=True),
@@ -127,7 +127,7 @@ FORMS = {
         ]},
     "change-correspondent-form": {
         "title": "Change of correspondent form",
-        "match": ["Change of correspondent", "Address for correspondence"],
+        "match": ["Address for correspondence", "Change of correspondent form"],
         "fields": [
             f("todays_date", "Today's date (dd/mm/yyyy)", "Section 1 About your organisation", 1, "Text Field 1-1", "date"),
             f("organisation_name", "Your organisation's name", "Section 1 About your organisation", 1, "Text Field 1-2", key=True),
@@ -155,7 +155,7 @@ FORMS = {
         ]},
     "coif-charities-funds-mandate-form": {
         "title": "COIF Charity Funds mandate form",
-        "match": ["Mandate form", "COIF Charity Funds", "About your charity"],
+        "match": ["This mandate form will supersede any other instructions we hold", "Mandate form COIF Charity Funds"],
         "fields": [
             f("todays_date", "Today's date (dd/mm/yyyy)", "Section 1 About your charity", 1, "Text Field 1-1", "date"),
             f("charity_name", "Charity name", "Section 1 About your charity", 1, "Text Field 1-2", key=True),
@@ -205,7 +205,7 @@ FORMS = {
         ]},
     "coif-charities-funds-amendment-income-and-withdrawal-payments-form": {
         "title": "COIF Charity Funds income and withdrawal payments amendment form",
-        "match": ["Income and withdrawal payments amendment form", "COIF Charity Funds", "Nominated bank details"],
+        "match": ["Income and withdrawal payments amendment form", "Use this form to make amendments to", "Nominated bank details"],
         "fields": [
             f("todays_date", "Today's date (dd/mm/yyyy)", "Section 1 About your charity", 1, "Text Field 1-1", "date"),
             f("charity_name", "Charity name", "Section 1 About your charity", 1, "Text Field 1-2", key=True),
@@ -275,10 +275,15 @@ def build():
                 fd["rect"] = rects[fd.get("widget_index", 0)]
             fields.append({k: fd[k] for k in ("id", "label", "section", "page", "widget", "widget_index", "rect", "kind", "key")
                            if k in fd})
+        text = " ".join(" ".join(pg.get_text().split()) for pg in doc).casefold()
+        absent = [m for m in spec["match"] if " ".join(m.split()).casefold() not in text]
+        if absent:
+            raise SystemExit(f"{slug}: match phrase(s) not printed on the form: {absent}")
         forms[slug] = {"title": spec["title"], "match": spec["match"], "pages": doc.page_count, "fields": fields}
     OUT.parent.mkdir(exist_ok=True)
     OUT.write_text(json.dumps({"version": 1, "note": "Fields of the CCLA static-detail forms a reviewer compares with "
-                               "Register. id/label/section/page/kind/key are for the reviewer; widget/widget_index/rect "
+                               "Register. match = phrases printed on the form (each checked against the PDF text), "
+                               "most distinctive first; the bare title can also appear in a covering email. id/label/section/page/kind/key are for the reviewer; widget/widget_index/rect "
                                "(PDF points, page origin top-left) are for the synthetic test generator.",
                                "forms": forms}, indent=1, ensure_ascii=False) + "\n", "utf-8")
     print(f"wrote {OUT} ({sum(len(v['fields']) for v in forms.values())} fields in {len(forms)} forms)")

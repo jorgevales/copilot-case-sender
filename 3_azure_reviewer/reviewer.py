@@ -59,22 +59,53 @@ def load_forms(path: Path) -> dict:
     return forms if isinstance(forms, dict) else {}
 
 
-def detect_form(forms: dict, ev: DocEvidence, filename: str) -> str:
-    """The form this document is: most of its 'match' phrases are printed on its first pages ('' = none)."""
-    text = " " + _words(" ".join(L.text for L in ev.lines if L.page <= (min(ev.page_numbers or [1]) + 2))) + " "
-    fname = _words(Path(filename).stem)
-    best, best_score = "", 0.0
+MIN_FORM_SCORE = 2.0        # at least one identifying phrase printed on page 1
+CLEAR_LEAD = 1.5            # the winner must lead by this much, else the page count decides, else 'unknown'
+
+
+def form_scores(forms: dict, ev: DocEvidence, filename: str) -> list:
+    """[(score, page-count distance, slug)] best first.  Page 1 counts most: the form's title as a line of its own
+    6 (inside running text 2, later pages 0.5); each other 'match' phrase as a line 3, inside page 1's text 2, later pages 0.5 (a
+    form often names OTHER forms in its notes, e.g. 'use our Change of address form').  The file name is a weak hint
+    (0.5).  Text documents (emails, notes) are never forms."""
+    if ev.local or not ev.lines:
+        return []
+    first = min(ev.page_numbers or [1])
+    p1 = [_words(L.text) for L in ev.lines if L.page == first]
+    lines, p1_text = set(p1), " " + " ".join(p1) + " "
+    rest = " " + " ".join(_words(L.text) for L in ev.lines if first < L.page <= first + 2) + " "
+    fname = " " + _words(Path(filename).stem) + " "
+    out = []
     for slug, form in forms.items():
-        phrases = [p for p in (form.get("match") or []) if _words(p)]
-        if not phrases:
-            continue
-        hits = sum(1 for p in phrases if f" {_words(p)} " in text)
-        if hits < max(1, (len(phrases) + 1) // 2):
-            continue
-        score = hits / len(phrases) + (0.5 if _words(slug.replace("-", " ")) in fname else 0)
-        if score > best_score:
-            best, best_score = slug, score
-    return best
+        score = 0.0
+        title = _words(form.get("title", ""))
+        if title:
+            score += 6 if title in lines else 2 if f" {title}" in p1_text else 0.5 if f" {title}" in rest else 0
+        for p in form.get("match") or []:
+            w = _words(p)
+            if w and w != title:
+                score += 3 if w in lines else 2 if f" {w}" in p1_text else 0.5 if f" {w}" in rest else 0
+        if title and f" {title}" in fname or _words(slug.replace("-", " ")) in fname:
+            score += 0.5
+        if score >= MIN_FORM_SCORE:
+            out.append((score, abs(ev.pages - int(form.get("pages") or ev.pages)), slug))
+    return sorted(out, key=lambda t: (-t[0], t[1], t[2]))
+
+
+def detect_form(forms: dict, ev: DocEvidence, filename: str) -> tuple:
+    """(slug, note): the form this document is ('' = none).  No clear winner = '' with a CHECK note."""
+    ranked = form_scores(forms, ev, filename)
+    if not ranked:
+        return "", ""
+    if len(ranked) == 1 or ranked[0][0] - ranked[1][0] >= CLEAR_LEAD:
+        return ranked[0][2], ""
+    close = [r for r in ranked if ranked[0][0] - r[0] < CLEAR_LEAD]
+    best = min(close, key=lambda r: r[1])
+    if sum(1 for r in close if r[1] == best[1]) == 1:          # the page count settles it
+        return best[2], ""
+    names = " or ".join(forms[r[2]].get("title", r[2]) for r in close[:3])
+    return "", (f"CHECK: '{filename}' looks like a form but it is unclear which ({names}) - its fields were not "
+                "read; it was reviewed as a supporting document")
 
 
 def snapshot_retrieved(data) -> str | None:
@@ -182,8 +213,10 @@ class Reviewer:
                 if AUDIT_RE.search(path.name):
                     kind = "audit_trail"
                 else:
-                    form = detect_form(self.forms, ev, path.name)
+                    form, note = detect_form(self.forms, ev, path.name)
                     kind = "form" if form else "supporting"
+                    if note:
+                        rec["notes"].append(note)
             row = {"DOC_ID": doc_id, "FILE": path.name, "KIND": kind, "FORM": form, "PAGES": ev.pages,
                    "PAGES_READ": ev.pages}
             if form:
@@ -288,15 +321,15 @@ class Reviewer:
         if not isinstance(obj, dict):
             return ["the answer is not a JSON object"]
         out = []
-        rows = obj.get("A_B_COMPARISONS")
-        if isinstance(rows, list):
+        twin = {("COPILOT_RESULT" if k == "REVIEW_RESULT" else k): v for k, v in obj.items()}
+        for key, what in (("A_B_COMPARISONS", "comparison row"), ("RULE_CHECKS", "rule check")):
+            rows = obj.get(key)
+            if not isinstance(rows, list):
+                continue
             for i, r in enumerate(rows, 1):
                 if not isinstance(r, dict) or not isinstance(r.get("FIELD_IDS"), list):
-                    out.append(f"comparison row {i}: FIELD_IDS must be a list")
-        twin = {("COPILOT_RESULT" if k == "REVIEW_RESULT" else k): v for k, v in obj.items()}
-        if isinstance(rows, list):
-            twin["A_B_COMPARISONS"] = [{k: v for k, v in r.items() if k != "FIELD_IDS"} if isinstance(r, dict) else r
-                                       for r in rows]
+                    out.append(f"{what} {i}: FIELD_IDS must be a list")
+            twin[key] = [{k: v for k, v in r.items() if k != "FIELD_IDS"} if isinstance(r, dict) else r for r in rows]
         out += [p.replace("COPILOT_RESULT", "REVIEW_RESULT") for p in self.validate(twin, expect)]
         return out
 
@@ -313,6 +346,15 @@ class Reviewer:
                                     + "; ".join(f"{w['LABEL'] or w['FIELD']}: {w['REASON']}" for w in weak)
                                     + ") - check the document by hand. Reviewer model's reading: " + r["EXPLANATION"])
                 notes.append(f"'{r['ITEM']}' set to could not compare (low-confidence field)")
+        for r in obj["RULE_CHECKS"]:
+            r["FIELD_IDS"] = [i for i in r.get("FIELD_IDS") or [] if i in by_id]
+            weak = [by_id[i] for i in r["FIELD_IDS"] if by_id[i]["LOW_CONFIDENCE"]]
+            if weak and r["STATUS"] in ("Satisfied", "Not satisfied"):
+                r["NOTE"] = (f"Not determinable: rests on a field read with low confidence or a possibly missing "
+                             f"signature (" + "; ".join(f"{w['LABEL'] or w['FIELD']}: {w['REASON']}" for w in weak)
+                             + ") - check by eye. Reviewer model said " + r["STATUS"] + ": " + r["NOTE"])
+                r["STATUS"] = "Not determinable"
+                notes.append(f"rule check '{r['RULE']}' set to Not determinable (low-confidence field)")
         verdict = self._verdict(obj)
         if verdict == "Correct":
             used = {i for r in rows for i in r["FIELD_IDS"]}

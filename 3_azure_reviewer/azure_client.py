@@ -28,7 +28,8 @@ POLL_LIMIT = 300                          # seconds one Document Intelligence an
 
 
 class AzureError(Exception):
-    """Base: `str()` is a plain-English reason without addresses or secrets."""
+    """Base: `str()` is a plain-English reason without addresses or secrets.  `status` = Azure's HTTP status."""
+    status = 0
 
 
 class TemporaryError(AzureError):
@@ -149,6 +150,12 @@ def _azure_message(resp) -> tuple:
 
 
 def classify(status: int, code: str, message: str, what: str) -> AzureError:
+    err = _classify(status, code, message, what)
+    err.status = status
+    return err
+
+
+def _classify(status: int, code: str, message: str, what: str) -> AzureError:
     text = f"{code} {message}".lower()
     tail = f" ({code}: {message})" if code or message else ""
     if "content_filter" in text or "responsibleaipolicyviolation" in text or "content management policy" in text:
@@ -179,12 +186,27 @@ class Http:
         self.on_wait = on_wait or (lambda what, seconds: None)
         self.factory = session_factory or requests.Session
         self.local = threading.local()
+        self.tls = "standard"             # "standard" (requests' own certificates) or "windows" (Windows store)
+        self._gen, self._lock = 0, threading.Lock()
 
     def session(self):
         s = getattr(self.local, "s", None)
-        if s is None:
-            s = self.local.s = self.factory()
+        if s is None or getattr(self.local, "gen", -1) != self._gen:
+            s = self.local.s = self.factory()          # trust_env stays on: proxy from the environment / Windows
+            self.local.gen = self._gen
+            if self.tls == "windows" and hasattr(s, "mount"):
+                adapter = windows_tls_adapter(self.requests)
+                s.mount("https://", adapter)
         return s
+
+    def use_windows_certificates(self) -> bool:
+        """Behind a company proxy that inspects TLS (the VDI), Azure's certificate is re-signed by the company's own
+        authority, which only the Windows certificate store knows.  Switch once, for every later call."""
+        with self._lock:
+            if self.tls == "windows":
+                return False
+            self.tls, self._gen = "windows", self._gen + 1
+            return True
 
     def call(self, method: str, url: str, service: str, what: str, timeout: float = 120, **kw):
         headers = dict(kw.pop("headers", {}) or {})
@@ -197,6 +219,17 @@ class Http:
             try:
                 resp = self.session().request(method, url, headers={**self.auth.headers(service), **headers},
                                               timeout=timeout, **kw)
+            except self.requests.exceptions.SSLError:
+                if self.use_windows_certificates():
+                    continue                              # same call again with the Windows certificate store
+                raise SafeStop(f"{what}: the secure connection (TLS) to Azure failed, also with the Windows "
+                               "certificate store - a company proxy or firewall may be inspecting or blocking it; "
+                               "ask IT whether this Azure address is allowed from this machine") from None
+            except self.requests.exceptions.ProxyError:
+                err = TemporaryError(f"{what}: the proxy refused or failed the connection (ProxyError) - check the "
+                                     "proxy / network settings of this machine")
+            except self.requests.exceptions.ConnectionError:
+                err = TemporaryError(f"{what}: could not connect to Azure (network, proxy or firewall)")
             except self.requests.RequestException as exc:
                 err = TemporaryError(f"{what}: network problem ({type(exc).__name__})")
             else:
@@ -227,6 +260,21 @@ class Http:
             self.sleep(wait)
 
 
+def windows_tls_adapter(requests):
+    """An HTTPS adapter verifying with Python's default context = the Windows certificate store (stdlib ssl)."""
+    import ssl
+
+    class WindowsTLS(requests.adapters.HTTPAdapter):
+        def init_poolmanager(self, *a, **kw):
+            kw["ssl_context"] = ssl.create_default_context()
+            return super().init_poolmanager(*a, **kw)
+
+        def proxy_manager_for(self, *a, **kw):
+            kw["ssl_context"] = ssl.create_default_context()
+            return super().proxy_manager_for(*a, **kw)
+    return WindowsTLS()
+
+
 # ---------------------------------------------------------------------------------------------- Document Intelligence
 
 class DocIntel:
@@ -243,6 +291,13 @@ class DocIntel:
         r = self.http.call("GET", f"{self.base}/documentintelligence/info?api-version={DI_API}", "di",
                            "Document Intelligence check", timeout=30)
         return r.json()
+
+    def check_analyze(self) -> str:
+        """The production analyze call on a built-in 1-page PDF (never cached: costs 1 page) -> the text read."""
+        res = self._request(check_pdf(), "1-2" if self.free else None)
+        with self._lock:
+            self.pages_used += len((res or {}).get("pages") or [])
+        return " ".join(str((res or {}).get("content") or "").split())
 
     def analyze(self, data: bytes, paged: bool = True) -> list:
         """Every piece's analyzeResult (page numbers are the file's own).  `paged` False = one request (an image or
@@ -324,26 +379,73 @@ def _out_of_range(text: str) -> bool:
 
 # ---------------------------------------------------------------------------------------------- language model
 
-class Chat:
-    """Azure OpenAI v1 chat completions, strict JSON schema output."""
+DEFAULT_API_VERSION = "2024-10-21"        # classic Azure OpenAI (GA, supports strict JSON schema)
+SCHEMA_WORDS = ("response_format", "json_schema", "structured output", "strict")
 
-    def __init__(self, endpoint: str, http: Http):
-        base = endpoint.rstrip("/")
-        if base.endswith("/chat/completions"):
-            self.url = base
-        elif "/openai/v1" in base:
-            self.url = base + "/chat/completions"
+
+class Chat:
+    """Azure OpenAI chat completions with strict JSON schema output, in either address style:
+      v1       <endpoint>/openai/v1/chat/completions                     (model = deployment in the body)
+      classic  <endpoint>/openai/deployments/<deployment>/chat/completions?api-version=<version>
+    Classic is used when the pasted endpoint contains /openai/deployments, or by itself when v1 answers 404 (then
+    kept for the rest of the run).  Behind an API gateway (APIM) the key header stays api-key."""
+
+    def __init__(self, endpoint: str, http: Http, api_version: str = ""):
+        from urllib.parse import parse_qs, urlsplit
+        parts = urlsplit(endpoint.strip())
+        query_version = (parse_qs(parts.query).get("api-version") or [""])[0]
+        path = parts.path.rstrip("/")
+        self.api_version = api_version or query_version or DEFAULT_API_VERSION
+        if "/openai/deployments" in path:
+            self.style, path = "classic", path.split("/openai/deployments")[0]
+        elif "/openai/v1" in path:
+            self.style, path = "v1", path.split("/openai/v1")[0]
         else:
-            self.url = base + "/openai/v1/chat/completions"
+            self.style = "auto"                           # v1 first, classic if v1 answers 404
+        self.base = f"{parts.scheme}://{parts.netloc}{path}"
         self.http = http
         self.usage, self._lock = {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0}, threading.Lock()
+
+    def url(self, model: str, style: str) -> str:
+        if style == "classic":
+            return f"{self.base}/openai/deployments/{model}/chat/completions?api-version={self.api_version}"
+        return f"{self.base}/openai/v1/chat/completions"
+
+    @property
+    def style_used(self) -> str:
+        return {"auto": "v1", "v1": "v1", "classic": f"classic (api-version {self.api_version})"}[self.style]
+
+    def _post(self, model: str, body: dict, what: str):
+        style = "classic" if self.style == "classic" else "v1"
+        try:
+            return self.http.call("POST", self.url(model, style), "openai", what, json=body, timeout=600)
+        except SafeStop as exc:
+            if exc.status != 404 or self.style != "auto":
+                raise
+        try:
+            r = self.http.call("POST", self.url(model, "classic"), "openai", what, json=body, timeout=600)
+        except SafeStop as exc:
+            if exc.status == 404:
+                raise SafeStop(f"{what}: Azure says not found (404) both as a v1 and as a classic Azure OpenAI "
+                               f"address - check the language model endpoint and the deployment name '{model}' in "
+                               "setup") from None
+            raise
+        self.style = "classic"                            # remembered for the rest of the run
+        return r
 
     def complete(self, model: str, messages: list, name: str, schema: dict, what: str) -> tuple:
         """(parsed object, raw text, model name Azure reports)."""
         body = {"model": model, "messages": messages,
                 "response_format": {"type": "json_schema",
                                     "json_schema": {"name": name, "strict": True, "schema": schema}}}
-        r = self.http.call("POST", self.url, "openai", what, json=body, timeout=600)
+        try:
+            r = self._post(model, body, what)
+        except BadRequest as exc:
+            if any(w in str(exc).lower() for w in SCHEMA_WORDS):
+                raise SafeStop(f"{what}: the deployment '{model}' does not accept strict JSON schema answers "
+                               "(structured outputs) - choose a newer model version, or a newer api-version for a "
+                               f"classic endpoint ({exc})") from None
+            raise
         data = r.json()
         with self._lock:
             u = data.get("usage") or {}
@@ -354,7 +456,8 @@ class Chat:
         msg = choice.get("message") or {}
         raw = msg.get("content") or ""
         if choice.get("finish_reason") == "content_filter" or msg.get("refusal"):
-            raise Refused(f"{what}: the model refused this case ({' '.join(str(msg.get('refusal') or 'content filter').split())[:160]})")
+            why = " ".join(str(msg.get("refusal") or "content filter").split())[:160]
+            raise Refused(f"{what}: the model refused this case ({why})")
         if choice.get("finish_reason") == "length":
             raise BadAnswer(f"{what}: the answer was cut off (too long)", raw)
         try:
@@ -365,9 +468,41 @@ class Chat:
             raise BadAnswer(f"{what}: the answer is not a JSON object", raw)
         return obj, raw, data.get("model") or model
 
+    # the check uses the production answer shape: strict schema with an enum, a list of objects, true/false/null
+    CHECK_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["RESULT", "ROWS"],
+                    "properties": {"RESULT": {"type": "string", "enum": ["Correct", "Incorrect", "Inconclusive"]},
+                                   "ROWS": {"type": "array", "items": {
+                                       "type": "object", "additionalProperties": False, "required": ["ITEM", "MATCH"],
+                                       "properties": {"ITEM": {"type": "string"},
+                                                      "MATCH": {"type": ["boolean", "null"]}}}}}}
+
     def ping(self, model: str) -> str:
-        schema = {"type": "object", "properties": {"ok": {"type": "boolean"}}, "required": ["ok"],
-                  "additionalProperties": False}
-        _obj, _raw, name = self.complete(model, [{"role": "user", "content": 'Reply with {"ok":true}'}], "ping",
-                                         schema, f"model check ({model})")
+        obj, _raw, name = self.complete(
+            model, [{"role": "user", "content": "This is a connection check. Answer RESULT Inconclusive and one row: "
+                                                "ITEM 'check', MATCH null."}],
+            "connection_check", self.CHECK_SCHEMA, f"model check ({model})")
+        if obj.get("RESULT") not in ("Correct", "Incorrect", "Inconclusive") or not isinstance(obj.get("ROWS"), list):
+            raise BadAnswer(f"model check ({model}): the answer did not follow the JSON schema", json.dumps(obj))
         return name
+
+
+# ---------------------------------------------------------------------------------------------- the check document
+
+def check_pdf(text: str = "AZURE REVIEWER CHECK") -> bytes:
+    """A 1-page PDF with one line of text, written by hand (stdlib only): the check's analyze call costs 1 page."""
+    stream = f"BT /F1 24 Tf 72 720 Td ({text}) Tj ET".encode("latin-1")
+    objs = [b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> "
+            b"/Contents 5 0 R >>",
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+            b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream"]
+    out, offsets = bytearray(b"%PDF-1.4\n"), []
+    for n, body in enumerate(objs, 1):
+        offsets.append(len(out))
+        out += f"{n} 0 obj\n".encode() + body + b"\nendobj\n"
+    xref = len(out)
+    out += f"xref\n0 {len(objs) + 1}\n0000000000 65535 f \n".encode()
+    out += b"".join(f"{o:010d} 00000 n \n".encode() for o in offsets)
+    out += f"trailer\n<< /Size {len(objs) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode()
+    return bytes(out)

@@ -396,6 +396,7 @@ DEFAULTS = {
     "azure_form_model": "", "azure_review_model": "",      # deployment names (the same name twice is fine)
     "azure_docintel_tier": "free",    # "free" (2 pages per request, 500 pages a month) or "paid"
     "azure_parallel_cases": 3, "azure_low_confidence": 0.80,
+    "azure_openai_api_version": "",   # only for the classic '/openai/deployments/...' address style; "" = 2024-10-21
     "az_cli_path": "",                # optional: az.cmd for the sign-in route
 }
 SECRET_KEYS = ("azure_docintel_key", "azure_openai_key")   # shown as "set" / "not set" wherever settings are listed

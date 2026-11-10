@@ -15,7 +15,7 @@ REVIEW_KEYS = ("REVIEW_RESULT", "DISCREPANCY_TYPE", "HEADLINE", "CASE_END_DATETI
                "CLIENT_REQUEST", "JUSTIFICATION", "A_B_COMPARISONS", "RULE_CHECKS")
 ROW_KEYS = ("ITEM", "Customer_expectation", "CUSTOMER_SOURCE", "System_data", "SYSTEM_SOURCE", "MATCH", "EXPLANATION",
             "FIELD_IDS")
-RULE_KEYS = ("RULE", "STATUS", "EVIDENCE", "NOTE")
+RULE_KEYS = ("RULE", "STATUS", "EVIDENCE", "NOTE", "FIELD_IDS")
 
 FORM_SYSTEM = (
     "You transcribe one filled-in paper form. You cannot see the page: a document reader turned it into numbered "
@@ -27,8 +27,8 @@ FORM_SYSTEM = (
     "reformat; join letters written in separate boxes, e.g. 'J O H N' -> 'JOHN'). Empty text when the field is blank "
     "or you cannot find it.\n"
     "- checkbox fields: VALUE 'ticked' or 'not ticked', citing the tick box id.\n"
-    "- signature fields: VALUE 'signed' when there is handwriting in the signature space, else 'not signed'; cite the "
-    "handwritten line(s).\n"
+    "- signature fields: presence only, not legibility. VALUE 'signed' when there is ANY mark or text in the "
+    "signature space (cite those words); else 'possibly not signed' with no citations. Never 'not signed'.\n"
     "- CITATIONS: the ids of the line(s) or word(s) the VALUE was read from (prefer word ids when a line also holds "
     "the printed label). Empty list when VALUE is empty.\n"
     "Printed labels and instructions of the form are NOT values. Never invent a value that is not in the text.")
@@ -63,7 +63,8 @@ def review_schema(discrepancy_words) -> dict:
                           "FIELD_IDS": {"type": "array", "items": {"type": "string"}}}}
     rule = {"type": "object", "additionalProperties": False, "required": list(RULE_KEYS),
             "properties": {"RULE": {"type": "string"}, "STATUS": {"type": "string", "enum": list(RULE_WORDS)},
-                           "EVIDENCE": {"type": "string"}, "NOTE": {"type": "string"}}}
+                           "EVIDENCE": {"type": "string"}, "NOTE": {"type": "string"},
+                           "FIELD_IDS": {"type": "array", "items": {"type": "string"}}}}
     return {"type": "object", "additionalProperties": False, "required": list(REVIEW_KEYS),
             "properties": {"REVIEW_RESULT": {"type": "string", "enum": list(RESULT_WORDS)},
                            "DISCREPANCY_TYPE": {"type": "string", "enum": list(discrepancy_words)},
@@ -82,13 +83,22 @@ REVIEW_SYSTEM = (
     "Do the whole analysis exactly as the attached daily_review_instructions.md, the Sub Worktype rules file and "
     "result_contract.md require. Your answer is ONE JSON object in the required schema. It follows result_contract.md "
     "in every key, value and rule, with two differences only: (1) the first key is REVIEW_RESULT (where the contract "
-    "says COPILOT_RESULT; same values); (2) every A_B_COMPARISONS row also has FIELD_IDS: the FIELD_IDs of "
-    "EXTRACTED_FIELDS that its Customer_expectation rests on (empty list when it rests on no extracted field).\n"
+    "says COPILOT_RESULT; same values); (2) every A_B_COMPARISONS row and every RULE_CHECKS row also has "
+    "FIELD_IDS: the FIELD_IDs of EXTRACTED_FIELDS it rests on (empty list when it rests on no extracted field).\n"
     "LOW CONFIDENCE RULE: a field with LOW_CONFIDENCE true was not read reliably (handwriting read with low "
     "confidence, or the reading could not be verified). A comparison that rests on such a field cannot be made: "
     "MATCH null, EXPLANATION starting 'Could not compare: the form value was read with low confidence'. Never treat a "
     "low-confidence reading as a mismatch or a match. You may read the document lines yourself, but a value you read "
-    "there that differs from the extracted VALUE is also only low confidence.\n"
+    "there that differs from the extracted VALUE is also only low confidence. A rule check that rests on a "
+    "LOW_CONFIDENCE field is 'Not determinable', never 'Not satisfied'.\n"
+    "SIGNATURES record presence only: 'signed' = marks were found in the signature space (legibility is not "
+    "checked); 'possibly not signed' (always LOW_CONFIDENCE) means the reader found no marks, which is NOT proof that "
+    "a signature is missing - a check resting on it is 'Not determinable'.\n"
+    "WHAT MAKES A CASE INCORRECT: only a real mismatch - MATCH false between a reliable form value (LOW_CONFIDENCE "
+    "false) and a value that IS in the Register snapshot - or a rule check 'Not satisfied' on reliable evidence. A "
+    "value missing from the snapshot is MATCH null (never false) and never makes a case Incorrect.\n"
+    "FORMAT FIXES: a field whose NOTE says it was 'read as' something else was corrected in format only (e.g. digit 0 "
+    "for letter O in an account prefix, postcode spacing, a phone number's spaces); compare its VALUE.\n"
     "Copy CASE_END_DATETIME and REGISTER_SNAPSHOT_DATETIME exactly from the case timing given. No markdown inside "
     "values.")
 
@@ -108,8 +118,8 @@ def review_message(base: str, case: dict, daily: str, rules_name: str, rules: st
         if d.get("FORM") and d.get("PAGES_EXPECTED"):
             extra = f"; recognised form '{d['FORM']}' ({d['PAGES_EXPECTED']} page(s) when complete)"
         docs.append(f"- {d['DOC_ID']}: '{d['FILE']}' - {d['KIND']}, {d['PAGES']} page(s) read{extra}")
-    shown = [{k: f[k] for k in ("FIELD_ID", "LABEL", "VALUE", "HANDWRITTEN", "CONFIDENCE", "LOW_CONFIDENCE")}
-             for f in fields]
+    shown = [{**{k: f[k] for k in ("FIELD_ID", "LABEL", "VALUE", "HANDWRITTEN", "CONFIDENCE", "LOW_CONFIDENCE")},
+              "NOTE": "; ".join(x for x in (f.get("NORMALISED"), f.get("REASON")) if x)} for f in fields]
     parts = ["# THE CASE MESSAGE", base.strip(), "", "# CASE FACTS", *facts, "",
              "# ATTACHED FILE: daily_review_instructions.md", daily.strip(), "",
              f"# ATTACHED FILE: Sub Worktype rules file '{rules_name}'", rules.strip(), "",

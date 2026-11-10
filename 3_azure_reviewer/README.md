@@ -23,6 +23,18 @@ How one case is reviewed (`reviewer.py`):
 5. Program rules: a comparison resting on a flagged field becomes MATCH null ("Could not compare"); a case cannot be
    Correct while a key field is unreadable or a form is short of pages.
 
+Also: forms are recognised by their page-1 title and phrases (page count breaks a near tie; no clear winner = read
+as supporting + CHECK note; text files are never forms). Signatures = presence, not legibility: marks in the signature
+space = "signed"; none = "possibly not signed", always flagged. Format-safe fixes keep `RAW_VALUE` + `NORMALISED`:
+account `XX` + 7 digits prefix (0->O, 8->B, 5->S, 1->I, 2->Z, 6->G), postcode inward code / first letter / spacing,
+phone digits only, dates dd/mm/yyyy (invalid = flagged). An empty key field is flagged.
+
+Connections: key (VDI) or sign-in (laptop); language model address v1 or classic
+(`/openai/deployments/<name>/chat/completions?api-version=` from the pasted endpoint or setting
+`azure_openai_api_version`, default 2024-10-21; chosen by itself when v1 answers 404). Behind a proxy that inspects
+TLS, the Windows certificate store is used after the first certificate error. `check` makes the real calls: one
+1-page analyze (costs 1 page) and each deployment with the strict JSON schema.
+
 Errors: temporary (throttling, 5xx, network) = 3 retries then held; credentials / quota / wrong endpoint or deployment
 = safe stop of the whole run; content refusal = held; program error = held with its trace in the run report.
 Files: `RUNTIME_ROOT\results-azure\<id>.json`, `RUNTIME_ROOT\azure_reviewed_instructions.txt` (valid results only),

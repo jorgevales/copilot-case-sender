@@ -103,7 +103,7 @@ def form_answer(name_cite="D3.p1.l4", id_cite="D3.p1.l6", name="ST MARY CHARITY"
                        {"FIELD": "consent", "VALUE": "ticked", "CITATIONS": ["D3.p1.s1"]}], "NOTES": ""}
 
 
-def review_answer(verdict="Correct", match=True, field_ids=("D3.client_name",), status="Satisfied"):
+def review_answer(verdict="Correct", match=True, field_ids=("D3.client_name",), status="Satisfied", rule_ids=()):
     return {"REVIEW_RESULT": verdict, "DISCREPANCY_TYPE": "None" if match is not False else TM.PROCESSOR_ERROR,
             "HEADLINE": "h", "CASE_END_DATETIME": "03/11/2026 10:06 AM",
             "REGISTER_SNAPSHOT_DATETIME": "2026-11-04T10:00:00+00:00", "CLIENT_REQUEST": "c",
@@ -111,7 +111,7 @@ def review_answer(verdict="Correct", match=True, field_ids=("D3.client_name",), 
             "A_B_COMPARISONS": [{"ITEM": "Client name", "Customer_expectation": "ST MARY CHARITY",
                                  "CUSTOMER_SOURCE": "D3", "System_data": "ST MARY CHARITY", "SYSTEM_SOURCE": "A > B",
                                  "MATCH": match, "EXPLANATION": "Same value.", "FIELD_IDS": list(field_ids)}],
-            "RULE_CHECKS": [{"RULE": "r", "STATUS": status, "EVIDENCE": "e", "NOTE": "n"}]}
+            "RULE_CHECKS": [{"RULE": "r", "STATUS": status, "EVIDENCE": "e", "NOTE": "n", "FIELD_IDS": list(rule_ids)}]}
 
 
 def make_case(base, files=None, form_pages=None):
@@ -168,7 +168,8 @@ def test_a_field_is_flagged_below_the_mark_or_when_its_citation_does_not_hold_it
     box = {"id": "consent", "kind": "checkbox"}
     assert not EV.derive_field(ev, box, "ticked", ["D3.p1.s1"], 0.80)["LOW_CONFIDENCE"]
     assert "does not show" in EV.derive_field(ev, box, "not ticked", ["D3.p1.s1"], 0.80)["REASON"]
-    assert not EV.derive_field(ev, {"id": "sig", "kind": "signature"}, "not signed", [], 0.80)["LOW_CONFIDENCE"]
+    sig = EV.derive_field(ev, {"id": "sig", "kind": "signature"}, "not signed", [], 0.80)
+    assert sig["VALUE"] == "possibly not signed" and sig["LOW_CONFIDENCE"]       # never 'not signed' at 1.0
 
 
 def test_text_files_are_read_here_with_full_confidence():
@@ -296,9 +297,7 @@ def test_a_comparison_on_a_low_confidence_field_becomes_could_not_compare(base):
     assert row["MATCH"] is None and row["EXPLANATION"].startswith("Could not compare")
     assert rec["state"] == "result_inconclusive" and rec["result"]["REVIEW_RESULT"] == "Inconclusive"
     assert "Program note" in rec["result"]["JUSTIFICATION"]
-    assert S.validate_result({("COPILOT_RESULT" if k == "REVIEW_RESULT" else k): v for k, v in rec["result"].items()
-                              if k != "A_B_COMPARISONS"} | {"A_B_COMPARISONS": [
-        {k: v for k, v in r.items() if k != "FIELD_IDS"} for r in rec["result"]["A_B_COMPARISONS"]]}) == []
+    assert make_reviewer(di, chat).problems(rec["result"], None) == []      # still valid by the contract
 
 
 def test_an_unreadable_key_field_or_a_short_form_is_never_correct(base):
@@ -386,3 +385,280 @@ def test_review_writes_one_result_file_per_case_with_a_state_and_the_reports(bas
     assert len(list(out.glob("azure-responses-*.md"))) == 1 and len(list(out.glob("azure-run-report-*.md"))) == 1
     assert "SECRETKEY" not in reports and "di.example" not in reports and "oa.example" not in reports
     assert "SUMMARY" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------------------------- form recognition
+
+RECOG_FORMS = {
+    "change-address-form": {"title": "Change of address form", "pages": 4,
+                            "match": ["Use this form to change the address"], "fields": []},
+    "change-signatory-form": {"title": "Change of signatory form", "pages": 6,
+                              "match": ["Use this form to remove and/or add new signatories",
+                                        "Removal of authorised signatories"], "fields": []},
+    "coif-amend": {"title": "Income and withdrawal payments amendment form", "pages": 4,
+                   "match": ["COIF Charity Funds"], "fields": []},
+    "coif-mandate": {"title": "Mandate form", "pages": 19, "match": ["COIF Charity Funds"], "fields": []}}
+
+
+def doc(pages):
+    return EV.DocEvidence.from_di("D3", "x.pdf", [di_result(pages)])
+
+
+def test_a_form_naming_another_form_in_its_notes_is_still_recognised_by_its_own_title():
+    pages = {n: ["filler"] for n in range(1, 7)}
+    pages[1] = ["Use this form to remove and/or add new signatories", "Change of signatory form",
+                "If only your address changed, please use our Change of address form instead.",
+                "Removal of authorised signatories"]
+    assert RV.detect_form(RECOG_FORMS, doc(pages), "Change of authorised signatories form.pdf") == \
+        ("change-signatory-form", "")
+
+
+def test_a_close_score_is_settled_by_the_page_count_else_the_form_is_unknown_with_a_check_note():
+    three = {1: ["COIF Charity Funds", "Income and withdrawal payments", "amendment form"], 2: ["x"], 3: ["y"]}
+    assert RV.detect_form(RECOG_FORMS, doc(three), "a.pdf")[0] == "coif-amend"     # 3 pages: closer to 4 than 19
+    tie = {"a": {"title": "Alpha form", "pages": 2, "match": ["Shared heading"], "fields": []},
+           "b": {"title": "Beta form", "pages": 2, "match": ["Shared heading"], "fields": []}}
+    slug, note = RV.detect_form(tie, doc({1: ["Shared heading"], 2: ["z"]}), "scan.pdf")
+    assert slug == "" and note.startswith("CHECK:") and "Alpha form" in note and "Beta form" in note
+
+
+def test_text_documents_are_never_forms(base):
+    ev = EV.DocEvidence.from_text("D4", "Email from client.eml", "Change of address form\nUse this form to change "
+                                  "the address")
+    assert RV.detect_form(RECOG_FORMS, ev, "Email from client.eml") == ("", "")
+    ci, di = make_case(base, files={"Email from client.eml": b"Change of address form\nUse this form to change"})
+    chat = FakeChat({"form_fields": [form_answer()], "case_review": [review_answer()]})
+    rec = make_reviewer(di, chat, forms={**FORMS, **RECOG_FORMS}).review(ci)
+    kinds = {d["FILE"]: d["KIND"] for d in rec["DOCUMENTS"]}
+    assert kinds["Email from client.eml"] == "supporting" and kinds["Email instruction authority.pdf"] == "form"
+
+
+# ---------------------------------------------------------------------------------------------- signatures
+
+def placed(page_lines, size=(8.5, 11.0)):
+    """A Layout result whose lines sit at given positions: [(text, x, y, handwritten, confidence)] on page 1."""
+    content, words, lines, hw = "", [], [], []
+    for text, x, y, is_hw, conf in page_lines:
+        start = len(content)
+        for k, w in enumerate(text.split()):
+            off = len(content)
+            content += w + " "
+            cx = x + k * 0.5
+            words.append({"content": w, "confidence": conf, "span": {"offset": off, "length": len(w)},
+                          "polygon": [cx - 0.1, y - 0.05, cx + 0.1, y - 0.05, cx + 0.1, y + 0.05, cx - 0.1, y + 0.05]})
+            if is_hw:
+                hw.append({"offset": off, "length": len(w)})
+        lines.append({"content": text, "polygon": [x, y - 0.05, x + 1, y - 0.05, x + 1, y + 0.05, x, y + 0.05],
+                      "spans": [{"offset": start, "length": len(content) - start}]})
+    return {"content": content, "styles": [{"isHandwritten": True, "spans": hw}] if hw else [],
+            "pages": [{"pageNumber": 1, "width": size[0], "height": size[1], "lines": lines, "words": words}]}
+
+
+SIG = {"id": "trustee_1_signature", "label": "Signature", "kind": "signature", "key": True, "page": 1,
+       "rect": [72, 72 * 5, 72 * 4, 72 * 6]}            # 1-4 in, 5-6 in on an A4-sized page (scaled to the page)
+
+
+def test_any_mark_in_the_signature_space_is_signed_and_never_flagged_for_reading_confidence():
+    a4 = (8.27, 11.69)
+    ev = EV.DocEvidence.from_di("D3", "f.pdf", [placed([("Signature", 1.1, 4.8, False, 0.99),
+                                                        ("vrrDalos", 2.0, 5.5 * 11.69 / 11.69, True, 0.31)], a4)])
+    row = EV.derive_field(ev, SIG, "", [], 0.80)                # the model saw nothing: the area check finds it
+    assert row["VALUE"] == "signed" and not row["LOW_CONFIDENCE"] and row["CONFIDENCE"] >= 0.80
+    assert row["HANDWRITTEN"] and row["CITATIONS"] == ["D3.p1.l2.w1"]
+
+
+def test_an_empty_signature_space_is_possibly_not_signed_and_always_flagged():
+    a4 = (8.27, 11.69)
+    ev = EV.DocEvidence.from_di("D3", "f.pdf", [placed([("Signature", 1.1, 4.8, False, 0.99)], a4)])
+    row = EV.derive_field(ev, SIG, "signed", ["D3.p1.l1"], 0.80)    # the printed label is not a signature
+    assert row["VALUE"] == "possibly not signed" and row["LOW_CONFIDENCE"] and row["CONFIDENCE"] == 0.0
+    text = [("For those persons who have authorised this form and live", 1.1, 5.5, False, 0.99)]
+    shifted = EV.DocEvidence.from_di("D3", "f.pdf", [placed(text, a4)])          # running printed text in the area
+    assert EV.derive_field(shifted, SIG, "", [], 0.80)["VALUE"] == "possibly not signed"
+
+
+def test_a_rule_check_resting_on_a_possibly_missing_signature_is_not_determinable(base):
+    ci, di = make_case(base)
+    forms = {"email-instruction-authority-form": {**FORMS["email-instruction-authority-form"], "fields": [
+        *FORMS["email-instruction-authority-form"]["fields"],
+        {"id": "trustee_1_signature", "label": "Signature", "page": 1, "kind": "signature", "key": True}]}}
+    answer = {**form_answer(), "FIELDS": form_answer()["FIELDS"] + [
+        {"FIELD": "trustee_1_signature", "VALUE": "possibly not signed", "CITATIONS": []}]}
+    bad = review_answer(verdict="Incorrect", status="Not satisfied", rule_ids=("D3.trustee_1_signature",))
+    chat = FakeChat({"form_fields": [answer], "case_review": [bad]})
+    rec = make_reviewer(di, chat, forms=forms).review(ci)
+    rule = rec["result"]["RULE_CHECKS"][0]
+    assert rule["STATUS"] == "Not determinable" and "Not satisfied" in rule["NOTE"]
+    assert rec["state"] == "result_inconclusive" and rec["result"]["DISCREPANCY_TYPE"] == "None"
+
+
+# ---------------------------------------------------------------------------------------------- format-safe fixes
+
+@pytest.mark.parametrize("fdef,read,value,flagged", [
+    ({"id": "account_number_1"}, "C01234567", "CO1234567", False),        # 0 -> O in the 2-letter prefix
+    ({"id": "account_number_1"}, "C81234567", "CB1234567", False),
+    ({"id": "account_number_1"}, "C0400106", "C0400106", False),          # 6 digits: not the format, left alone
+    ({"id": "account_number_1"}, "CO12345X7", "CO12345X7", False),        # digits part not digits: left alone
+    ({"id": "client_id_numbers", "label": "Client ID number(s)"}, "40O1067", "4001067", False),
+    ({"id": "new_postcode"}, "CHI INQ", "CHI 1NQ", False),                # inward: digit + 2 letters only
+    ({"id": "new_postcode"}, "0X1 1AB", "OX1 1AB", False),              # outward code starts with a letter
+    ({"id": "old_postcode"}, "NN67AP", "NN6 7AP", False),
+    ({"id": "daytime_phone"}, "01904 9O1010", "01904901010", False),
+    ({"id": "date_of_birth", "kind": "date"}, "17////1977", "17/11/1977", False),
+    ({"id": "signed_date", "kind": "date"}, "17/////977", "17/11/1977", False),
+    ({"id": "signed_date", "kind": "date"}, "31/02/2026", "31/02/2026", True),   # still invalid: flagged
+])
+def test_format_safe_normalisation_keeps_the_raw_reading(fdef, read, value, flagged):
+    ev = EV.DocEvidence.from_text("D3", "f.txt", read)
+    row = EV.derive_field(ev, {"kind": "text", **fdef}, read, ["D3.p1.l1"], 0.80)
+    assert row["VALUE"] == value and row["RAW_VALUE"] == read and row["LOW_CONFIDENCE"] is flagged
+    assert bool(row["NORMALISED"]) is (value != read)
+
+
+def test_an_empty_key_field_is_flagged_and_its_mismatch_becomes_could_not_compare(base):
+    ci, di = make_case(base)
+    empty = {**form_answer(), "FIELDS": [{"FIELD": "client_name", "VALUE": "", "CITATIONS": []}]
+             + form_answer()["FIELDS"][1:]}
+    wrong = review_answer(verdict="Incorrect", match=False)
+    chat = FakeChat({"form_fields": [empty], "case_review": [wrong]})
+    rec = make_reviewer(di, chat).review(ci)
+    field = next(f for f in rec["EXTRACTED_FIELDS"] if f["FIELD"] == "client_name")
+    assert field["LOW_CONFIDENCE"] and field["CONFIDENCE"] == 0.0 and "key field empty" in field["REASON"]
+    assert rec["result"]["A_B_COMPARISONS"][0]["MATCH"] is None and rec["state"] == "result_inconclusive"
+
+
+# ---------------------------------------------------------------------------------------------- connections
+
+class Server:
+    """A fake Azure: Document Intelligence (info, analyze, result) and the model, in v1 or classic style."""
+
+    def __init__(self, v1=True, strict=True, ssl_fail=0):
+        self.v1, self.strict, self.ssl_fail, self.calls, self.mounted = v1, strict, ssl_fail, [], []
+
+    def factory(self):
+        server = self
+
+        class Sess:
+            def mount(self, prefix, adapter):
+                server.mounted.append(type(adapter).__name__)
+
+            def request(self, method, url, headers=None, timeout=None, **kw):
+                server.calls.append((method, url, dict(headers or {}), kw))
+                if server.ssl_fail:
+                    server.ssl_fail -= 1
+                    import requests
+                    raise requests.exceptions.SSLError("certificate verify failed")
+                return server.answer(method, url, kw)
+        return Sess()
+
+    def answer(self, method, url, kw):
+        if "/documentintelligence/info" in url:
+            return Resp(200, {"customDocumentModels": {}})
+        if ":analyze" in url:
+            return Resp(202, headers={"Operation-Location": "https://di.example/op/1"})
+        if "/op/1" in url:
+            return Resp(200, {"status": "succeeded", "analyzeResult": {
+                "content": "AZURE REVIEWER CHECK", "pages": [{"pageNumber": 1}]}})
+        if "/openai/v1/" in url and not self.v1:
+            return Resp(404, {"error": {"code": "404", "message": "Resource not found"}})
+        if not self.strict:
+            return Resp(400, {"error": {"code": "BadRequest", "message": "response_format value as json_schema is "
+                                                                        "enabled only for api versions 2024-08-01"}})
+        body = {"RESULT": "Inconclusive", "ROWS": [{"ITEM": "check", "MATCH": None}]}
+        return Resp(200, {"model": "fake-model", "choices": [{"finish_reason": "stop",
+                                                              "message": {"content": json.dumps(body)}}]})
+
+
+def key_cfg(**over):
+    return types.SimpleNamespace(**{"azure_auth": "key", "azure_docintel_key": "SECRET-DI-KEY",
+                                    "azure_openai_key": "SECRET-OA-KEY", "az_cli_path": "", **over})
+
+
+def test_a_classic_endpoint_is_called_with_its_deployment_and_api_version():
+    server = Server(v1=False)
+    http = AZ.Http(AZ.Auth(key_cfg()), sleep=lambda s: None, session_factory=server.factory)
+    chat = AZ.Chat("https://fnz-apim.example/aoai/openai/deployments/gpt-x/chat/completions?api-version=2025-01-01",
+                   http)
+    assert chat.ping("case-dep") == "fake-model"
+    url = server.calls[-1][1]
+    assert url == "https://fnz-apim.example/aoai/openai/deployments/case-dep/chat/completions?api-version=2025-01-01"
+    assert server.calls[-1][2]["api-key"] == "SECRET-OA-KEY"
+
+
+def test_v1_answering_404_switches_to_classic_for_the_rest_of_the_run():
+    server = Server(v1=False)
+    http = AZ.Http(AZ.Auth(key_cfg()), sleep=lambda s: None, session_factory=server.factory)
+    chat = AZ.Chat("https://res.example/", http, "2024-10-21")
+    chat.ping("form-dep")
+    chat.ping("case-dep")
+    urls = [c[1] for c in server.calls]
+    assert urls[0].endswith("/openai/v1/chat/completions") and "deployments/form-dep" in urls[1]
+    assert len(urls) == 3 and "deployments/case-dep" in urls[2] and "api-version=2024-10-21" in urls[2]
+    assert chat.style_used.startswith("classic")
+
+
+def test_a_model_without_strict_json_schema_is_a_plain_safe_stop():
+    server = Server(strict=False)
+    http = AZ.Http(AZ.Auth(key_cfg()), sleep=lambda s: None, session_factory=server.factory)
+    with pytest.raises(AZ.SafeStop, match="does not accept strict JSON schema"):
+        AZ.Chat("https://res.example", http).ping("old-dep")
+
+
+def test_tls_inspection_switches_once_to_the_windows_certificate_store():
+    server = Server(ssl_fail=1)
+    http = AZ.Http(AZ.Auth(key_cfg()), sleep=lambda s: None, session_factory=server.factory)
+    assert http.call("GET", "https://di.example/documentintelligence/info", "di", "t").status_code == 200
+    assert http.tls == "windows" and server.mounted == ["WindowsTLS"]
+    http.call("GET", "https://di.example/documentintelligence/info", "di", "t")
+    assert server.mounted == ["WindowsTLS"]                       # kept, not mounted again
+    still = Server(ssl_fail=2)
+    http = AZ.Http(AZ.Auth(key_cfg()), sleep=lambda s: None, session_factory=still.factory)
+    with pytest.raises(AZ.SafeStop, match="TLS") as info:
+        http.call("GET", "https://di.example/x", "di", "Document Intelligence check")
+    assert "di.example" not in str(info.value)
+
+
+def test_proxy_and_connection_problems_are_said_plainly():
+    import requests
+    h, _sess, _waits = http_with([requests.exceptions.ProxyError("p")] * 4)
+    with pytest.raises(AZ.TemporaryError, match="proxy"):
+        h.call("GET", "https://x", "di", "t")
+    h, _sess, _waits = http_with([requests.exceptions.ConnectionError("c")] * 4)
+    with pytest.raises(AZ.TemporaryError, match="network, proxy or firewall"):
+        h.call("GET", "https://x", "di", "t")
+
+
+def test_the_paid_tier_reads_the_whole_document_in_one_request(base):
+    http = PieceHttp(7)
+    di = AZ.DocIntel("https://di", http, base / "cache", free=False)
+    res = di.analyze(b"%PDF seven pages")
+    assert http.posts == ["1-7"] and sum(len(r["pages"]) for r in res) == 7 and di.pages_used == 7
+
+
+def test_check_proves_the_production_calls_with_keys_and_never_shows_them(base, monkeypatch, capsys):
+    cfg = {"runtime_root": str(base / "rt"), "reviewer": "azure", "azure_docintel_endpoint": "https://di.example",
+           "azure_openai_endpoint": "https://oa.example", "azure_auth": "key", "azure_docintel_key": "SECRET-DI-KEY",
+           "azure_openai_key": "SECRET-OA-KEY", "azure_form_model": "form-m", "azure_review_model": "case-m"}
+    (base / "cfg.json").write_text(json.dumps(cfg), "utf-8")
+    monkeypatch.setenv("SENDER_CONFIG", str(base / "cfg.json"))
+    server = Server()
+    real_http = AZ.Http
+
+    def fake_http(auth, **kw):
+        return real_http(auth, sleep=lambda s: None, session_factory=server.factory)
+    monkeypatch.setattr(AZ, "Http", fake_http)
+    assert ACR.main(["check"]) == 0
+    out = capsys.readouterr().out
+    assert "[ok] Document Intelligence analyze (prebuilt-layout, 1 test page)" in out
+    assert "[ok] form model 'form-m' answers in the strict JSON schema" in out
+    assert "[ok] case model 'case-m' answers in the strict JSON schema" in out
+    assert "Azure authentication - key" in out and "TLS): standard" in out
+    assert "SECRET" not in out and "di.example" not in out and "oa.example" not in out
+    di_calls = [c for c in server.calls if "di.example" in c[1]]
+    oa_calls = [c for c in server.calls if "oa.example" in c[1]]
+    assert all(c[2].get("Ocp-Apim-Subscription-Key") == "SECRET-DI-KEY" and "api-key" not in c[2] for c in di_calls)
+    assert all(c[2].get("api-key") == "SECRET-OA-KEY" and "Ocp-Apim-Subscription-Key" not in c[2] for c in oa_calls)
+    analyze = [c for c in di_calls if ":analyze" in c[1]]
+    assert len(analyze) == 1 and "pages=1-2" in analyze[0][1] and "prebuilt-layout" in analyze[0][1]
+    body = next(c[3]["json"] for c in oa_calls)
+    assert body["response_format"]["type"] == "json_schema" and body["response_format"]["json_schema"]["strict"]

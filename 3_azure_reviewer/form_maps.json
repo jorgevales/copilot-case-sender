@@ -1,12 +1,13 @@
 {
  "version": 1,
- "note": "Fields of the CCLA static-detail forms a reviewer compares with Register. id/label/section/page/kind/key are for the reviewer; widget/widget_index/rect (PDF points, page origin top-left) are for the synthetic test generator.",
+ "note": "Fields of the CCLA static-detail forms a reviewer compares with Register. match = phrases printed on the form (each checked against the PDF text), most distinctive first; the bare title can also appear in a covering email. id/label/section/page/kind/key are for the reviewer; widget/widget_index/rect (PDF points, page origin top-left) are for the synthetic test generator.",
  "forms": {
   "change-address-form": {
    "title": "Change of address form",
    "match": [
-    "Change of address form",
-    "Use this form to change the address"
+    "Use this form to change the address",
+    "of an existing authorised correspondent",
+    "Change of address form"
    ],
    "pages": 4,
    "fields": [
@@ -450,8 +451,9 @@
   "email-instruction-authority-form": {
    "title": "Email instructions authority form",
    "match": [
-    "Email instructions authority form",
-    "Authority to accept email instructions"
+    "Authority to accept email instructions",
+    "Use this form to authorise CCLA",
+    "Email instructions authority form"
    ],
    "pages": 2,
    "fields": [
@@ -593,11 +595,11 @@
    ]
   },
   "change-organisation-name": {
-   "title": "Change of organisation name form",
+   "title": "Change of account name form",
    "match": [
-    "Change of organisation name",
     "Previous client name",
-    "New client name"
+    "New client name",
+    "Change of account name form"
    ],
    "pages": 4,
    "fields": [
@@ -949,10 +951,11 @@
    ]
   },
   "change-signatory-form": {
-   "title": "Change of authorised signatories form",
+   "title": "Change of signatory form",
    "match": [
     "Removal of authorised signatories",
-    "authorised signator"
+    "Accounts must be operated by at least two authorised signatories",
+    "Change of signatory form"
    ],
    "pages": 6,
    "fields": [
@@ -1516,8 +1519,8 @@
   "change-correspondent-form": {
    "title": "Change of correspondent form",
    "match": [
-    "Change of correspondent",
-    "Address for correspondence"
+    "Address for correspondence",
+    "Change of correspondent form"
    ],
    "pages": 5,
    "fields": [
@@ -2066,9 +2069,8 @@
   "coif-charities-funds-mandate-form": {
    "title": "COIF Charity Funds mandate form",
    "match": [
-    "Mandate form",
-    "COIF Charity Funds",
-    "About your charity"
+    "This mandate form will supersede any other instructions we hold",
+    "Mandate form COIF Charity Funds"
    ],
    "pages": 19,
    "fields": [
@@ -2678,7 +2680,7 @@
    "title": "COIF Charity Funds income and withdrawal payments amendment form",
    "match": [
     "Income and withdrawal payments amendment form",
-    "COIF Charity Funds",
+    "Use this form to make amendments to",
     "Nominated bank details"
    ],
    "pages": 4,
