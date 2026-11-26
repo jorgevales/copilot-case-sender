@@ -375,14 +375,19 @@ def sheet_xml(sh: Sheet, styles: Styles) -> str:
 
 def xlsx_bytes(cases: list, reviewer: str | None = None) -> bytes:
     """The whole workbook from [(info, result)]; it opens on the Cases tab."""
-    sheets, styles = build(cases, reviewer), Styles()
+    return workbook_bytes(build(cases, reviewer), active=1)
+
+
+def workbook_bytes(sheets: list, active: int = 0) -> bytes:
+    """Any list of Sheet objects as an .xlsx file; it opens on sheet number `active` (0 = the first)."""
+    styles = Styles()
     bodies = [sheet_xml(sh, styles) for sh in sheets]         # first: registers every style the sheets use
     n = len(sheets)
-    names = "".join(f'<sheet name="{sh.name}" sheetId="{i}" r:id="rId{i}"/>' for i, sh in enumerate(sheets, 1))
+    names = "".join(f'<sheet name="{escape(sh.name)}" sheetId="{i}" r:id="rId{i}"/>' for i, sh in enumerate(sheets, 1))
     book = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
             '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
             'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-            f'<bookViews><workbookView activeTab="1"/></bookViews><sheets>{names}</sheets></workbook>')
+            f'<bookViews><workbookView activeTab="{active}"/></bookViews><sheets>{names}</sheets></workbook>')
     rels = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
             '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
             + "".join(f'<Relationship Id="rId{i}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/'

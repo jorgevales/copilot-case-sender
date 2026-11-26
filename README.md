@@ -1,14 +1,18 @@
-# Daily statics review — System 1 documents + System 2 snapshots + Copilot
+# Daily statics review — System 1 documents + System 2 snapshots + System 3 (Mission Control)
 
-Three parts work **at the same time**, so Copilot can review case 1 while System 1 is still downloading case 2:
+Three parts work **at the same time**, so case 1 is sent to System 3 while System 1 is still downloading case 2:
 
 | Folder | Part | What it does | Where it works |
 |---|---|---|---|
-| `1_system1_documents/` | **Part 1** | Per case: every Received Document + the Audit Trail from System 1 | the ONE System 1 tab of the **systems Edge** (port 9223) |
-| `2_system2_snapshots/` | **Part 2** | All account snapshots from System 2, in bulk (usually done before case 1) | signed-in requests with the systems Edge's cookies (no tab) |
-| `3_copilot_sender/` | **Part 3** | Sends each complete case to Copilot, one fresh chat, sent once, answer read back | the **Copilot Edge** (port 9333) |
-| `3_azure_reviewer/` | **Part 3 (alternative)** | With the setting `reviewer = azure`: reads every document with Azure Document Intelligence and reviews the case with an Azure language model, instead of Copilot (see [The Azure reviewer](#the-azure-reviewer-instead-of-copilot)) | no browser |
-| `orchestrator/` | Coordinator | Asks for the CSV, starts everything, hands complete cases over, writes the daily report | no browser |
+| `1_system1_documents/` | **System 1** | Per case: every Received Document + the Audit Trail from System 1 | the ONE System 1 tab of the **systems Edge** (port 9223) |
+| `2_system2_snapshots/` | **System 2** | All account snapshots from System 2, in bulk (usually done before case 1) | signed-in requests with the systems Edge's cookies (no tab) |
+| `3_mission_control/` | **System 3 (default)** | Sends each complete case to the company's **Mission Control** workflow (first version: see its README) | no browser |
+| `3_copilot_sender/` | System 3 (option) | Sends each complete case to Copilot, one fresh chat, sent once, answer read back | the **Copilot Edge** (port 9333) |
+| `3_azure_reviewer/` | System 3 (option, not maintained) | Azure Document Intelligence + an Azure language model (see [The Azure reviewer](#the-azure-reviewer-instead-of-copilot)) | no browser |
+| `orchestrator/` | Coordinator | The **menu**; asks for the BAM Report and the run choice, starts everything, hands complete cases over, writes the reports | no browser |
+| `shared/bam_report.py` | BAM Report | Reads the BAM Report `.xlsx` (first sheet, headers in row 5) | — |
+| `shared/run_scope.py` | Run choices | The 10 ways to choose which cases a run works on | — |
+| `shared/done_log.py` | Already-done log | Every case downloaded / captured / sent, kept on S:; `Already sent log.xlsx` for you | — |
 | `shared/pipeline.py` | Contract | The small files the parts use to work together (read its header) | — |
 | `shared/timing.py` | Case timing | The four case-timing values typed into each case's message (End Date, snapshot time, business days, age) | — |
 | `shared/review_workbook.py` | Results workbook | `Copilot review results.xlsx` for the human reviewers (no extra package) | — |
@@ -43,30 +47,98 @@ stay in your local, git-ignored `sender_config.json`.
      (with `{party}`), the nine account-detail pages (each with `{account}`) and the customer summary page (with
      `{customer}`, for the Charity Commission Number; see `2_system2_snapshots/README.md`).
 
-   These stay only in your local, git-ignored `sender_config.json`. **No System 1 / System 2 address is written in
-   the code.** Enter keeps a shown value. Run `Run.cmd setup` again at any time to edit.
-4. `Run.cmd check` validates everything (nothing is sent). The first run installs the pinned packages (`playwright`,
-   `requests`, `beautifulsoup4`) into `RUNTIME_ROOT\deps`.
+   - **A name for each system** (e.g. the real product names). They show on screen, in the menu and in your own
+     `Already sent log.xlsx`; the shareable reports keep "System 1" / "System 2".
+   - **The BAM Reports folder** - where you drop each day's BAM Report (default `<this folder>\BAM Reports`, never
+     committed).
+   - **System 3**: `mission_control` (default), `copilot` or `azure`. For Mission Control: its endpoint address (leave
+     it empty until you have it: cases are then prepared and saved, not sent) and how to sign in (`none` or `key`).
 
-## A daily run (`Run.cmd` / `Run.cmd run`)
+   These stay only in your local, git-ignored `sender_config.json`, so **updating the project (git pull) never
+   changes them** - only running setup again does. **No System 1 / System 2 address is written in the code.** Enter
+   keeps a shown value. Run setup again at any time (menu option 6, or `Run.cmd setup`) to edit.
+4. Menu option 7 / `Run.cmd check` validates everything (nothing is sent). The first run installs the pinned packages
+   (`playwright`, `requests`, `beautifulsoup4`) into `RUNTIME_ROOT\deps`.
 
-1. **The CSV** - the **BAM Studio report** saved as CSV. Paste its path (the last one is offered). It needs the
-   columns `Request Id` (the older `Instruction Id` / `instrcution id` spellings also work), `Client Account Number`,
-   `Client Number`, `Process Status` and `Sub Worktype`, and (optional) **`End Date`** - when the case ended, in UK
-   time - and the **case source**: the first column whose name contains "source" (e.g. `Case Source`), i.e. where the
-   customer request came in (email, post ...). Other columns are ignored. The case source is given to the reviewer
-   (Copilot or Azure) as one line of the case's facts - right under the case timing in the base message - and shown in
-   the daily report and the results workbook; blank or no such column = `not stated`. Any rule about it belongs in
-   your Sub Worktype files, not in the code. Only **Ended** rows are reviewed. Every other row (Voided, blank, an invalid ID, a duplicate, no account) is listed under **SKIPPED** with
-   its reason before anything starts. A CSV without any End Date is sent anyway (see [Case timing](#case-timing)).
-   Before this, an older results workbook is renamed (see [Results workbook](#results-workbook-copilot-review-resultsxlsx)).
-2. **The plan.** For each Ended row: *download and send*, *complete already* (send only), *already sent earlier*
-   (sent-ledger), or *held* (for example, a folder for that ID already in CASES_ROOT that this tool did not make).
-   Sub Worktypes without an instructions file are warned about.
-3. **Two Edges open.** The **systems Edge** (System 1 + System 2, its own remembered profile) and the **Copilot
-   Edge** (its own remembered profile). Two profiles are needed because Edge locks a profile to one running Edge.
-   Both remember your sign-ins between days.
-4. **Questions** (Part 3, in this console): moving cursor? Then the Copilot model.
+## The menu (double-click `Run.cmd`)
+
+```
+  1  Full run - <System 1> + <System 2> together; each complete case goes to Mission Control at once
+  2  <System 1> only - download the case documents
+  3  <System 2> only - capture the account snapshots
+  4  <System 1> + <System 2> - documents and snapshots, no review
+  5  Mission Control only - send the cases already downloaded and captured
+  6  Setup          7  Check          0  Exit
+```
+
+- Systems 1 and 2 **always run in parallel** when both are in the run.
+- In a **full run** each case goes to System 3 **the moment** its documents and snapshot are both complete - with 1,000
+  cases, sending starts after the first one, not after all 1,000. A case that fails is reported in plain words and the
+  run goes on with the next one.
+- **System 1 only / System 2 only**: what the other system already made is used. A case is moved into CASES_ROOT (ready
+  for System 3) as soon as both halves exist; the rest is reported as **not complete yet** (not a problem). Without
+  System 2 in the run, the newest snapshot of the account (any day) is used.
+- **System 3 only**: sends the cases that are complete (documents + snapshot); a case whose documents are missing is
+  held ("run System 1 first").
+
+Every run option then asks for:
+
+1. **The BAM Report** (`.xlsx`). The newest file in your BAM Reports folder is offered - press Enter to use it, or
+   paste / drag another file into the window. Only the **first sheet** is read; rows 1-4 are skipped and the **headers
+   are in row 5**. Columns are found **by their header name** (31 columns is normal; another count is only a warning):
+
+   | Column | Header | Used for |
+   |---|---|---|
+   | A | `RequestId` | the instruction ID (**needed**) |
+   | K | `Received Date` | sent to Mission Control, the daily report, run choice 10 |
+   | N | `Client Account Number` | the account (**needed**) |
+   | O / P | `Client Name` / `Client Number` | run choice 5, Mission Control |
+   | Q / R | `Fund` / `Fund Type` | run choice 8, Mission Control |
+   | V | `Process Status` | **needed**: `Ended` = reviewed; `Voided` (and anything else) = **excluded automatically** |
+   | Y / Z | `Source` / `Email Subject` | Email / Post / blank; run choice 9, Mission Control |
+   | AA | `Sub Worktype` | **needed** |
+   | AE | `End Date` | case timing |
+
+   Dates are real Excel date-times (`25/11/2026 12:23 PM`). Every excluded row (Voided, an invalid or repeated
+   RequestId, no account) is listed under **AUTOMATICALLY EXCLUDED** before anything starts and again at the end.
+2. **Which cases** - the run choices:
+
+   | # | Choice | Then asks |
+   |---|---|---|
+   | 1 | Just one case | its RequestId (Enter = the first case) |
+   | 2 | The first few cases | how many |
+   | 3 | Every case in the report | - (Enter = this one) |
+   | 4 | Cases I paste in | the RequestIds, one per line; an empty line ends |
+   | 5 | All cases for a client | pick Client Number(s) from a list (with the client's name) |
+   | 6 | All cases for an account | pick Client Account Number(s) |
+   | 7 | All cases of one type | pick Sub Worktype(s) |
+   | 8 | All cases for a fund | pick Fund(s) |
+   | 9 | Cases that came by email or post | pick Email / Post / (blank) |
+   | 10 | Cases received between two dates | from / to (dd/mm/yyyy) |
+3. **Cases already done before.** Every download (System 1), snapshot (System 2) and Mission Control send (System 3)
+   is written to the **already-done log** on S: (`RUNTIME_ROOT\already_done_log\`, shown as
+   `CASES_ROOT\Already sent log.xlsx`, rebuilt after every run). When the chosen cases include some already done, you
+   see how many and when, then: **Enter = run them all again**, `1` = skip them, `2` = show the list first. Running a
+   case again moves its earlier files to `RUNTIME_ROOT\pipeline\older\<run>\` (never deleted). Copilot and Azure
+   still never get the same case twice (their own lists); Mission Control does when you choose so.
+
+For a scheduled or scripted run the same answers can be given on the command line:
+`Run.cmd run --mode full|s1|s2|s12|s3 --report <file.xlsx> --scope all|first:5|one:<id>|ids:<id>,<id>|client:<n>|account:<n>|type:<Sub Worktype>|fund:<f>|source:email|received:01/11/2026-25/11/2026 --again yes|no`.
+
+## A daily run, step by step
+
+1. **The BAM Report, the run choice and the already-done question** (above). Before this, an older results workbook is
+   renamed (Copilot / Azure only; see [Results workbook](#results-workbook-copilot-review-resultsxlsx)). The case
+   source (`Source`) is given to the reviewer as one line of the case's facts and shown in the daily report; blank =
+   `not stated`. A report without any End Date is sent anyway (see [Case timing](#case-timing)).
+2. **The plan.** For each chosen case: *download and send*, *complete already* (send only), *already sent earlier*
+   (Copilot / Azure), *skipped by your choice*, or *held* (for example, a folder for that ID already in CASES_ROOT that
+   this tool did not make). With Copilot or Azure, Sub Worktypes without an instructions file are warned about
+   (Mission Control needs none: its agents already have them).
+3. **Edge opens.** The **systems Edge** (System 1 + System 2, its own remembered profile) - and, with Copilot as
+   System 3 only, the **Copilot Edge** (its own remembered profile). Two profiles are needed because Edge locks a
+   profile to one running Edge. Both remember your sign-ins between days. Mission Control needs no browser.
+4. **Questions** (Copilot only, in this console): moving cursor? Then the Copilot model.
 5. **Sign in everywhere, then press Enter.** Part 1 checks there is exactly ONE System 1 tab showing My Inbox; Part 2
    checks the System 2 page shows "logout"; Copilot is already confirmed. If something is missing it is named, and
    you press Enter again. After this you can walk away.
@@ -136,6 +208,8 @@ everything but never repeat company details (names, IDs, account numbers, hosts,
 general review guidance file (`instructions_path`).
 
 ## The Azure reviewer (instead of Copilot)
+
+> **Not maintained** (user, 2026-11-26): kept working as it is, but no longer developed. Mission Control is System 3.
 
 An alternative Part 3. Parts 1 and 2 and the hand-over are the same; only the review changes. Copilot stays the
 default and stays available: switch with `Run.cmd setup` (question *PART 3 - which reviewer*).

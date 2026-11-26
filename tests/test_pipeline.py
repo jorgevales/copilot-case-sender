@@ -25,6 +25,7 @@ from pathlib import Path
 
 import pytest
 
+import bam_helpers as BH                             # synthetic BAM Reports
 import test_sender as T                              # its fakes (FakeBrowser, FakeTab ...) and the loaded sender (T.S)
 from test_sender import env, env2                    # noqa: F401  (pytest fixtures)
 
@@ -270,7 +271,7 @@ def test_the_daily_report_has_one_line_per_csv_row(base):
     assert rows[0]["left_out_files"] == 3
     out = H.write_report(rows, base / "reports", "r1")
     assert out.read_text("utf-8-sig").splitlines()[0].startswith("row,instruction_id")
-    assert P.workload_line(rows) == "Reviewed 1 of 3 'Ended' case(s) (4 CSV row(s), 1 skipped); 2 need you"
+    assert P.workload_line(rows) == "Reviewed 1 of 3 'Ended' case(s) (4 row(s), 1 excluded); 2 need you"
 
 
 def test_the_pipeline_report_shows_what_system1_and_system2_saw(base):
@@ -1063,7 +1064,7 @@ def test_one_whole_run_coordinates_the_three_parts_and_reports_every_csv_row(bas
     daily.write_text("daily instructions", "utf-8")
     config = base / "sender_config.json"
     config.write_text(json.dumps({"cases_root": str(cases_root), "runtime_root": str(runtime), "base_message_path": str(msg),
-                                  "daily_instructions_path": str(daily),
+                                  "daily_instructions_path": str(daily), "reviewer": "copilot",
                                   "python_executable": sys.executable, "edge_executable": sys.executable,
                                   "approved_root": str(base), "guidance_dir": str(g), "result_contract_path": str(contract),
                                   "system1_url": "https://system1.example.invalid/app/inbox", "system1_brand_text": "Brand",
@@ -1075,10 +1076,10 @@ def test_one_whole_run_coordinates_the_three_parts_and_reports_every_csv_row(bas
                                   "system2_detail_pages": {n: f"https://system2.example.invalid/detail{i}?id={{account}}"
                                                            for i, n in enumerate(P.DETAIL_SECTIONS)}}), "utf-8")
     (cases_root / "Copilot review results.xlsx").write_bytes(b"older run")   # the coordinator sets it aside here
-    csv = write_csv(base / "daily.csv", [(hexid(1), "AB100000", "C1", "Ended", "Change of Address"),
-                                         (hexid(2), "AB200000", "C2", "Voided", "Change of Address"),
-                                         (hexid(3), "AB300000", "C3", "Ended", "Change of Address"),
-                                         (hexid(4), "AB400000", "C4", "Ended", "Change of Address")])
+    csv = BH.write_bam(base / "BAM Report.xlsx", [BH.case(hexid(1), "AB100000", client="C1"),
+                                                  BH.case(hexid(2), "AB200000", "Voided", client="C2"),
+                                                  BH.case(hexid(3), "AB300000", client="C3"),
+                                                  BH.case(hexid(4), "AB400000", client="C4")])
     fakes = {}
     for name, src, part in (("part1", FAKE_PART, "part1"), ("part2", FAKE_PART, "part2"), ("sender", FAKE_SENDER, "")):
         fakes[name] = base / f"fake_{name}.py"
@@ -1089,11 +1090,11 @@ def test_one_whole_run_coordinates_the_three_parts_and_reports_every_csv_row(bas
     sender = sys.modules["copilot_case_sender"]
     monkeypatch.setattr(sender, "ensure_dependencies", lambda *a: None)
     monkeypatch.setattr(sender, "cdp_http", lambda *a, **k: None)     # no real Edge: the pointer sweep finds none
-    monkeypatch.setattr(R, "open_systems_edge", lambda cfg, rt: "started (fake)")
+    monkeypatch.setattr(R, "open_systems_edge", lambda cfg, rt, used="12": "started (fake)")
     monkeypatch.setattr(R, "PART_SCRIPTS", {"part1": fakes["part1"], "part2": fakes["part2"]})
     monkeypatch.setattr(R, "SENDER_SCRIPT", fakes["sender"])
     try:
-        code = R.main(["--csv", str(csv)])
+        code = R.main(["--report", str(csv), "--mode", "full", "--scope", "all"])
     finally:
         sender.WRITE_GUARD["roots"] = None
         os.environ.clear()
@@ -1105,14 +1106,15 @@ def test_one_whole_run_coordinates_the_three_parts_and_reports_every_csv_row(bas
     report = next((runtime / "reports").glob("daily-report-*.csv")).read_text("utf-8-sig").splitlines()
     by_id = {line.split(",")[1]: line for line in report[1:]}
     assert "sent - Copilot: Correct" in by_id[hexid(1)] and "sent - Copilot: Correct" in by_id[hexid(4)]
-    assert "skipped" in by_id[hexid(2)] and "Voided" in by_id[hexid(2)]
+    assert "excluded automatically" in by_id[hexid(2)] and "Voided" in by_id[hexid(2)]
     assert "held" in by_id[hexid(3)] and "View not found" in by_id[hexid(3)]
     assert sorted(p.name for p in cases_root.iterdir() if p.is_dir() and p.name != ".work") == \
         [f"{hexid(1)} - AB100000", f"{hexid(4)} - AB400000"]
-    older = [p.name for p in cases_root.iterdir() if p.is_file()]     # the results workbook lives in CASES_ROOT
-    assert len(older) == 1 and older[0].startswith("Copilot review results - older ")
+    older = [p.name for p in cases_root.iterdir() if p.is_file() and p.name != "Already sent log.xlsx"]
+    assert len(older) == 1 and older[0].startswith("Copilot review results - older ")   # it lives in CASES_ROOT
+    assert (cases_root / "Already sent log.xlsx").is_file()            # the already-done log, for you
     assert not list((runtime / "reports").glob("*.xlsx"))              # never in RUNTIME_ROOT
-    assert "SKIPPED - 1 row(s)" in out and "DAILY REPORT" in out
+    assert "AUTOMATICALLY EXCLUDED - 1 row(s)" in out and "DAILY REPORT" in out
     assert "Visual pointer: the systems Edge did not answer" in out      # the sweep ran once the parts had ended
 
 
@@ -1434,7 +1436,7 @@ def test_the_in_page_scripts_draw_replace_sweep_and_self_remove_in_a_real_dom(ba
 
 # ---------------------------------------------------------------------------------------------- Part 2: the party profile
 # A synthetic Interested Party profile in the shape System 2 sends it (no script run): the contact rows are built by
-# the page's setup functions (shape from the sanitised sample, System_2_Claude_Handover.md + Copilot's answer); only
+# the page's setup functions (shape from the sanitised sample, the local System 2 handover notes + Copilot's answer); only
 # headers and placeholders are rows.  Every value is made up.
 
 import base64 as _b64

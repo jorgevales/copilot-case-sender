@@ -1,6 +1,6 @@
-# CLAUDE.md — Automatic daily statics review 2 (Copilot Case Sender)
+# Copilot.md — Automatic daily statics review 2 (Copilot Case Sender)
 
-Handoff for new Claude Code sessions. Read this first; it should be enough to start working.
+Handoff for new Copilot sessions. Read this first; it should be enough to start working.
 User is a medium beginner: plain language, minimal jargon, don't push or publish without asking.
 
 ## What this project is
@@ -11,6 +11,33 @@ fetches every account's System 2 snapshot in bulk (requests with the systems Edg
 complete case to Microsoft 365 Copilot (its own Edge, port 9333) and reads the strict-JSON answer back. A coordinator
 hands a case over the moment it is complete, so Copilot works on case 1 while System 1 downloads case 2.
 Part 3 is the rewrite ("2") of the older "Automatic daily statics review" runner (see README last section).
+
+**Update 2026-11-26 (agreed with the user, see README "The menu"):**
+- `Run.cmd` opens a **menu** (`orchestrator/run_pipeline.py`): full run / System 1 only / System 2 only / System 1+2 /
+  System 3 only / setup / check (`P.MODES`: `full`=123, `s1`, `s2`, `s12`, `s3`). Systems 1+2 always in parallel; in a
+  full run each case goes to System 3 the moment it is complete (hand-over unchanged).
+- Input is ONLY the **BAM Report `.xlsx`** (`shared/bam_report.py`, stdlib zip/XML reader): first sheet in workbook
+  order, headers in row 5, columns found by header NAME (user's choice; 31 columns expected, other count = warning),
+  needed: RequestId, Client Account Number, Process Status, Sub Worktype. Dates are real date cells -> text
+  `dd/mm/yyyy hh:mm AM/PM` (what `shared/timing.py` reads). Voided/invalid/duplicate rows = "excluded automatically",
+  listed at the start and at the end. The CSV reader stays only for the laptop's azure-test tooling.
+- **Run choices** (`shared/run_scope.py`, 10 plain-language options, `--scope` one-line form for tests/scripts).
+- **System names** `system1_name`/`system2_name` in setup, saved in the git-ignored `sender_config.json` (a pull never
+  changes them). Shown on screen/menu/`Already sent log.xlsx`; redacted back to "System 1/2" in shareable logs.
+- **Already-done log** (`shared/done_log.py`): `RUNTIME_ROOT\already_done_log\<writer>.jsonl` (one file per writer:
+  coordinator = System 1/2 lines from `Handover._note_done`, mission-control = sends) + `CASES_ROOT\Already sent log.xlsx`
+  rebuilt at the end. Chosen cases already done -> warning, ONE question, **Enter = run them all again** (user rule),
+  1 = skip, 2 = list. Run again = `set_aside_for_rerun` MOVES earlier files to `pipeline\older\<run>\` (never deletes).
+  Copilot/Azure keep their own never-twice ledgers.
+- **System 3 = Mission Control** (`3_mission_control/mission_control.py`, default `reviewer`). First version: structure
+  of the trigger unknown; one case per multipart POST (`case` JSON + `files`), built in `case_package` only. Empty
+  `mission_control_url` = "prepared - not connected yet" (saved, nothing sent). 401/403 = stop sending; timeout =
+  uncertain (never auto-resent); 5xx/429 retried 3x; 4xx = failed, run continues. No Sub Worktype guidance file is
+  needed or sent with Mission Control (its agents have them): Part 1 / hand-over skip the guidance hold for it. The MC
+  script is also the console of runs without System 3 (plan `send` = false).
+- **Azure: not maintained** (user, 2026-11-26) - keep its tests green, build nothing new. The stashed Azure fix stays parked.
+- **Copilot.md is NOT in the repo** (`.git/info/exclude`); the repo carries `Copilot.md`, regenerated from this file by the
+  local `pre-commit` hook (Copilot -> Copilot). Never mention Copilot.md in committed files; no Co-Authored-By lines.
 
 Real runs happen on the work VDI, with everything on the `S:` drive. Local copies are for development and tests only.
 Parts 1 and 2 started from sanitized copies of the user's VDI scripts. The repo is PUBLIC: every page address, host and
@@ -30,6 +57,9 @@ brand pattern of System 1/2 lives only in the git-ignored config (pasted once in
 | `2_system2_snapshots/system2_snapshots.py` | Part 2 (cookies via `cdp_call` Storage.getCookies, Access Denied → stop, expired → pause). Party profile (2026-11-03): contact records read from the page's setup-script object literals as text, never run (`setup_records`, strict `js_object`), finished rows by id prefix (`table_records`), per-section `completeness`; compliance by control ID; written file read back (`SnapshotIncomplete`). Nine account-detail pages (2026-11-03, `system2_detail_pages`, `P.DETAIL_SECTIONS`): readers from the user's sanitised reference (git-ignored), landmarks per page, any page not read / confirmed empty fails the account (`DetailsIncomplete`), staged write + read-back, same-day reuse only if `snapshot_problems` is empty; file `<ACCOUNT>_Complete_Account_Profile.json`. Charity Commission Number (2026-11-03, `system2_customer_summary_page`, `{customer}` = CSV Client Number as given, no fallback, no page-vs-customer check): one request per Client Number per run (`submit_customers`), `Additional Info` panel, key right after `Client Number` (`merge_customer_additional_info`), record in `metadata.customerAdditionalInfo`, optional (never holds a case; not captured = refetched same day). Its README has the rules. |
 | `3_copilot_sender/copilot_case_sender.py` | Part 3, the sender (~4,900 lines). Pipeline mode: `run --pipeline <run dir>` with `PipelineFeed` (section 9b). |
 | `guidance/` | README only. The real `result_contract.md`, `daily_review_instructions.md`, base message and `<Sub Worktype>.md` files live on S: (user's choice: none committed; the top-level copies are git-ignored). |
+| `shared/bam_report.py`, `shared/run_scope.py`, `shared/done_log.py` | BAM Report reader, the 10 run choices, the already-done log (2026-11-26). |
+| `3_mission_control/mission_control.py` | System 3 = Mission Control (default reviewer; `run --pipeline`, `check`). Its README has the package and outcomes. |
+| `tests/test_daily_update.py`, `tests/bam_helpers.py` | Tests of the 2026-11-26 update (synthetic BAM Reports with real date cells, a local fake Mission Control endpoint, whole runs per mode). |
 | `README.md` | Full user/design documentation. Authoritative for behaviour; read the relevant section before changing logic. |
 | `tests/test_sender.py`, `tests/test_pipeline.py`, `tests/test_code_checks.py` | Tests (count: see pytest; code checks: keyword clashes, every part parses) (fake pages, real processes for one whole run). Need `SENDER_TEST_ROOT`; Part 2 tests need requests+bs4 (else skipped). |
 | `.gitignore` | Excludes `sender_config.json` (at the top level), `local_python.cmd`, `sender_runtime/`, logs, `.venv/`, `.env`. |
@@ -152,6 +182,6 @@ Rules:
 
 ## Keeping the graph fresh
 
-- `graphify-out/` and `.claude/` are git-ignored on purpose (local only). Commit them only if the user asks.
-- Refresh the graph every time new code or docs land (after edits, a commit, or pulling a push): `graphify update .` for code (no cost); after doc changes (README, this file) also run `graphify extract . --backend claude-cli --max-concurrency 1`, then `graphify cluster-only . --backend=claude-cli`. Use the executable path given above.
+- `graphify-out/` and `.copilot/` are git-ignored on purpose (local only). Commit them only if the user asks.
+- Refresh the graph every time new code or docs land (after edits, a commit, or pulling a push): `graphify update .` for code (no cost); after doc changes (README, this file) also run `graphify extract . --backend copilot-cli --max-concurrency 1`, then `graphify cluster-only . --backend=copilot-cli`. Use the executable path given above.
 - Git hooks (post-commit, post-checkout) are installed locally via `graphify hook install` and rebuild the code graph automatically after each commit/checkout. Doc changes still need the manual `extract` step above. Hooks live in `.git/hooks` and are not pushed; reinstall them after a fresh clone.

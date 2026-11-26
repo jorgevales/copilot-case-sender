@@ -15,13 +15,13 @@ __pycache__/
 /result_contract.md
 /bank_holidays.txt
 
-# Local design notes from the real pages (sanitised, but kept off the public repository)
-/System_2_Claude_Handover.md
-/account_nine_sections_parser_reference_SANITIZED_FOR_CLAUDE.py
+# Local design notes and assistant files are excluded on the laptop only (.git/info/exclude)
 
-# Local graphify knowledge graph and Claude Code config: keep out of the repo unless requested
+# Local graphify knowledge graph: keep out of the repo unless requested
 graphify-out/
-.claude/
+
+# Your BAM Reports (real case lists): never committed
+/BAM Reports/
 
 # Laptop-only synthetic test data (downloaded CCLA PDFs, dataset images, generated cases): never commit
 tests/azure_synthetic/_downloads/

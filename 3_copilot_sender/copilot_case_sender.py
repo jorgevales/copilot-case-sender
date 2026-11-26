@@ -385,10 +385,21 @@ DEFAULTS = {
     "system2_detail_pages": {},       # the nine account-detail pages (shared.pipeline.DETAIL_SECTIONS), {account} in each
     "system2_customer_summary_page": "",  # the customer summary page (Charity Commission Number), {customer} = Client Number
     "systems_cdp_port": 9223,         # Edge for System 1 + 2 (its own remembered profile); Copilot stays on cdp_port
-    "last_csv_path": "",              # the daily CSV used last time (offered as the default)
-    # Part 3 can be this Copilot sender (default, unchanged) or the Azure reviewer (3_azure_reviewer/).  Endpoints and
-    # keys live ONLY in the git-ignored sender_config.json; reports and check show a key as "set" / "not set".
-    "reviewer": "copilot",            # "copilot" = Edge + Microsoft 365 Copilot (this script); "azure" = 3_azure_reviewer
+    "last_csv_path": "",              # the BAM Report used last time
+    # Your own names for the two systems (setup; kept in this computer's sender_config.json, so a git pull never
+    # changes them).  Shown on screen, in the menu and in your own logs; the shareable reports keep 'System 1/2'.
+    "system1_name": "System 1", "system2_name": "System 2",
+    "bam_reports_dir": "",            # the folder you drop each BAM Report .xlsx into ("" = <this folder>\BAM Reports)
+    # Part 3 = System 3: Mission Control (default), this Copilot sender or the Azure reviewer (3_azure_reviewer/).
+    # Endpoints and keys live ONLY in the git-ignored sender_config.json; reports and check show a key as "set" / "not set".
+    "reviewer": "mission_control",    # "mission_control" = 3_mission_control (send each case to the company workflow);
+                                      # "copilot" = Edge + Microsoft 365 Copilot (this script); "azure" = 3_azure_reviewer
+    "mission_control_url": "",        # the workflow's endpoint (https://...); "" = not connected yet: packages are only saved
+    "mission_control_auth": "none",   # "none" or "key" (a key sent in the header below)
+    "mission_control_key": "",        # SECRET: never printed, never in a report
+    "mission_control_key_header": "api-key",
+    "mission_control_timeout": 120,   # seconds to wait for Mission Control to accept one case
+    "mission_control_parallel": 2,    # cases sent at the same time
     "azure_docintel_endpoint": "",    # Azure Document Intelligence (Layout reads every page)
     "azure_openai_endpoint": "",      # Azure language model (fills each form, reviews the case)
     "azure_auth": "key",              # "key" (typed in setup; the VDI) or "signin" (keyless Azure sign-in; the laptop)
@@ -399,12 +410,14 @@ DEFAULTS = {
     "azure_openai_api_version": "",   # only for the classic '/openai/deployments/...' address style; "" = 2024-10-21
     "az_cli_path": "",                # optional: az.cmd for the sign-in route
 }
-SECRET_KEYS = ("azure_docintel_key", "azure_openai_key")   # shown as "set" / "not set" wherever settings are listed
-REVIEWERS = ("copilot", "azure")
+AZURE_KEYS = ("azure_docintel_key", "azure_openai_key")
+SECRET_KEYS = AZURE_KEYS + ("mission_control_key",)   # shown as "set" / "not set" wherever settings are listed
+REVIEWERS = ("mission_control", "copilot", "azure")
 REQUIRED = ["cases_root", "base_message_path", "daily_instructions_path", "python_executable", "edge_executable",
             "runtime_root"]
 PATH_KEYS = REQUIRED + ["instructions_path", "result_contract_path", "node_executable", "dependency_directory", "approved_root",
-                        "approved_unc_root", "driver_cache_dir", "guidance_dir", "last_csv_path", "az_cli_path"]
+                        "approved_unc_root", "driver_cache_dir", "guidance_dir", "last_csv_path", "az_cli_path",
+                        "bam_reports_dir"]
 HERE = Path(os.path.abspath(__file__)).parent   # never .resolve(): it turns a mapped drive (S:) into its UNC form
 PROJECT = HERE.parent                           # the tool's top folder: Run.cmd, sender_config.json, guidance/, shared/
 if str(PROJECT) not in sys.path:                # embedded Python does not add the script folder: shared/ is found here
@@ -491,8 +504,49 @@ def ask_azure(cur: dict) -> None:
         cur["azure_low_confidence"] = value
     value = ask("  Azure CLI az.cmd (optional; only for signin)", cur.get("az_cli_path") or "", True)
     cur["az_cli_path"] = value
-    keys = ", ".join(f"{k}: {'set' if cur.get(k) else 'not set'}" for k in SECRET_KEYS)
+    keys = ", ".join(f"{k}: {'set' if cur.get(k) else 'not set'}" for k in AZURE_KEYS)
     print(f"  Keys: {keys}")
+
+
+def ask_mission_control(cur: dict) -> None:
+    """Part 3 = Mission Control: its endpoint (empty = not connected yet) and how to sign in to it."""
+    print("\nMISSION CONTROL - each complete case (documents, snapshot, BAM Report details) is sent to the company workflow.\n"
+          "  Leave the address empty until you have it: the cases are then prepared and saved, not sent.")
+    cur["mission_control_url"] = ask_text("  Mission Control endpoint address (https://...; Enter = not connected yet)",
+                                          cur.get("mission_control_url") or "", True)
+    auth = ask_text("  How to sign in: none, or key (a key sent with every case)",
+                    cur.get("mission_control_auth") or "none").strip().lower()
+    cur["mission_control_auth"] = auth if auth in ("none", "key") else "none"
+    if cur["mission_control_auth"] == "key":
+        cur["mission_control_key_header"] = ask_text("  Name of the header that carries the key",
+                                                     cur.get("mission_control_key_header") or "api-key")
+        cur["mission_control_key"] = ask_secret("  Mission Control key", cur.get("mission_control_key") or "")
+    else:                                         # no key kept on disk when it is not used
+        cur["mission_control_key"] = ""
+    print(f"  Key: {'set' if cur.get('mission_control_key') else 'not set'}")
+
+
+def mission_control_problems(cfg) -> list:
+    """Problems of the Mission Control settings (labels only: never the address or the key in the text)."""
+    out = []
+    url = str(getattr(cfg, "mission_control_url", "") or "")
+    if url:
+        u = urlparse(url)
+        local = (u.hostname or "") in ("127.0.0.1", "localhost")
+        if not u.netloc or not (u.scheme == "https" or (u.scheme == "http" and local)):
+            out.append("mission_control_url must be an https:// address")
+    if getattr(cfg, "mission_control_auth", "none") not in ("none", "key"):
+        out.append("mission_control_auth must be 'none' or 'key'")
+    elif cfg.mission_control_auth == "key":
+        if not getattr(cfg, "mission_control_key", ""):
+            out.append("mission_control_key is not set (mission_control_auth is 'key')")
+        if not str(getattr(cfg, "mission_control_key_header", "") or "").strip():
+            out.append("mission_control_key_header is not set")
+    for key, low in (("mission_control_timeout", 5), ("mission_control_parallel", 1)):
+        value = getattr(cfg, key, None)
+        if not isinstance(value, int) or isinstance(value, bool) or value < low:
+            out.append(f"{key} must be a whole number, {low} or more")
+    return out
 
 
 def azure_problems(cfg) -> list:
@@ -505,7 +559,7 @@ def azure_problems(cfg) -> list:
     if cfg.azure_auth not in ("key", "signin"):
         out.append("azure_auth must be 'key' or 'signin'")
     elif cfg.azure_auth == "key":
-        out += [f"{k} is not set (azure_auth is 'key')" for k in SECRET_KEYS if not getattr(cfg, k, "")]
+        out += [f"{k} is not set (azure_auth is 'key')" for k in AZURE_KEYS if not getattr(cfg, k, "")]
     for key in ("azure_form_model", "azure_review_model"):
         if not str(getattr(cfg, key, "") or "").strip():
             out.append(f"{key} (a deployment name) is not set")
@@ -603,9 +657,15 @@ def setup_command() -> int:
     cur["edge_executable"] = ask_file("edge_executable", "Installed msedge.exe", "msedge.exe", edge)
     cur["runtime_root"] = ask_dir("runtime_root", "Runtime folder on S: for all tool files (RUNTIME_ROOT; created if missing)",
                                   create=True, default=str(PROJECT / "sender_runtime"))
+    value = ask("Folder where you drop each BAM Report .xlsx (created if missing)",
+                cur.get("bam_reports_dir") or str(PROJECT / "BAM Reports"))
+    cur["bam_reports_dir"] = value
     print("\nThe pages the daily pipeline connects to - pasted once, kept only in this computer's sender_config.json.\n"
-          "Your original Part 1 / Part 2 scripts have each value.\n\n"
+          "Your original Part 1 / Part 2 scripts have each value.\n"
+          "Each system also gets a NAME of your choice: shown on screen, in the menu and in your own logs. It is saved\n"
+          "on this computer only, so updating the project (git pull) never changes it - only running setup again does.\n\n"
           "SYSTEM 1 - where the case documents are downloaded from (Part 1)")
+    cur["system1_name"] = ask_text("  Name for System 1", cur.get("system1_name") or "System 1").strip() or "System 1"
     cur["system1_url"] = ask_text("  Its inbox page address (the page that shows My Inbox)", cur.get("system1_url") or "")
     cur["system1_viewer_marker"] = ask_text(
         "  Document viewer marker: the text that names the viewer page in a document's link (the part of the\n"
@@ -616,6 +676,7 @@ def setup_command() -> int:
                                          cur.get("system1_brand_text") or "")
     cur["system1_brand_html"] = ask_text("  Logo markup pattern (Enter = none)", cur.get("system1_brand_html") or "", True)
     print("\nSYSTEM 2 - where the account snapshots are retrieved from (Part 2)")
+    cur["system2_name"] = ask_text("  Name for System 2", cur.get("system2_name") or "System 2").strip() or "System 2"
     cur["system2_url"] = ask_text("  A page address that shows 'logout' when you are signed in", cur.get("system2_url") or "")
     cur["system2_account_page"] = ask_text("  Account summary page address, with {account} where the account number goes",
                                            cur.get("system2_account_page") or "")
@@ -629,9 +690,12 @@ def setup_command() -> int:
     cur["system2_customer_summary_page"] = ask_text(
         "  Customer summary page address (it shows the Charity Commission Number), with {customer} where the\n"
         "  CSV's Client Number goes", cur.get("system2_customer_summary_page") or "")
-    who = ask_text("\nPART 3 - which reviewer: copilot (Microsoft 365 Copilot in Edge) or azure (Azure Document "
-                   "Intelligence + an Azure language model)", cur.get("reviewer") or "copilot").strip().lower()
-    cur["reviewer"] = who if who in REVIEWERS else "copilot"
+    who = ask_text("\nSYSTEM 3 - who reviews the cases: mission_control (the company workflow), copilot (Microsoft 365 "
+                   "Copilot in Edge) or azure (Azure Document Intelligence + an Azure language model)",
+                   cur.get("reviewer") or "mission_control").strip().lower().replace(" ", "_")
+    cur["reviewer"] = who if who in REVIEWERS else "mission_control"
+    if cur["reviewer"] == "mission_control":
+        ask_mission_control(cur)
     if cur["reviewer"] == "azure":
         ask_azure(cur)
         while not cur["result_contract_path"]:       # the Azure reviewer always answers in the contract's format
@@ -723,7 +787,9 @@ def validate_config(cfg):
         problems.append("completion_mode 'json_result' needs result_contract_path (or use 'submission_only')")
     reviewer = getattr(cfg, "reviewer", "copilot")
     if reviewer not in REVIEWERS:
-        problems.append("reviewer must be 'copilot' or 'azure'")
+        problems.append("reviewer must be 'mission_control', 'copilot' or 'azure'")
+    elif reviewer == "mission_control":
+        problems += mission_control_problems(cfg)
     elif reviewer == "azure":
         problems += azure_problems(cfg)
         if not cfg.result_contract_path or cfg.completion_mode != "json_result":
@@ -997,9 +1063,14 @@ def register_redactions(red: Redactor, cfg, policy: PathPolicy | None) -> None:
               "base_message_path": "BASE_MESSAGE_FILE", "python_executable": "PYTHON_EXECUTABLE",
               "edge_executable": "EDGE_EXECUTABLE", "node_executable": "NODE_EXECUTABLE",
               "dependency_directory": "DEPENDENCY_DIR", "approved_root": "APPROVED_ROOT",
-              "approved_unc_root": "APPROVED_UNC_ROOT", "driver_cache_dir": "DRIVER_CACHE_DIR", "guidance_dir": "GUIDANCE_DIR"}
+              "approved_unc_root": "APPROVED_UNC_ROOT", "driver_cache_dir": "DRIVER_CACHE_DIR", "guidance_dir": "GUIDANCE_DIR",
+              "bam_reports_dir": "BAM_REPORTS_DIR", "mission_control_url": "MISSION_CONTROL_ENDPOINT"}
     for key, label in labels.items():
         red.add(getattr(cfg, key, ""), label)
+    for key, label in (("system1_name", "System 1"), ("system2_name", "System 2")):   # your names stay off shared logs
+        name = str(getattr(cfg, key, "") or "").strip()
+        if len(name) >= 3 and name != label:
+            red.add(name, label)
     for key in SECRET_KEYS:                       # a key that slips into any text (an error message) is replaced too
         red.add(getattr(cfg, key, ""), "<secret>")
     if policy and policy.unc_root:
@@ -4406,7 +4477,10 @@ class PipelineFeed:
             red.add(case.ref, case.alias + "-ref")
             try:
                 policy.check(case.path, "case folder")
-                fixed = [doc_of(policy.check(m.get("guidance") or "", "Sub Worktype instructions"))]
+                # Mission Control hands over no instructions file (its agents have them); Copilot/Azure always do.
+                needs_rules = self.plan.get("reviewer") != "mission_control"
+                fixed = ([doc_of(policy.check(m.get("guidance") or "", "Sub Worktype instructions"))]
+                         if needs_rules or m.get("guidance") else [])
             except (PathError, OSError) as exc:
                 case.blocked, fixed = (str(exc) if isinstance(exc, PathError) else
                                        "the Sub Worktype instructions file could not be read"), []

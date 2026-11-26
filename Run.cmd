@@ -1,10 +1,10 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
-title Daily review - System 1 + System 2 + Copilot or Azure
-rem Double-click = the daily review (Part 1 System 1 documents + Part 2 System 2 snapshots + Part 3 Copilot - or the
-rem Azure reviewer when setup says reviewer = azure - together).
-rem   Run.cmd run         the daily review (same as double-click; asks for the daily CSV)
-rem   Run.cmd setup       paste/edit your paths, URLs and options (saved in sender_config.json)
+title Daily review
+rem Double-click = the MENU: full run, System 1 only, System 2 only, System 1 + 2, System 3 only (Mission Control,
+rem or Copilot / Azure when setup says so), setup, check.  Every run asks for the BAM Report (.xlsx) and which cases.
+rem   Run.cmd run         the same menu (add --mode ... --report ... --scope ... to skip the questions)
+rem   Run.cmd setup       paste/edit your paths, URLs, system names and options (saved in sender_config.json)
 rem   Run.cmd check       validate everything without sending (add --browser to also test Edge); with the Azure
 rem                       reviewer it also checks that Azure answers
 rem   Run.cmd plan        dry run of what is in CASES_ROOT now

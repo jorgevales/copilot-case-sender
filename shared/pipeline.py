@@ -44,7 +44,10 @@ DETAIL_SECTIONS = ("01 Personal Details", "02 Contact Details", "03 Corresponden
                    "05 Banking Details", "06 Other Details", "07 Suspended Activity", "08 Future Dated Instructions",
                    "09 Flags and Custom Details")
 ID_RE = re.compile(r"^[0-9a-f]{32}$")
-REVIEWERS = ("copilot", "azure")       # Part 3: the Copilot sender (default) or the Azure reviewer
+REVIEWERS = ("mission_control", "copilot", "azure")   # Part 3 (System 3): Mission Control (default), Copilot or Azure
+REVIEWER_NAMES = {"mission_control": "Mission Control", "copilot": "Copilot", "azure": "the Azure reviewer"}
+# The run's systems: '1' = System 1 documents, '2' = System 2 snapshots, '3' = System 3 (the reviewer).
+MODES = {"full": "123", "s1": "1", "s2": "2", "s12": "12", "s3": "3"}
 AZURE_LEDGER = "azure_reviewed_instructions.txt"   # in RUNTIME_ROOT: the Azure reviewer's own "already reviewed" list
 AZURE_RESULTS = "results-azure"         # in RUNTIME_ROOT: the Azure reviewer's <instruction id>.json per case
 CASE_SOURCE_NOT_STATED = "not stated"   # the Studio report has no case source for the case
@@ -155,8 +158,20 @@ def source_head(heads: dict):
     return next((h for k, h in heads.items() if "source" in k), None)
 
 
+def read_report(path) -> tuple[list, list, list]:
+    """The daily run's case list: the BAM Report .xlsx (shared/bam_report.py) -> (cases, excluded rows, warnings).
+    Only an .xlsx is accepted here; the CSV reader below stays for the laptop's synthetic tests (azure-test)."""
+    from shared import bam_report as BAM
+    try:
+        return BAM.read_bam_report(path, ID_RE, REVIEWED_STATUS, norm_account)
+    except BAM.ReportError as exc:
+        raise CsvError(str(exc)) from None
+
+
 def read_case_list(path) -> tuple[list, list]:
-    """The daily CSV (the BAM Studio report saved as CSV) -> (cases to review, skipped rows).
+    """A case list -> (cases to review, skipped rows): the BAM Report .xlsx, or a CSV (laptop tests only).
+
+    The CSV (the BAM Studio report saved as CSV):
 
     Columns (header spelling is loose): Request Id (also the older 'Instruction Id' / 'instrcution id' spellings),
     Client Account Number, Client Number, Process Status, Sub Worktype, (optional) End Date - the case end in UK time,
@@ -165,6 +180,9 @@ def read_case_list(path) -> tuple[list, list]:
     columns are ignored.  Only Process Status 'Ended' is reviewed; every other row is returned in `skipped` with the
     reason, so it can be shown clearly - nothing is dropped silently."""
     path = Path(path)
+    if path.suffix.lower() == ".xlsx":
+        cases, skipped, _warnings = read_report(path)
+        return cases, skipped
     if not path.is_file():
         raise CsvError("the CSV file was not found")
     text = path.read_text(encoding="utf-8-sig", errors="replace")
@@ -267,6 +285,21 @@ class Paths:
 
     def snapshot(self, account: str, day: str | None = None) -> Path:
         return self.snapshots(day) / f"{norm_account(account)}{SNAPSHOT_SUFFIX}"
+
+    def latest_snapshot(self, account: str) -> Path | None:
+        """The newest snapshot of this account on any day (used when System 2 is not part of the run)."""
+        name = f"{norm_account(account)}{SNAPSHOT_SUFFIX}"
+        try:
+            days = sorted((d for d in (self.root / "snapshots").iterdir() if d.is_dir()), key=lambda d: d.name,
+                          reverse=True)
+        except OSError:
+            return None
+        return next((d / name for d in days if (d / name).is_file()), None)
+
+    @property
+    def older(self) -> Path:
+        """RUNTIME_ROOT\\pipeline\\older\\<run>: what a 'run them again' moved aside (never deleted)."""
+        return self.root / "older" / self.run.name
 
     @property
     def plan(self) -> Path:
@@ -455,11 +488,23 @@ AZURE_OUTCOMES = {
     "result_inconclusive": "reviewed - Azure: Inconclusive", "result_invalid": "reviewed - answer not in the required format",
     "held": "held", "not_sent_stopped": "not reviewed - run stopped", "skipped_already_sent": "already reviewed earlier",
 }
+# reviewer = mission_control
+MISSION_OUTCOMES = {
+    "mc_sent": "sent to Mission Control", "mc_prepared": "prepared - Mission Control not connected yet",
+    "mc_failed": "NOT sent to Mission Control - failed", "mc_uncertain": "UNCERTAIN send - check Mission Control",
+    "not_sent_stopped": "not sent - run stopped", "held": "held",
+}
+READY = "ready - documents and snapshot complete (not sent in this run)"
+WAITING = "not complete yet"
+EXCLUDED = "excluded automatically"
 REPORT_COLUMNS = ["row", "instruction_id", "client_account_number", "client_number", "process_status", "sub_worktype",
-                  "case_source", "outcome", "detail", "left_out_files", "copilot_chat"]
+                  "case_source", "received_date", "outcome", "detail", "left_out_files", "copilot_chat"]
 REVIEWED = ("sent - Copilot: Correct", "sent - Copilot: Incorrect", "sent - Copilot: Inconclusive",
-            "reviewed - Azure: Correct", "reviewed - Azure: Incorrect", "reviewed - Azure: Inconclusive")
-EARLIER = ("already sent earlier", "already reviewed earlier")
+            "reviewed - Azure: Correct", "reviewed - Azure: Incorrect", "reviewed - Azure: Inconclusive",
+            "sent to Mission Control")
+EARLIER = ("already sent earlier", "already reviewed earlier", "already done - skipped by your choice",
+           "already complete")
+CALM = (READY, WAITING, MISSION_OUTCOMES["mc_prepared"])   # expected outcomes of a partial run: nothing needs you
 
 
 def azure_result(paths: Paths, iid: str, since: str = ""):
@@ -484,14 +529,18 @@ def daily_report(paths: Paths, plan: dict, control: Control) -> list:
     from status\\part3-results.json (the reviewer ended early) is taken from its results-azure file of this run."""
     held = control.held()
     sent = read_json(paths.sub("status") / "part3-results.json", {}) or {}
+    waiting = read_json(paths.sub("status") / "waiting.json", {}) or {}
     azure = plan.get("reviewer") == "azure"
-    words = AZURE_OUTCOMES if azure else OUTCOMES
+    mission = plan.get("reviewer") == "mission_control"
+    sending = plan.get("send", True)
+    words = AZURE_OUTCOMES if azure else MISSION_OUTCOMES if mission else OUTCOMES
     earlier = EARLIER[1] if azure else EARLIER[0]
     rows = []
     for c in plan["skipped"]:
         rows.append({"row": c["row_number"], "instruction_id": c["iid"], "client_account_number": c["account"],
                      "client_number": c["client_number"], "process_status": c["status"],
-                     "sub_worktype": c["sub_worktype_csv"], "case_source": c.get("case_source", ""), "outcome": "skipped",
+                     "sub_worktype": c["sub_worktype_csv"], "case_source": c.get("case_source", ""),
+                     "received_date": c.get("received_date", ""), "outcome": EXCLUDED if plan.get("bam") else "skipped",
                      "detail": c["reason"], "left_out_files": "", "copilot_chat": ""})
     for c in plan["cases"]:
         iid = c["iid"]
@@ -499,11 +548,18 @@ def daily_report(paths: Paths, plan: dict, control: Control) -> list:
         row = {"row": c["row_number"], "instruction_id": iid, "client_account_number": c["account"],
                "client_number": c["client_number"], "process_status": c["status"],
                "sub_worktype": m.get("sub_worktype") or c["sub_worktype_csv"],
-               "case_source": c.get("case_source") or CASE_SOURCE_NOT_STATED, "outcome": "", "detail": "",
+               "case_source": c.get("case_source") or CASE_SOURCE_NOT_STATED,
+               "received_date": c.get("received_date", ""), "outcome": "", "detail": "",
                "left_out_files": "", "copilot_chat": ""}
         r = sent.get(iid) or (azure_result(paths, iid, plan.get("created", "")) if azure else None)
+        handed = read_json(paths.cases / f"{iid}.json") or {}
         if c["needs"] in ("done", "held"):
-            row.update(outcome=earlier if c["needs"] == "done" else "held", detail=c["note"])
+            word = c.get("word") or (earlier if c["needs"] == "done" else "held")
+            row.update(outcome=word, detail=c["note"])
+        elif iid in waiting:
+            row.update(outcome=WAITING, detail=waiting[iid])
+        elif not sending and iid not in held and handed and (paths.cases_root / handed.get("folder", "")).is_dir():
+            row.update(outcome=READY, detail="in CASES_ROOT, ready for System 3")
         elif r and not (azure and r["state"] == "held"):
             row.update(outcome=words.get(r["state"], r["state"]), detail=r.get("reason", ""),
                        left_out_files=r.get("left_out_files") or "", copilot_chat=r.get("chat", ""))
@@ -511,6 +567,8 @@ def daily_report(paths: Paths, plan: dict, control: Control) -> list:
             row.update(outcome="held", detail=held[iid]["reason"])
         elif r:                                         # azure: held, but its held file is missing
             row.update(outcome="held", detail=r.get("reason", ""))
+        elif m and not sending:
+            row.update(outcome=WAITING, detail="documents downloaded - the account snapshot is not complete yet")
         elif m:
             row.update(outcome="not sent - run ended" if not azure else "not reviewed - run ended",
                        detail="downloaded, not handed over or not " + ("reviewed" if azure else "sent") + " yet")
@@ -525,12 +583,13 @@ def daily_report(paths: Paths, plan: dict, control: Control) -> list:
 
 def needs_you(row: dict) -> bool:
     """A row you have to look at: anything but a clean verdict, an earlier send or a skipped row."""
-    return row["outcome"] not in REVIEWED + EARLIER + ("skipped",) or "CHECK" in str(row.get("detail", ""))
+    return (row["outcome"] not in REVIEWED + EARLIER + CALM + ("skipped", EXCLUDED)
+            or "CHECK" in str(row.get("detail", "")))
 
 
 def workload_line(rows: list) -> str:
-    """'Reviewed X of Y ...' - the one line that says whether the whole CSV was done."""
-    ended = [r for r in rows if r["outcome"] != "skipped"]
+    """'Reviewed X of Y ...' - the one line that says whether the whole list was done."""
+    ended = [r for r in rows if r["outcome"] not in ("skipped", EXCLUDED)]
     reviewed = sum(1 for r in ended if r["outcome"] in REVIEWED)
-    return (f"Reviewed {reviewed} of {len(ended)} 'Ended' case(s) ({len(rows)} CSV row(s), "
-            f"{len(rows) - len(ended)} skipped); {sum(1 for r in rows if needs_you(r))} need you")
+    return (f"Reviewed {reviewed} of {len(ended)} 'Ended' case(s) ({len(rows)} row(s), "
+            f"{len(rows) - len(ended)} excluded); {sum(1 for r in rows if needs_you(r))} need you")

@@ -93,6 +93,8 @@ def configure(cfg):
     BRAND_TEXT, BRAND_HTML = cfg.system1_brand_text or "(?!)", cfg.system1_brand_html or "(?!)"   # (?!) never matches
     WORK_ROOT = Path(cfg.cases_root) / P.WORK_DIR
     GUIDANCE_DIR, CONTRACT = getattr(cfg, "guidance_dir", "") or "", getattr(cfg, "result_contract_path", "") or ""
+    if getattr(cfg, "reviewer", "") == "mission_control":   # its agents have the instructions: no case is held for them
+        GUIDANCE_DIR = ""
 
 
 def guidance_problem(sub_system1, sub_csv):

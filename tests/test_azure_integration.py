@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 
 import test_sender as T                              # the loaded sender (T.S) and its fakes
+import bam_helpers as BH                             # synthetic BAM Reports
 import test_pipeline as TP                           # its helpers (base fixture, CSV writer, fake parts, FeedWorld)
 from test_sender import env, env2                    # noqa: F401  (pytest fixtures)
 from test_pipeline import base                       # noqa: F401  (pytest fixture)
@@ -130,7 +131,7 @@ def test_the_daily_report_words_azure_outcomes_and_uses_only_this_runs_azure_fil
     assert report[hexid(3)]["outcome"] == "not reached - run ended"                # the stale file is not this run's
     assert report[hexid(4)]["outcome"] == "held" and ".msg" in report[hexid(4)]["detail"]
     assert report[hexid(5)]["outcome"] == "already reviewed earlier"
-    assert P.workload_line(list(report.values())) == "Reviewed 2 of 5 'Ended' case(s) (5 CSV row(s), 0 skipped); 2 need you"
+    assert P.workload_line(list(report.values())) == "Reviewed 2 of 5 'Ended' case(s) (5 row(s), 0 excluded); 2 need you"
     assert list(P.REPORT_COLUMNS).index("case_source") == list(P.REPORT_COLUMNS).index("sub_worktype") + 1
 
 
@@ -292,10 +293,9 @@ def test_a_whole_run_with_the_azure_reviewer(base, monkeypatch, capsys):
     (cases_root / W.AZURE_NAME).write_bytes(b"older azure run")
     (runtime / "sent_instructions.txt").write_text(f"{hexid(1)}\tsubmitted\tx\n", "utf-8")   # Copilot's: not Azure's
     (runtime / P.AZURE_LEDGER).write_text(f"{hexid(4)}\tresult_correct\tx\n", "utf-8")
-    csv = write_csv(base / "studio.csv", [(hexid(1), "AB100000", "C1", "Ended", "Change of Address", "", "Email", "T"),
-                                          (hexid(2), "AB200000", "C2", "Voided", "Change of Address", "", "Post", "T"),
-                                          (hexid(4), "AB400000", "C4", "Ended", "Change of Address", "", "Post", "T")],
-                    header=STUDIO)
+    csv = BH.write_bam(base / "BAM Report.xlsx", [BH.case(hexid(1), "AB100000", client="C1", source="Email"),
+                                                  BH.case(hexid(2), "AB200000", "Voided", client="C2", source="Post"),
+                                                  BH.case(hexid(4), "AB400000", client="C4", source="Post")])
     fakes = {}
     for name, src, part in (("part1", TP.FAKE_PART, "part1"), ("part2", TP.FAKE_PART, "part2"), ("azure", FAKE_AZURE, "")):
         fakes[name] = base / f"fake_{name}.py"
@@ -306,12 +306,12 @@ def test_a_whole_run_with_the_azure_reviewer(base, monkeypatch, capsys):
     sender = sys.modules["copilot_case_sender"]
     monkeypatch.setattr(sender, "ensure_dependencies", lambda *a: None)
     monkeypatch.setattr(sender, "cdp_http", lambda *a, **k: None)
-    monkeypatch.setattr(R, "open_systems_edge", lambda cfg, rt: "started (fake)")
+    monkeypatch.setattr(R, "open_systems_edge", lambda cfg, rt, used="12": "started (fake)")
     monkeypatch.setattr(R, "PART_SCRIPTS", {"part1": fakes["part1"], "part2": fakes["part2"]})
     monkeypatch.setattr(R, "AZURE_SCRIPT", fakes["azure"])
     monkeypatch.setattr(R, "SENDER_SCRIPT", base / "the-copilot-sender-must-not-start.py")
     try:
-        code = R.main(["--csv", str(csv)])
+        code = R.main(["--report", str(csv), "--mode", "full", "--scope", "all"])
     finally:
         sender.WRITE_GUARD["roots"] = None
         os.environ.clear()
@@ -320,12 +320,12 @@ def test_a_whole_run_with_the_azure_reviewer(base, monkeypatch, capsys):
         sys.dont_write_bytecode, sys.pycache_prefix = False, None
     out = capsys.readouterr().out
     assert code == 0, out
-    assert "Starting the Azure reviewer (Part 3)" in out
+    assert "Starting Azure reviewer" in out
     report = next((runtime / "reports").glob("daily-report-*.csv")).read_text("utf-8-sig").splitlines()
     head = report[0].split(",")
     by_id = {dict(zip(head, line.split(",")))["instruction_id"]: dict(zip(head, line.split(","))) for line in report[1:]}
     assert by_id[hexid(1)]["outcome"] == "reviewed - Azure: Correct" and by_id[hexid(1)]["detail"] == "source Email"
-    assert by_id[hexid(1)]["case_source"] == "Email" and by_id[hexid(2)]["outcome"] == "skipped"
+    assert by_id[hexid(1)]["case_source"] == "Email" and by_id[hexid(2)]["outcome"] == "excluded automatically"
     assert by_id[hexid(4)]["outcome"] == "already reviewed earlier"           # the Azure ledger, not Copilot's
     files = sorted(p.name for p in cases_root.iterdir() if p.is_file())
     assert W.NAME in files and any(n.startswith("Azure review results - older ") for n in files)
@@ -343,6 +343,7 @@ def test_the_pipeline_settings_for_azure_skip_the_copilot_port_and_need_the_cont
                                    "system2_detail_pages": {n: "https://b.invalid/{account}" for n in P.DETAIL_SECTIONS},
                                    "cdp_port": 9223, "systems_cdp_port": 9223, "result_contract_path": "",
                                    "completion_mode": "submission_only"})
+    cfg.reviewer = "copilot"
     assert any("systems_cdp_port" in p for p in R.pipeline_problems(cfg))          # Copilot: two Edges
     cfg.reviewer = "azure"
     monkeypatch.setattr(R, "AZURE_SCRIPT", base / "missing.py")

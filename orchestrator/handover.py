@@ -11,6 +11,7 @@ A case that cannot be completed is held with a plain reason (shown in the daily 
 from __future__ import annotations
 
 import csv
+import datetime
 import json
 import os
 import shutil
@@ -27,35 +28,102 @@ def _special(contract) -> list:
     return [p for p in (contract if isinstance(contract, (list, tuple)) else [contract]) if p]
 
 
+def needs_guidance(reviewer: str) -> bool:
+    """Copilot and Azure get a Sub Worktype instructions file with every case; Mission Control's agents have them."""
+    return reviewer != "mission_control"
+
+
 def build_plan(cases: list, skipped: list, paths: P.Paths, sent: set, guidance_dir, contract,
-               reviewer: str = "copilot") -> dict:
-    """What each CSV row needs this run: 'download' (Parts 1 + 2, then sent), 'send' (complete from an earlier run),
-    'done' (sent / reviewed in an earlier run: `sent` is the ledger of THIS reviewer) or 'held' (cannot be done safely
-    - with the reason).  `reviewer` (copilot / azure) is recorded so the daily report words the outcomes for it."""
+               reviewer: str = "copilot", systems: str = "123", rerun=(), skip=(), extra=None) -> dict:
+    """What each case needs this run: 'download' (Parts 1 / 2 work on it, then it is handed over), 'send' (complete
+    from an earlier run), 'done' (nothing to do: sent / reviewed earlier - `sent` is the 'never twice' list of Copilot or
+    Azure - or already complete when System 3 is not in the run, or skipped by your choice) or 'held' (cannot be done
+    safely - with the reason).
+
+    `systems` ('1', '2', '3' in any combination, see P.MODES) is the run's choice.  `rerun` = cases you chose to run
+    again although they were done before: what an earlier run left (case folder, downloads, today's snapshot) is
+    moved aside by `set_aside_for_rerun` before the parts start, so they work on it from scratch.  `skip` = cases you
+    chose NOT to run again.  `extra` is copied into the plan (BAM Report name, run choice, out-of-scope count)."""
     try:
         existing = {e.name[:32].lower(): e.name for e in os.scandir(paths.cases_root)
                     if e.is_dir() and P.ID_RE.match(e.name[:32].lower())}
     except OSError:
         existing = {}
+    retrieve, send = "1" in systems or "2" in systems, "3" in systems
+    rerun, skip = set(rerun), set(skip)
     out = []
     for c in cases:
         iid, item = c["iid"], dict(c)
         handed = P.read_json(paths.cases / f"{iid}.json")
-        if iid in sent:
-            item.update(needs="done", note="sent in an earlier run")
-        elif handed and (paths.cases_root / handed["folder"]).is_dir():
+        complete = bool(handed and (paths.cases_root / handed["folder"]).is_dir())
+        m = P.read_json(paths.downloads / f"{iid}.json")
+        has_docs = bool(m and (paths.work / m.get("folder", "")).is_dir())
+        if iid in skip:
+            item.update(needs="done", note="done before - not run again (your choice)",
+                        word="already done - skipped by your choice")
+        elif send and iid in sent and reviewer != "mission_control":
+            item.update(needs="done", note=f"sent in an earlier run - {P.REVIEWER_NAMES.get(reviewer, reviewer)} "
+                                           "never gets the same case twice")
+        elif complete and iid in rerun and retrieve:
+            item.update(needs="download", note="run again (your choice)", redo=True)
+        elif complete and send:
             item.update(needs="send", note="complete from an earlier run - only sent now")
+        elif complete:
+            item.update(needs="done", note="documents and snapshot already complete - ready for System 3",
+                        word="already complete")
         elif iid in existing:
             item.update(needs="held", note="a folder for this instruction ID already exists in CASES_ROOT and was not "
                                            "made by this pipeline - move it out, then run again")
+        elif "1" not in systems and not has_docs and send and "2" not in systems:
+            item.update(needs="held", note="its documents are not downloaded yet - run System 1 first")
         else:
-            item.update(needs="download", note="")
+            item.update(needs="download", note="", redo=bool(iid in rerun and has_docs and "1" in systems))
         out.append(item)
     downloads = [c for c in out if c["needs"] == "download"]
     no_guidance = sorted({c["sub_worktype_csv"] for c in downloads
-                          if not P.guidance_for(c["sub_worktype_csv"], guidance_dir, exclude=_special(contract))})
+                          if not P.guidance_for(c["sub_worktype_csv"], guidance_dir, exclude=_special(contract))}) \
+        if needs_guidance(reviewer) else []
     return {"run": paths.run.name, "day": P.today(), "created": P.now(), "reviewer": reviewer, "cases": out,
-            "skipped": skipped, "parts": {"part1": bool(downloads), "part2": bool(downloads)}, "no_guidance": no_guidance}
+            "skipped": skipped, "systems": systems, "send": send, **(extra or {}),
+            "parts": {"part1": bool(downloads) and "1" in systems, "part2": bool(downloads) and "2" in systems},
+            "no_guidance": no_guidance}
+
+
+def set_aside_for_rerun(paths: P.Paths, plan: dict) -> list:
+    """Cases you chose to run again: their earlier case folder, hand-over and download records and (when System 2 is
+    in the run) today's snapshot of their account are MOVED to RUNTIME_ROOT\\pipeline\\older\\<run>\\ - never deleted.
+    Returns plain lines for the screen (a move that fails holds the case: it is never half re-run)."""
+    lines, moved_snaps = [], set()
+    systems = plan.get("systems", "123")
+    for c in plan["cases"]:
+        if c.get("needs") != "download" or c["iid"] not in set(plan.get("rerun") or []):
+            continue
+        iid, dest = c["iid"], paths.older / c["iid"]
+        try:
+            dest.mkdir(parents=True, exist_ok=True)
+            handed = P.read_json(paths.cases / f"{iid}.json") or {}
+            m = P.read_json(paths.downloads / f"{iid}.json") or {}
+            done = paths.cases_root / handed["folder"] if handed.get("folder") else None
+            if done is not None and done.is_dir():
+                if "1" in systems:                     # documents downloaded again: the old folder is kept aside
+                    shutil.move(str(done), str(dest / done.name))
+                else:                                  # only the snapshot is redone: the documents go back to .work
+                    os.rename(done, paths.work / done.name)
+            if (paths.cases / f"{iid}.json").is_file():
+                shutil.move(str(paths.cases / f"{iid}.json"), str(dest / "handed.json"))
+            if "1" in systems:
+                if m.get("folder") and (paths.work / m["folder"]).is_dir():
+                    shutil.move(str(paths.work / m["folder"]), str(dest / m["folder"]))
+                if (paths.downloads / f"{iid}.json").is_file():
+                    shutil.move(str(paths.downloads / f"{iid}.json"), str(dest / "downloads.json"))
+            snap = paths.snapshot(c["account"], plan.get("day"))
+            if "2" in systems and snap.is_file() and c["account"] not in moved_snaps:
+                shutil.move(str(snap), str(dest / snap.name))
+                moved_snaps.add(c["account"])
+        except OSError as exc:
+            c.update(needs="held", note=f"could not move the earlier files aside to run it again ({type(exc).__name__})")
+            lines.append(f"  {iid}: NOT run again - its earlier files could not be moved aside")
+    return lines
 
 
 # ---------------------------------------------------------------------------------------------- the hand-over
@@ -64,12 +132,16 @@ class Handover:
     """Called every half second by the coordinator while the run goes on (`step`).  `alive(part)` says whether that
     part's process is still running (a part that crashed counts as finished)."""
 
-    def __init__(self, paths: P.Paths, control: P.Control, plan: dict, guidance_dir, contract, alive=lambda part: True):
+    def __init__(self, paths: P.Paths, control: P.Control, plan: dict, guidance_dir, contract, alive=lambda part: True,
+                 done_log=None):
         self.paths, self.control, self.plan = paths, control, plan
         self.guidance_dir, self.contract, self.alive = guidance_dir, contract, alive
         self.todo = [c for c in plan["cases"] if c.get("needs") == "download"]
         self.day = plan.get("day")
-        self.done, self.handed = set(), []
+        self.systems = plan.get("systems", "123")
+        self.rules = needs_guidance(plan.get("reviewer", "copilot"))
+        self.done, self.handed, self.waiting = set(), [], {}
+        self.log, self.logged = done_log, set()           # the already-done log: System 1 / System 2 lines
 
     def over(self, part: str) -> bool:
         return bool(self.control.is_finished(part)) or not self.alive(part)
@@ -79,36 +151,83 @@ class Handover:
         self.control.event("coordinator", f"{iid} HELD: {reason}", iid=iid)
         self.done.add(iid)
 
+    def _wait(self, iid: str, reason: str) -> None:
+        """Not complete yet, by the run's choice (e.g. System 1 only): no problem, it is finished in a later run."""
+        self.waiting[iid] = reason
+        P.write_json(self.paths.sub("status") / "waiting.json", self.waiting)
+        self.control.event("coordinator", f"{iid} not complete yet: {reason}", "detail", iid=iid)
+        self.done.add(iid)
+
+    def _note_done(self, c: dict, m) -> None:
+        """One already-done line per case and system, when this run's System 1 / System 2 made it (not reused)."""
+        if self.log is None:
+            return
+        since = self.plan.get("created", "")
+        if "1" in self.systems and m and (c["iid"], "system1") not in self.logged and \
+                str(m.get("finished") or self._made(self.paths.downloads / f"{c['iid']}.json")) >= since:
+            self._log_line(c, "system1", "downloaded", f"{len(m.get('documents') or [])} document(s) + Audit Trail",
+                           m.get("sub_worktype", ""))
+        snap = self.paths.snapshot(c["account"], self.day)
+        if "2" in self.systems and (c["iid"], "system2") not in self.logged and snap.is_file():
+            if self._made(snap) >= since:
+                self._log_line(c, "system2", "captured", "", (m or {}).get("sub_worktype", "") or c.get("sub_worktype_csv", ""))
+
+    @staticmethod
+    def _made(path: Path) -> str:
+        """When a file was last written, as UTC ISO text ('' when it cannot be read)."""
+        try:
+            return datetime.datetime.fromtimestamp(path.stat().st_mtime, datetime.timezone.utc).isoformat()
+        except OSError:
+            return ""
+
+    def _log_line(self, c, system, outcome, detail, sub) -> None:
+        try:
+            self.log.add(system, c["iid"], outcome, c["account"], detail, self.paths.run.name, sub)
+            self.logged.add((c["iid"], system))
+        except OSError as exc:
+            self.control.event("coordinator", f"WARNING: the already-done log could not be written ({type(exc).__name__})")
+            self.logged.add((c["iid"], system))           # said once, not every half second
+
     def step(self) -> bool:
         """Hand over every case that became complete; True once the feed is closed (nothing more will come)."""
         if self.control.feed_closed():
             return True
         if self.control.stopped():                 # no hand-over while stopping: unfinished cases stay in .work
+            for c in self.todo:                    # what was made before the stop is still logged
+                self._note_done(c, P.read_json(self.paths.downloads / f"{c['iid']}.json"))
             self.control.close_feed()
             return True
         held = self.control.held()
         failed = P.read_json(self.paths.sub("status") / "part2-failed.json", {}) or {}
         p1_over, p2_over = self.over("part1"), self.over("part2")
+        s1, s2 = "1" in self.systems, "2" in self.systems
         for c in self.todo:
             iid = c["iid"]
             if iid in self.done:
                 continue
+            m = P.read_json(self.paths.downloads / f"{iid}.json")
+            self._note_done(c, m)
             if iid in held:                        # Part 1 could not download it (reason already recorded)
                 self.done.add(iid)
                 continue
-            m = P.read_json(self.paths.downloads / f"{iid}.json")
             if not m or not (self.paths.work / m["folder"]).is_dir():
-                if p1_over:
+                if s1 and p1_over:
                     self._hold(iid, "System 1 documents were not downloaded (Part 1 ended before this case)")
+                elif not s1 and (p2_over or not s2):
+                    self._wait(iid, "its documents are not downloaded yet (run System 1)")
                 continue
-            guidance = P.guidance_for(m["sub_worktype"], self.guidance_dir, exclude=_special(self.contract))
-            if guidance is None:
-                self._hold(iid, f"no instructions file for Sub Worktype '{m['sub_worktype']}' in the guidance folder")
-                continue
-            snap = self.paths.snapshot(c["account"], self.day)
-            if not snap.is_file():
-                if p2_over:
+            guidance = None
+            if self.rules:
+                guidance = P.guidance_for(m["sub_worktype"], self.guidance_dir, exclude=_special(self.contract))
+                if guidance is None:
+                    self._hold(iid, f"no instructions file for Sub Worktype '{m['sub_worktype']}' in the guidance folder")
+                    continue
+            snap = self.paths.snapshot(c["account"], self.day) if s2 else self.paths.latest_snapshot(c["account"])
+            if snap is None or not snap.is_file():
+                if s2 and p2_over:
                     self._hold(iid, "no System 2 snapshot (" + failed.get(c["account"], "not retrieved") + ")")
+                elif not s2:
+                    self._wait(iid, "documents downloaded - no account snapshot yet (run System 2)")
                 continue
             self._hand_over(c, m, guidance, snap)
         if p1_over and all(c["iid"] in self.done for c in self.todo):
@@ -116,7 +235,7 @@ class Handover:
             return True
         return False
 
-    def _hand_over(self, c: dict, m: dict, guidance: Path, snap: Path) -> None:
+    def _hand_over(self, c: dict, m: dict, guidance: Path | None, snap: Path) -> None:
         iid = c["iid"]
         work, dest = self.paths.work / m["folder"], self.paths.cases_root / m["folder"]
         if dest.exists():
@@ -133,11 +252,12 @@ class Handover:
         order = [snap.name] + ([m["audit"]] if m.get("audit") else []) + list(m.get("documents") or [])
         P.write_json(self.paths.cases / f"{iid}.json", {
             "iid": iid, "account": c["account"], "folder": m["folder"], "sub_worktype": m["sub_worktype"],
-            "guidance": str(guidance), "order": order, "warnings": m.get("warnings", []),
-            "case_source": c.get("case_source", ""), "handed": P.now()})
+            "guidance": str(guidance) if guidance else "", "order": order, "warnings": m.get("warnings", []),
+            "case_source": c.get("case_source", ""), "snapshot_day": snap.parent.name, "handed": P.now()})
         self.done.add(iid)
         self.handed.append(iid)
-        who = "the Azure reviewer" if self.plan.get("reviewer") == "azure" else "Copilot"
+        who = P.REVIEWER_NAMES.get(self.plan.get("reviewer", "copilot"), "System 3") if self.plan.get("send", True) \
+            else "CASES_ROOT (ready for System 3)"
         self.control.event("coordinator", f"{iid} complete ({len(order)} files) - handed to {who}", iid=iid)
 
 

@@ -232,7 +232,7 @@ NOT_CAPTURED="Not captured"      # the contract's phrase for 'could not be read'
 EXTRACTED,EMPTY,NOT_FOUND,FAILED,DISAGREE="Extracted successfully","Confirmed empty","Not found","Extraction failed","Discrepancy"
 
 # ---------------------------------------------------------------------------------------------- party profile
-# What the Interested Party profile holds and where (System_2_Claude_Handover.md; Copilot's answer of 2026-11-03 from
+# What the Interested Party profile holds and where (the local System 2 handover notes; Copilot's answer of 2026-11-03 from
 # the captured page, sanitised).  The email / phone / address records are NOT rows in the page System 2 sends: the
 # page's own setup functions AddExistingCustomerInterestedParty... build those rows in the browser from object
 # literals written in its script.  This part never runs a script: it READS those literals as text (`setup_records`),
