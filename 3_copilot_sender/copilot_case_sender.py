@@ -400,6 +400,7 @@ DEFAULTS = {
     "mission_control_key_header": "api-key",
     "mission_control_timeout": 120,   # seconds to wait for Mission Control to accept one case
     "mission_control_parallel": 2,    # cases sent at the same time
+    "relationship_hours": 2,          # relationship map: instructions of one customer received this close = one time cluster
     "azure_docintel_endpoint": "",    # Azure Document Intelligence (Layout reads every page)
     "azure_openai_endpoint": "",      # Azure language model (fills each form, reviews the case)
     "azure_auth": "key",              # "key" (typed in setup; the VDI) or "signin" (keyless Azure sign-in; the laptop)
@@ -546,6 +547,9 @@ def mission_control_problems(cfg) -> list:
         value = getattr(cfg, key, None)
         if not isinstance(value, int) or isinstance(value, bool) or value < low:
             out.append(f"{key} must be a whole number, {low} or more")
+    hours = getattr(cfg, "relationship_hours", 2)
+    if isinstance(hours, bool) or not isinstance(hours, (int, float)) or not 0 < hours <= 168:
+        out.append("relationship_hours must be a number of hours above 0 (at most 168)")
     return out
 
 

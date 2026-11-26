@@ -21,6 +21,7 @@ import test_daily_update as DU                       # the Mission Control helpe
 P, H, P1, T, MC = TP.P, TP.H, TP.P1, TP.T, DU.MC
 hexid = TP.hexid
 from shared import document_map as DM                 # noqa: E402
+from shared import relationship_map as RM             # noqa: E402
 
 GUID_A = "0a1b2c3d-0000-4000-8000-00000000000a"
 GUID_B = "0a1b2c3d-0000-4000-8000-00000000000b"
@@ -324,6 +325,8 @@ def test_the_coordinator_writes_the_map_before_it_closes_the_feed(base):
     status = DM.read_status(paths)
     assert status["ok"] and DM.read_map(paths)["instructions"][hexid(1)]["table_recorded"] is False
     assert (paths.cases_root / P.DOCUMENT_MAPS_DIR / f"{paths.run.name}.json").is_file()
+    assert status["relationships_ok"] and RM.read(paths)["instructions"][hexid(1)]["related"] == []
+    assert (paths.cases_root / P.DOCUMENT_MAPS_DIR / f"{paths.run.name}{RM.COPY_SUFFIX}").is_file()
 
 
 def test_the_hand_over_lists_the_documents_table_after_the_audit_trail(base):
@@ -342,6 +345,53 @@ def test_the_hand_over_lists_the_documents_table_after_the_audit_trail(base):
     assert order[:3] == ["AB1_Complete_Account_Profile.json", "Audit Trail.pdf", P.DOCUMENTS_TABLE_FILE]
 
 
+# ---------------------------------------------------------------------------------------------- the relationship map
+
+def entry(iid, client, sub, source, received, subject="", docs=(), status="ready"):
+    return {"instruction_id": iid, "client_number": client, "client_name": "SYNTH" if client else "",
+            "client_account_number": f"AC{iid[-2:]}", "sub_worktype": sub, "source": source, "received_date": received,
+            "email_subject": subject, "document_ids": list(docs), "status": status, "group": None}
+
+
+def test_the_relationship_map_groups_one_customer_and_ranks_every_pair():
+    i = [hexid(n) for n in range(1, 8)]
+    doc_map = {"run": "r", "instructions": {e["instruction_id"]: e for e in [
+        entry(i[0], "C1", "Change of Address", "Email", "20/11/2026 09:00 AM", "Change of address", ["D1"]),
+        entry(i[1], "C1", "Change of Address", "Email", "20/11/2026 09:30 AM", "RE: FW:  change  of Address", ["D9"]),
+        entry(i[2], "C1", "Bank Details", "Post", "20/11/2026 03:00 PM", "re: OTHER", ["D1"]),
+        entry(i[3], "C1", "Change of Address", "Email", "21/11/2026 10:00 AM", "Other"),
+        entry(i[4], "C1", "Bank Details", "Email", "21/11/2026 11:00 AM", "", status="held"),
+        entry(i[5], "C2", "Change of Address", "Email", "20/11/2026 09:10 AM", "Change of address", ["D1"]),
+        entry(i[6], "", "Change of Address", "Email", "")]}}
+    rel = RM.build_relationships(doc_map, 2)
+    r = rel["instructions"]
+    assert [(x["instruction_id"], x["strength"]) for x in r[i[0]]["related"]] == \
+        [(i[2], "strong"), (i[1], "likely"), (i[3], "likely"), (i[4], "possible")]
+    assert any("share 1 document(s): D1" in x for x in r[i[0]]["related"][0]["reasons"])
+    assert "same email subject (supporting only)" in r[i[0]]["related"][1]["reasons"]    # never 'strong' by itself
+    assert any("30 min apart (same time cluster" in x for x in r[i[0]]["related"][1]["reasons"])
+    only_subject = next(x for x in r[i[2]]["related"] if x["instruction_id"] == i[3])     # nothing else in common
+    assert only_subject["strength"] == "likely" and "same email subject (supporting only)" in only_subject["reasons"]
+    assert [(x["instruction_id"], x["strength"]) for x in r[i[3]]["related"]][:2] == [(i[0], "likely"), (i[1], "likely")]
+    assert next(x for x in r[i[4]]["related"] if x["instruction_id"] == i[3])["strength"] == "likely"   # 1 h apart
+    assert r[i[5]]["related"] == []                         # another customer: never linked, even sharing D1
+    assert r[i[6]]["related"] == [] and r[i[6]]["time_cluster"] is None
+    assert [r[x]["time_cluster"] for x in i[:5]] == ["C1/T1", "C1/T1", "C1/T2", "C1/T3", "C1/T3"]
+    c1 = rel["customers"][0]
+    assert c1["client_number"] == "C1" and c1["instructions"] == 5
+    coa = c1["sub_worktypes"][0]
+    assert coa["sub_worktype"] == "Change of Address" and \
+        [(t["time_cluster"], t["instructions"]) for t in coa["time_clusters"]] == [("C1/T1", [i[0], i[1]]), ("C1/T3", [i[3]])]
+    assert coa["time_clusters"][0]["first_received"] == "2026-11-20T09:00:00"
+    assert rel["customers"][2]["client_number"] == RM.UNKNOWN_CUSTOMER
+    assert rel["summary"] == {"instructions": 7, "customers": 2, "customers_with_several_instructions": 1,
+                              "pairs": {"strong": 1, "likely": 5, "possible": 4}, "without_customer": 1}
+    assert RM.slice_of(rel, i[0])["time_cluster"] == "C1/T1" and rel["how_to_read"] and rel["window_hours"] == 2
+    assert RM.tidy_subject("Fwd: RE:  Hello  World") == "hello world"
+    wider = RM.build_relationships(doc_map, 24)["instructions"]        # the window is the setting
+    assert next(x for x in wider[i[2]]["related"] if x["instruction_id"] == i[4])["strength"] == "likely"
+
+
 # ---------------------------------------------------------------------------------------------- Mission Control
 
 def test_a_case_package_carries_its_table_and_related_instructions(base):
@@ -358,12 +408,17 @@ def test_a_case_package_carries_its_table_and_related_instructions(base):
 def test_the_map_is_prepared_when_not_connected_and_refused_without_a_map(base):
     paths, control = TP.make_paths(base)
     cfg = DU.mc_cfg(mission_control_url="", runtime_root=str(paths.runtime_root))
-    ok, detail, m = MC.send_map(cfg, paths)
-    assert not ok and "could not be made" in detail and m is None
+    ok, detail, m, r = MC.send_map(cfg, paths)
+    assert not ok and "could not be made" in detail and m is None and r is None
     DM.write_map(paths, {"cases": []}, control)
-    ok, detail, m = MC.send_map(cfg, paths, opener=lambda *a, **k: pytest.fail("nothing may be sent"))
-    assert ok and "prepared" in detail and m["map_version"] == 1
-    assert P.read_json(paths.runtime_root / MC.OUTBOX / paths.run.name / MC.MAP_OUTBOX)["outcome"] == "prepared"
+    ok, detail, m, r = MC.send_map(cfg, paths, opener=lambda *a, **k: pytest.fail("nothing may be sent"))
+    assert ok and "prepared" in detail and m["map_version"] == 1 and r["window_hours"] == 2
+    out = paths.runtime_root / MC.OUTBOX / paths.run.name
+    assert P.read_json(out / MC.MAP_OUTBOX)["outcome"] == "prepared" and P.read_json(out / MC.REL_OUTBOX)["outcome"] == "prepared"
+    status = DM.read_status(paths)                       # a relationship map that could not be made: no case is sent
+    P.write_json(paths.sub("status") / DM.MAP_STATUS, dict(status, relationships_ok=False, relationships_error="boom"))
+    ok, detail, *_ = MC.send_map(cfg, paths)
+    assert not ok and "relationship map could not be made (boom)" in detail
 
 
 def test_the_send_order_is_the_report_order():
@@ -379,7 +434,10 @@ def test_a_full_run_sends_the_map_first_then_each_case_with_its_related_instruct
                                                         ["--scope", "all"])
     assert code == 0, out
     assert [kind for kind, *_ in DU.Trigger.sent] == ["map", "case", "case"]
-    doc_map = DU.Trigger.sent[0][1]
+    doc_map, parts = DU.Trigger.sent[0][1], DU.Trigger.sent[0][2]
+    assert list(parts) == ["map", "relationship_map"]           # both maps in the one first send
+    rel_map = json.loads(parts["relationship_map"].get_content())
+    assert rel_map["instructions"][hexid(1)]["related"][0]["strength"] == "strong"      # they share DOC-SHARED
     assert doc_map["groups"][0]["instructions"] == [hexid(1), hexid(4)]
     assert doc_map["documents"]["DOC-SHARED"]["in_instructions"][1]["instruction_id"] == hexid(4)
     metas = {m["request_id"]: m for m, *_ in DU.Trigger.got}
@@ -389,6 +447,7 @@ def test_a_full_run_sends_the_map_first_then_each_case_with_its_related_instruct
     entry = doc_map["instructions"][hexid(1)]
     assert entry["client_account_number"] == "AB100000" and entry["bam_report"]["columns"]["RequestId"] == hexid(1)
     assert doc_map["run_details"]["mode"] == "full" and entry["status"] == "ready"
+    assert metas[hexid(4)]["relationships"]["related"][0]["instruction_id"] == hexid(1)
     assert metas[hexid(1)]["documents_table"][0]["document_id"] == "DOC-SHARED"
     assert list((cases_root / P.DOCUMENT_MAPS_DIR).glob("*.json"))
     assert rows[hexid(1)]["outcome"] == "sent to Mission Control"

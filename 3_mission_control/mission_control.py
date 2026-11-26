@@ -61,10 +61,12 @@ import copilot_case_sender as S                     # noqa: E402  settings, stor
 from shared import pipeline as P                    # noqa: E402
 from shared import done_log as DL                   # noqa: E402
 from shared import document_map as DM               # noqa: E402
+from shared import relationship_map as RM           # noqa: E402
 
 PACKAGE_VERSION = 2                                 # 2: documents table + related instructions; the map goes first
 OUTBOX = "mission-control"                          # RUNTIME_ROOT\mission-control\<run>\<id>\case.json (+ map.json)
 MAP_OUTBOX = "map.json"                             # RUNTIME_ROOT\mission-control\<run>\map.json: the map as sent
+REL_OUTBOX = "relationship_map.json"                # ... and the relationship map, sent in the same send
 TRIES = 3
 BACKOFF = (5, 15)
 MAX_PACKAGE_MB = 300                                # one case bigger than this is not sent (reported as failed)
@@ -106,9 +108,10 @@ def case_files(folder: Path, order: list, snapshot_suffix: str = P.SNAPSHOT_SUFF
     return out
 
 
-def case_package(row: dict, handed: dict, folder: Path, table=None, related=None) -> tuple:
+def case_package(row: dict, handed: dict, folder: Path, table=None, related=None, relationships=None) -> tuple:
     """(the 'case' JSON, the files to send).  THE place to change when Mission Control's trigger structure is known.
-    `table` = the case's Received Documents records, `related` = what the run's map says about it."""
+    `table` = the case's Received Documents records, `related` = what the run's documents map says about it,
+    `relationships` = its place in the relationship map and its related instructions (strength + reasons)."""
     files = case_files(folder, list(handed.get("order") or []))
     meta = {
         "package_version": PACKAGE_VERSION,
@@ -128,6 +131,8 @@ def case_package(row: dict, handed: dict, folder: Path, table=None, related=None
         "warnings": list(handed.get("warnings") or []),
         "documents_table": list(table or []),
         "related": related or {"group": None, "related_instructions": [], "document_ids": []},
+        "relationships": relationships or {"client_number": "", "sub_worktype": "", "time_cluster": None,
+                                           "related": [], "window_hours": None},
         "files": [{"name": f["name"], "kind": f["kind"], "size": f["path"].stat().st_size, "sha256": sha256(f["path"])}
                   for f in files],
         "prepared_at": P.now(),
@@ -174,13 +179,18 @@ def post(cfg, body: bytes, ctype: str, opener=urllib.request.urlopen) -> tuple:
         return resp.status, resp.read(65536)
 
 
-def map_multipart(doc_map: dict) -> tuple:
-    """The run's document map as its own send: one part 'map' (JSON).  -> (body bytes, content type)."""
+def map_multipart(doc_map: dict, rel_map: dict) -> tuple:
+    """The run's two maps as ONE send, before any case: part 'map' (the documents map) and part 'relationship_map'
+    (JSON each).  -> (body bytes, content type)."""
     boundary = "----dailyreview" + uuid.uuid4().hex
-    body = b"".join([f"--{boundary}\r\nContent-Disposition: form-data; name=\"map\"; filename=\"document_map.json\"\r\n"
-                     "Content-Type: application/json; charset=utf-8\r\n\r\n".encode(),
-                     json.dumps(doc_map, ensure_ascii=False).encode("utf-8"), f"\r\n--{boundary}--\r\n".encode()])
-    return body, f"multipart/form-data; boundary={boundary}"
+    out = []
+    for name, filename, obj in (("map", "document_map.json", doc_map),
+                                ("relationship_map", "relationship_map.json", rel_map)):
+        out += [f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\n"
+                "Content-Type: application/json; charset=utf-8\r\n\r\n".encode(),
+                json.dumps(obj, ensure_ascii=False).encode("utf-8"), b"\r\n"]
+    out.append(f"--{boundary}--\r\n".encode())
+    return b"".join(out), f"multipart/form-data; boundary={boundary}"
 
 
 def send_case(cfg, meta: dict, files: list, opener=urllib.request.urlopen, sleep=time.sleep) -> tuple:
@@ -232,25 +242,36 @@ def save_package(out: Path, meta: dict, outcome: str = "", detail: str = "") -> 
 
 
 def send_map(cfg, paths: P.Paths, opener=urllib.request.urlopen, sleep=time.sleep) -> tuple:
-    """The run's document map, before any case -> (ok, plain detail, the map or None).  ok only when Mission Control
-    accepted it (2xx) or, not connected yet, when it was prepared.  Raises KeyRefused."""
+    """The run's two maps (documents + relationships) in one send, before any case -> (ok, plain detail, documents
+    map or None, relationship map or None).  ok only when Mission Control accepted them (2xx) or, not connected yet,
+    when they were prepared.  Either map missing = not ok (no case is sent).  Raises KeyRefused."""
     status = DM.read_status(paths) or {}
     doc_map = DM.read_map(paths) if status.get("ok") else None
+    rel_map = RM.read(paths) if status.get("relationships_ok") else None
     if not doc_map:
-        return False, "the run's document map could not be made (" + (status.get("error") or "no map file") + ")", None
+        return False, "the run's document map could not be made (" + (status.get("error") or "no map file") + ")", \
+            None, None
+    if not rel_map:
+        return False, ("the run's relationship map could not be made ("
+                       + (status.get("relationships_error") or "no map file") + ")"), None, None
     out = Path(cfg.runtime_root) / OUTBOX / paths.run.name
     out.mkdir(parents=True, exist_ok=True)
+
+    def keep(outcome, detail=""):
+        P.write_json(out / MAP_OUTBOX, {**doc_map, "outcome": outcome, "detail": detail})
+        P.write_json(out / REL_OUTBOX, {**rel_map, "outcome": outcome, "detail": detail})
     if not cfg.mission_control_url:
-        P.write_json(out / MAP_OUTBOX, {**doc_map, "outcome": "prepared"})
-        return True, "Mission Control not connected yet - the document map was prepared and saved, not sent", doc_map
-    body, ctype = map_multipart(doc_map)
+        keep("prepared")
+        return True, ("Mission Control not connected yet - the document map and relationship map were prepared and "
+                      "saved, not sent"), doc_map, rel_map
+    body, ctype = map_multipart(doc_map, rel_map)
     try:
         outcome, detail = send_body(cfg, body, ctype, opener, sleep, "map")
     except KeyRefused as exc:
-        P.write_json(out / MAP_OUTBOX, {**doc_map, "outcome": "failed", "detail": str(exc)})
+        keep("failed", str(exc))
         raise
-    P.write_json(out / MAP_OUTBOX, {**doc_map, "outcome": outcome, "detail": detail})
-    return outcome == "sent", detail, doc_map
+    keep(outcome, detail)
+    return outcome == "sent", detail, doc_map, rel_map
 
 
 def send_order(cases: list, plan_order: list, doc_map=None) -> list:
@@ -265,7 +286,8 @@ def process(cfg, feed, case, opener=urllib.request.urlopen, sleep=time.sleep) ->
     row = feed.rows.get(case.id) or {}
     handed = P.read_json(feed.paths.cases / f"{case.id}.json") or {}
     table = (P.read_json(feed.paths.downloads / f"{case.id}.json") or {}).get("documents_table")
-    meta, files = case_package(row, handed, case.path, table, DM.related_of(getattr(feed, "doc_map", None), case.id))
+    meta, files = case_package(row, handed, case.path, table, DM.related_of(getattr(feed, "doc_map", None), case.id),
+                               RM.slice_of(getattr(feed, "rel_map", None), case.id))
     out = Path(cfg.runtime_root) / OUTBOX / feed.paths.run.name / case.id
     if not cfg.mission_control_url:
         save_package(out, meta, "prepared", "Mission Control not connected yet - saved, not sent")
@@ -327,7 +349,7 @@ async def pipeline_async(ctx, run_dir: Path, opener=urllib.request.urlopen) -> i
     cfg, log = ctx.cfg, ctx.log
     stop = S.Stopper()
     feed = MissionFeed(run_dir, ctx, S.local_salt(ctx.rt))
-    feed.doc_map = None
+    feed.doc_map = feed.rel_map = None
     names = names_of(cfg)
     feed.names = {"part1": names["system1"], "part2": names["system2"]}
     sending = bool(feed.plan.get("send", True))
@@ -376,7 +398,8 @@ async def pipeline_async(ctx, run_dir: Path, opener=urllib.request.urlopen) -> i
                                                "run is settled; then the document map goes first")
                 else:
                     try:
-                        map_ok, detail, feed.doc_map = await loop.run_in_executor(pool, send_map, cfg, feed.paths, opener)
+                        map_ok, detail, feed.doc_map, feed.rel_map = await loop.run_in_executor(
+                            pool, send_map, cfg, feed.paths, opener)
                     except KeyRefused as exc:
                         refused, code, map_ok, detail = str(exc), 3, False, str(exc)
                         feed.control.stop("part3", str(exc))

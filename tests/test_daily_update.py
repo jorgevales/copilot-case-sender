@@ -463,7 +463,7 @@ class Trigger(http.server.BaseHTTPRequestHandler):
         parts = list(msg.iter_parts())
         kind = parts[0].get_param("name", header="content-disposition")
         first = json.loads(parts[0].get_content())
-        Trigger.sent.append((kind, first))
+        Trigger.sent.append((kind, first, {p.get_param("name", header="content-disposition"): p for p in parts}))
         if kind == "map" and Trigger.refuse_map:
             self.send_response(400)
             self.end_headers()

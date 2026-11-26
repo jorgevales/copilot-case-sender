@@ -239,7 +239,8 @@ class Handover:
         return False
 
     def _close(self) -> None:
-        """Every case is settled: the run's document map first (Mission Control waits for it), then the feed closes."""
+        """Every case is settled: the run's document map + relationship map first (Mission Control waits for them),
+        then the feed closes."""
         status = DM.write_map(self.paths, self.plan, self.control)
         if status.get("ok"):
             s = status.get("summary") or {}
@@ -248,6 +249,16 @@ class Handover:
                                f"in several instructions, {s.get('groups', 0)} group(s) of related instructions")
         else:
             self.control.event("coordinator", f"WARNING: the document map could not be made ({status.get('error')})")
+        if status.get("relationships_ok"):
+            r = status.get("relationships_summary") or {}
+            pairs = r.get("pairs") or {}
+            self.control.event("coordinator", f"relationship map ready: {r.get('customers', 0)} customer(s), "
+                               f"{r.get('customers_with_several_instructions', 0)} with several instructions; pairs "
+                               f"strong {pairs.get('strong', 0)}, likely {pairs.get('likely', 0)}, "
+                               f"possible {pairs.get('possible', 0)}")
+        elif status.get("ok"):
+            self.control.event("coordinator", "WARNING: the relationship map could not be made "
+                                              f"({status.get('relationships_error')})")
         self.control.close_feed()
 
     def _hand_over(self, c: dict, m: dict, guidance: Path | None, snap: Path) -> None:

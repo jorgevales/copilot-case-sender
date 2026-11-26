@@ -160,10 +160,22 @@ Added 2026-11-26. System 1's **Received Documents** table is captured for every 
   - `groups`: instructions connected through shared documents (A shares with B, B with C: one group), with their
     accounts, client numbers and Sub Worktypes;
   - `documents_without_id`, and `table_recorded: false` for cases downloaded before this was added.
-- **Mission Control** receives the map **first**, as its own send (part `map`), and only after System 1 and System 2
-  have finished every case. Then each case follows, carrying its `documents_table` and `related` (its group and
-  related instructions). The order of the case sends is decided in one place (`send_order`), so sending related
-  cases together can be added later.
+- **The run's relationship map** (`relationship_map.json` beside the document map, copied to
+  `CASES_ROOT\_Document maps\<run>-relationships.json`, made by `shared/relationship_map.py`). It is guidance for the
+  agent on which instructions of the **same customer** probably belong together. For example, 10 instructions from
+  one Client Number on 10 accounts, where a document in one supports a change in another:
+  - a tree: **customer** (Client Number; System 1's when the report has none) -> **Sub Worktype** -> **time
+    cluster** (instructions received within `relationship_hours` of each other, chained; a setting, default 2 hours);
+  - for every instruction, the other instructions of the same customer, each labelled **strong** (they share a
+    document), **likely** (received within the window, or the same Sub Worktype and the same Source, or the same
+    email subject ignoring case, spaces and RE:/FW:/FWD:) or **possible** (same customer only), with every reason
+    that matched. The email subject is **supporting evidence only**: it never makes a pair strong, and different
+    subjects count against nothing. Instructions of **different** customers are never linked here.
+- **Mission Control** receives both maps **first**, in one send (parts `map` and `relationship_map`), and only after
+  System 1 and System 2 have finished every case. If either map is missing or not accepted, no case is sent. Then
+  each case follows, carrying its `documents_table`, `related` (from the document map) and `relationships` (its
+  place in the tree and its related instructions). The order of the case sends is decided in one place
+  (`send_order`), so sending related cases together can be added later.
 
 ## A daily run, step by step
 

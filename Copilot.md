@@ -50,6 +50,14 @@ Part 3 is the rewrite ("2") of the older "Automatic daily statics review" runner
   not accepted = no case sent), then cases one by one in report order (`send_order` = the one place to change for
   group sending, still undecided by the user), each with `documents_table` + `related` (`package_version` 2).
   Copilot/Azure code not changed.
+- **Relationship map** (user, 2026-11-26, `shared/relationship_map.py`): built by `write_map` right after the
+  documents map, from its instruction entries. Tree Client Number -> Sub Worktype -> time cluster (chained within
+  setting `relationship_hours`, default 2, passed via the plan). Pairs ONLY within the same Client Number: strong =
+  shared Document ID; likely = same time cluster, or same Sub Worktype AND Source, or same tidied email subject
+  (subject = supporting evidence only, user: never strong alone, a different subject counts nothing); possible =
+  same customer. Sent in the SAME first send as the documents map (part `relationship_map`); either map
+  missing = no case sent. Each case gets `relationships` (`RM.slice_of`). Other BAM columns: the user named only Email
+  Subject + Source - ask before adding signals.
 - **Azure: not maintained** (user, 2026-11-26) - keep its tests green, build nothing new. The stashed Azure fix stays parked.
 - **The original of this notes file stays on the laptop only** (`.git/info/exclude`); the repo carries `Copilot.md`,
   regenerated from it by the local `pre-commit` hook on every commit. Never name the original in committed files; no
@@ -73,7 +81,7 @@ brand pattern of System 1/2 lives only in the git-ignored config (pasted once in
 | `2_system2_snapshots/system2_snapshots.py` | Part 2 (cookies via `cdp_call` Storage.getCookies, Access Denied → stop, expired → pause). Party profile (2026-11-03): contact records read from the page's setup-script object literals as text, never run (`setup_records`, strict `js_object`), finished rows by id prefix (`table_records`), per-section `completeness`; compliance by control ID; written file read back (`SnapshotIncomplete`). Nine account-detail pages (2026-11-03, `system2_detail_pages`, `P.DETAIL_SECTIONS`): readers from the user's sanitised reference (git-ignored), landmarks per page, any page not read / confirmed empty fails the account (`DetailsIncomplete`), staged write + read-back, same-day reuse only if `snapshot_problems` is empty; file `<ACCOUNT>_Complete_Account_Profile.json`. Charity Commission Number (2026-11-03, `system2_customer_summary_page`, `{customer}` = CSV Client Number as given, no fallback, no page-vs-customer check): one request per Client Number per run (`submit_customers`), `Additional Info` panel, key right after `Client Number` (`merge_customer_additional_info`), record in `metadata.customerAdditionalInfo`, optional (never holds a case; not captured = refetched same day). Its README has the rules. |
 | `3_copilot_sender/copilot_case_sender.py` | Part 3, the sender (~4,900 lines). Pipeline mode: `run --pipeline <run dir>` with `PipelineFeed` (section 9b). |
 | `guidance/` | README only. The real `result_contract.md`, `daily_review_instructions.md`, base message and `<Sub Worktype>.md` files live on S: (user's choice: none committed; the top-level copies are git-ignored). |
-| `shared/document_map.py`, `tests/test_document_map.py` | System 1 documents-table records, the per-case `_Documents Table.json`, the run's document map (2026-11-26) and their tests (Node runs the page script). |
+| `shared/document_map.py`, `shared/relationship_map.py`, `tests/test_document_map.py` | System 1 documents-table records, the per-case `_Documents Table.json`, the run's document map and relationship map (2026-11-26) and their tests (Node runs the page script). |
 | `shared/bam_report.py`, `shared/run_scope.py`, `shared/done_log.py` | BAM Report reader, the 10 run choices, the already-done log (2026-11-26). |
 | `3_mission_control/mission_control.py` | System 3 = Mission Control (default reviewer; `run --pipeline`, `check`). Its README has the package and outcomes. |
 | `tests/test_daily_update.py`, `tests/bam_helpers.py` | Tests of the 2026-11-26 update (synthetic BAM Reports with real date cells, a local fake Mission Control endpoint, whole runs per mode). |

@@ -415,7 +415,8 @@ def run_mode(cfg, mode: str, args) -> int:
     plan = H.build_plan(scope.cases, excluded, paths, sent, cfg.guidance_dir, special, reviewer=reviewer,
                         systems=systems, rerun=rerun, skip=skip,
                         extra={"bam": report.name, "scope": scope.label, "out_of_scope": len(cases) - len(scope.cases),
-                               "rerun": sorted(rerun), "mode": mode})
+                               "rerun": sorted(rerun), "mode": mode,
+                               "relationship_hours": getattr(cfg, "relationship_hours", 2)})
     for line in H.set_aside_for_rerun(paths, plan):
         print(line)
     P.write_json(paths.plan, plan)

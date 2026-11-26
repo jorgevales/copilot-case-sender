@@ -278,9 +278,12 @@ def build_map(paths: P.Paths, plan: dict, control: P.Control) -> dict:
 
 
 def write_map(paths: P.Paths, plan: dict, control: P.Control) -> dict:
-    """Build + write the map (run folder, then the CASES_ROOT copy) and its status file.  Never raises: a map that
-    could not be built is recorded as {ok: False, error} so Mission Control knows not to send the cases."""
-    status = {"ok": False, "path": "", "copy": "", "error": "", "written": ""}
+    """Build + write the documents map (run folder, then the CASES_ROOT copy), then the relationship map built from it
+    (shared/relationship_map.py, window = plan['relationship_hours']), and their status file.  Never raises: a map
+    that could not be built is recorded (ok / relationships_ok False + error) so Mission Control sends no case."""
+    from shared import relationship_map as RM
+    status = {"ok": False, "path": "", "copy": "", "error": "", "written": "",
+              "relationships_ok": False, "relationships_path": "", "relationships_copy": "", "relationships_error": ""}
     try:
         doc_map = build_map(paths, plan, control)
         target = paths.run / MAP_FILE
@@ -292,6 +295,13 @@ def write_map(paths: P.Paths, plan: dict, control: P.Control) -> dict:
             status["copy"] = str(copy)
         except OSError as exc:                              # the run's own copy is what Mission Control reads
             status["copy_error"] = f"{type(exc).__name__}"
+        try:
+            hours = float(plan.get("relationship_hours") or RM.DEFAULT_HOURS)
+            path, copy, summary = RM.write(paths, doc_map, hours)
+            status.update(relationships_ok=True, relationships_path=path, relationships_copy=copy,
+                          relationships_summary=summary)
+        except Exception as exc:                            # noqa: BLE001 - recorded: Mission Control sends no case
+            status["relationships_error"] = f"{type(exc).__name__}: {exc}"[:300]
     except Exception as exc:                                # noqa: BLE001 - recorded, never crashes the hand-over
         status["error"] = f"{type(exc).__name__}: {exc}"[:300]
     status["written"] = P.now()
