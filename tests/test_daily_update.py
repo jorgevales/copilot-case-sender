@@ -452,15 +452,24 @@ def test_the_mission_control_settings_are_checked_without_showing_the_key():
 # ---------------------------------------------------------------------------------------------- whole runs
 
 class Trigger(http.server.BaseHTTPRequestHandler):
-    got = []
+    got = []                                          # the cases: (case JSON, file names, key)
+    sent = []                                         # every send in order: ("map" | "case", its JSON)
+    refuse_map = False
 
     def do_POST(self):
         body = self.rfile.read(int(self.headers["Content-Length"]))
         msg = email.parser.BytesParser(policy=email.policy.HTTP).parsebytes(
             b"Content-Type: " + self.headers["Content-Type"].encode() + b"\r\n\r\n" + body)
         parts = list(msg.iter_parts())
-        Trigger.got.append((json.loads(parts[0].get_content()), [p.get_filename() for p in parts[1:]],
-                            self.headers.get("api-key")))
+        kind = parts[0].get_param("name", header="content-disposition")
+        first = json.loads(parts[0].get_content())
+        Trigger.sent.append((kind, first))
+        if kind == "map" and Trigger.refuse_map:
+            self.send_response(400)
+            self.end_headers()
+            return
+        if kind == "case":
+            Trigger.got.append((first, [p.get_filename() for p in parts[1:]], self.headers.get("api-key")))
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
@@ -527,7 +536,7 @@ def whole_run(base, monkeypatch, capsys, mode, cases, extra=None, argv_extra=())
 
 @pytest.fixture
 def trigger():
-    Trigger.got = []
+    Trigger.got, Trigger.sent, Trigger.refuse_map = [], [], False
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Trigger)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     yield f"http://127.0.0.1:{server.server_address[1]}/trigger"
@@ -598,5 +607,6 @@ def test_the_menu_shows_your_system_names_and_exits_cleanly(base, monkeypatch, c
     monkeypatch.setattr("builtins.input", lambda prompt="": next(replies))
     assert R.main([]) == 0
     out = capsys.readouterr().out
-    assert "1  Full run - Studio Test + Register Test together; each complete case goes to Mission Control at once" in out
+    assert ("1  Full run - Studio Test + Register Test together; when every case is done, the document map then each "
+            "case go to Mission Control") in out
     assert "2  Studio Test only" in out and "5  Mission Control only" in out and "Please type a number" in out

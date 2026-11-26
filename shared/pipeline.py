@@ -9,7 +9,8 @@
 The parts never call each other.  They only read and write the small files described here:
 
   RUNTIME_ROOT\\pipeline\\
-    downloads\\<id>.json         Part 1: every document + Audit Trail of this case is saved in .work (persistent)
+    downloads\\<id>.json         Part 1: every document + Audit Trail of this case is saved in .work (persistent), with
+                                its Received Documents table (`documents_table`, one record per row, see DOCUMENTS_TABLE_FILE)
     cases\\<id>.json             Coordinator: the case folder is complete in CASES_ROOT, ready for Part 3 (persistent)
     snapshots\\<YYYY-MM-DD>\\     Part 2: <ACCOUNT>_Complete_Account_Profile.json (reused the same day only if it checks out)
     runs\\<run id>\\
@@ -20,7 +21,11 @@ The parts never call each other.  They only read and write the small files descr
       held\\<id>.json             a case that will not be sent this run, and why
       logs\\                      Part 1 / Part 2 console output
       diagnostics\\<part>\\        what each part saw, per case / account (read by the coordinator's pipeline report)
+      document_map.json         Coordinator, just before the feed closes: which documents (by Document ID) belong to
+                                which instructions, and which instructions are related (shared/document_map.py)
   RUNTIME_ROOT\\logs\\captures\\<run id>\\   screenshots + page copies taken when a case fails or is held
+  CASES_ROOT\\<id> - <ACCOUNT>\\_Documents Table.json   Part 1: that case's Received Documents table (sent with the case)
+  CASES_ROOT\\_Document maps\\<run id>.json             a copy of the run's document map, beside the case folders
 
 A case reaches CASES_ROOT only when it is complete (documents + Audit Trail + snapshot), in one rename from .work,
 so Part 3 never sees a half-downloaded case.
@@ -39,6 +44,8 @@ from urllib.parse import parse_qsl, urlsplit
 
 WORK_DIR = ".work"                      # inside CASES_ROOT (same share, so the hand-over is one rename)
 SNAPSHOT_SUFFIX = "_Complete_Account_Profile.json"   # the ONE place the snapshot's file name is decided (Paths.snapshot)
+DOCUMENTS_TABLE_FILE = "_Documents Table.json"       # Part 1, in every case folder: its Received Documents table
+DOCUMENT_MAPS_DIR = "_Document maps"                 # in CASES_ROOT: one <run id>.json per run (shared/document_map.py)
 # The nine account-detail pages of System 2, in the order the snapshot keeps them; their addresses are pasted in setup.
 DETAIL_SECTIONS = ("01 Personal Details", "02 Contact Details", "03 Correspondence Details", "04 Trading Details",
                    "05 Banking Details", "06 Other Details", "07 Suspended Activity", "08 Future Dated Instructions",

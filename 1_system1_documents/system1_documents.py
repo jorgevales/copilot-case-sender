@@ -6,6 +6,10 @@ search the instruction ID -> open it -> verify the exact ID and the account on O
 -> download every Received Document + the Audit Trail into CASES_ROOT\\.work\\<id> - <ACCOUNT> -> back to My Inbox.
 A finished case is announced in RUNTIME_ROOT\\pipeline\\downloads\\<id>.json; the coordinator adds the System 2 snapshot
 and moves the folder into CASES_ROOT, where the Copilot sender (Part 3) picks it up while this part goes on.
+Documents table (2026-11-26): the Received Documents table (the one with a "Document ID" column) is read by its headers;
+each file is saved as '<Document ID>_<Document Name>'; a document this run already saved for an earlier instruction is
+copied from that folder instead of fetched again; the case's table goes into its folder as '_Documents Table.json'
+and into downloads\\<id>.json (`documents_table`), from which the coordinator builds the run's document map.
 
 Started by orchestrator/run_pipeline.py with --run-dir; never asks anything on the console (its output goes to the run
 folder's logs\\part1.log, progress lines to the one console through events\\part1.jsonl).  Rules kept from the
@@ -47,6 +51,7 @@ if not VISUAL_CURSOR_MODULE.is_file():
     )
 
 from shared import pipeline as P
+from shared import document_map as DM
 from studio_visual_cursor import (
     CursorConfig,
     VisualCursor,
@@ -69,6 +74,7 @@ WORK_ROOT = Path(".")  # CASES_ROOT\.work - set by configure()
 GUIDANCE_DIR = ""      # one <Sub Worktype>.md per type: no file = the case is held before anything is downloaded
 CONTRACT = ""          # the result contract (never taken for a Sub Worktype's instructions)
 CAPTURES = None        # RUNTIME_ROOT\logs\captures\<run>: screenshot + page copy when a case or a document fails
+RUN_DOCS = {}          # Document ID -> {iid, folder, file}: saved earlier in this run (a duplicate is copied, not fetched)
 BAD = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 POLL = 0.025
 
@@ -159,10 +165,11 @@ def event(items, name, /, **details):
     items.append({"at": now(), "event": name, **details})
     print(name, flush=True)
 def unique(folder, name):
-    path = folder / safe(name, "download")
+    base = safe(name, "download")                  # the shortened name stays short when " (2)" is added
+    path = folder / base
     i = 2
     while path.exists():
-        path = folder / f"{Path(name).stem} ({i}){Path(name).suffix}"
+        path = folder / f"{Path(base).stem} ({i}){Path(base).suffix}"
         i += 1
     return path
 
@@ -602,28 +609,80 @@ async def save_download(download, folder, preferred=None):
     await download.save_as(str(path)); return path
 
 
+# The Received Documents table (Studio_Documents_Table_Structure): the ONE table whose header row has a "Document ID"
+# column, with or without the "Received Documents" wrapper/heading.  Each cell holds a repeated column label
+# (awInfoTableCell_innerHeader, ignored) and the value (awInfoTableCell_content).  Plain DOM calls only (children,
+# tagName, classList, textContent) so the test suite RUNS this exact script against the documented page structure.
+DOCS_TABLE_FN = r"""
+  function s4clean(v){return (v??'').toString().replace(/\s+/g,' ').trim()}
+  function s4kids(e){return Array.from((e&&e.children)||[])}
+  function s4tag(e){return ((e&&e.tagName)||'').toLowerCase()}
+  function s4has(e,c){return !!(e&&e.classList&&e.classList.contains(c))}
+  function s4find(e,test,out){out=out||[];for(const k of s4kids(e)){if(test(k))out.push(k);s4find(k,test,out)}return out}
+  function s4own(e,test,out){out=out||[];for(const k of s4kids(e)){if(test(k))out.push(k);if(s4tag(k)!=='table')s4own(k,test,out)}return out}
+  function s4text(cell){
+    const content=s4find(cell,k=>s4has(k,'awInfoTableCell_content'))[0];
+    if(content)return s4clean(content.textContent);
+    if(s4find(cell,k=>s4has(k,'awInfoTableCell_innerHeader')).length)return '';   // only the repeated label: empty
+    return s4clean(cell.textContent);
+  }
+  function s4DocsTable(doc){
+    for(const t of s4find(doc.documentElement||doc,k=>s4tag(k)==='table')){
+      const trs=s4own(t,k=>s4tag(k)==='tr');
+      const head=trs.find(r=>s4kids(r).some(k=>s4tag(k)==='th'));
+      if(!head)continue;
+      const headers=s4kids(head).filter(k=>s4tag(k)==='th').map(s4text);
+      if(!headers.some(h=>h.toLowerCase()==='document id'))continue;
+      return {table:t,headers,rows:trs.filter(r=>r!==head&&s4kids(r).some(k=>s4tag(k)==='td'))};
+    }
+    return null;
+  }
+"""
+DOCUMENTS_TABLE_JS = "() => {" + DOCS_TABLE_FN + r"""
+  const p=s4DocsTable(document);
+  if(!p)return {found:false,headers:[],rows:[]};
+  return {found:true,headers:p.headers,
+          rows:p.rows.map((r,i)=>({index:i,cells:s4kids(r).filter(k=>s4tag(k)==='td').map(s4text)}))};
+}"""
+
+
+async def read_documents_table(page):
+    """The Received Documents table as {found, headers, rows: [{index, cells}]} (never raises)."""
+    try:
+        raw=await page.evaluate(DOCUMENTS_TABLE_JS)
+    except Exception as exc:
+        return {'found':False,'headers':[],'rows':[],'error':f'{type(exc).__name__}: {exc}'[:300]}
+    return raw if isinstance(raw,dict) else {'found':False,'headers':[],'rows':[]}
+
+
 async def document_rows(page):
-    """Resolve Received Documents rows even when View is an icon-only span.  Viewer links are found by the private
+    """Resolve Received Documents rows even when View is an icon-only span.  Only the rows of the table with a
+    "Document ID" header are used (any table's rows only if there is no such table); name and ID come from their
+    header's column.  `rowIndex` = the row's place in that table, the same as DOCUMENTS_TABLE_JS's `index`.
+    Viewer links are found by the private
     `system1_viewer_marker` (none = every document goes through the UI route).  A link belongs to the row whose
     document ID it contains ('id'); only when no link names an ID and there are exactly as many links as rows are
     they paired in page order ('position'); otherwise the row has no link ('none') and goes through the UI route."""
-    return await page.evaluate(r"""(marker) => {
+    return await page.evaluate("(marker) => {" + DOCS_TABLE_FN + r"""
       const clean=v=>(v??'').toString().replace(/\s+/g,' ').trim();
-      const rows=[...document.querySelectorAll('table.awInfoTable_table tbody tr, .awInfoTableGroup--body > .awInfoTableRow')];
+      const picked=s4DocsTable(document);
+      const rows=picked?picked.rows:[...document.querySelectorAll('table.awInfoTable_table tbody tr, .awInfoTableGroup--body > .awInfoTableRow')];
+      const col=n=>picked?picked.headers.findIndex(h=>h.toLowerCase()===n):-1;
+      const nameCol=col('document name'), idCol=col('document id');
       const out=[];
-      for (const row of rows) {
+      for (const [rowIndex,row] of rows.entries()) {
         const cells=[...row.querySelectorAll(':scope > td, :scope > .awInfoTableCell')];
         if (!cells.length) continue;
         const vals=cells.map(c=>clean((c.querySelector('.awInfoTableCell_content')||c).innerText));
         const rowText=clean(row.innerText);
-        const documentName=(vals.find(x=>/\.[a-z0-9]{2,8}$/i.test(x))||rowText.match(/([^\s]+\.[a-z0-9]{2,8})\b/i)?.[1]||'');
-        const documentId=(vals.find(x=>/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(x))||rowText.match(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/i)?.[0]||'');
+        const documentName=nameCol>=0?(vals[nameCol]||''):(vals.find(x=>/\.[a-z0-9]{2,8}$/i.test(x))||rowText.match(/([^\s]+\.[a-z0-9]{2,8})\b/i)?.[1]||'');
+        const documentId=idCol>=0?(vals[idCol]||''):(vals.find(x=>/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(x))||rowText.match(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/i)?.[0]||'');
         const action=[...row.querySelectorAll('button,a,[role=button],span.awIcon,.awInteractiveElement')].find(e=>{
           const d=clean([e.innerText,e.textContent,e.title,e.getAttribute('aria-label'),e.getAttribute('data-appway-test-id'),e.outerHTML].join(' '));
           return /\bview\b|viewdetails|document/i.test(d);
         }) || cells.at(-1)?.querySelector('button,a,[role=button],span.awIcon,.awInteractiveElement');
         if (!documentName && !documentId) continue;
-        out.push({index:out.length,documentName,documentId,rowText,cells:vals,
+        out.push({index:out.length,rowIndex,documentName,documentId,rowText,cells:vals,
           actionId:action?.id||'',actionTestId:action?.getAttribute('data-appway-test-id')||'',
           actionHtml:action?.outerHTML?.slice(0,2000)||'',hasAction:!!action});
       }
@@ -645,13 +704,14 @@ async def document_rows(page):
     }""", VIEWER_MARKER)
 
 async def mark_document_view(page, item):
-    return await page.evaluate(r"""d=>{
+    return await page.evaluate("d=>{" + DOCS_TABLE_FN + r"""
       document.querySelectorAll('[data-s4-document-view]').forEach(e=>e.removeAttribute('data-s4-document-view'));
       const clean=v=>(v??'').toString().replace(/\s+/g,' ').trim();
-      const rows=[...document.querySelectorAll('table.awInfoTable_table tbody tr, .awInfoTableGroup--body > .awInfoTableRow')];
+      const picked=s4DocsTable(document);
+      const rows=picked?picked.rows:[...document.querySelectorAll('table.awInfoTable_table tbody tr, .awInfoTableGroup--body > .awInfoTableRow')];
       let row=rows.find(r=>d.documentId && clean(r.innerText).includes(d.documentId));
       if(!row) row=rows.find(r=>d.documentName && clean(r.innerText).includes(d.documentName));
-      if(!row) row=rows[d.index];
+      if(!row) row=rows[d.rowIndex??d.index];
       if(!row)return false;
       let target=(d.actionId&&document.getElementById(d.actionId)) ||
         (d.actionTestId&&row.querySelector(`[data-appway-test-id="${CSS.escape(d.actionTestId)}"]`)) ||
@@ -750,7 +810,7 @@ async def fast_direct_document(context, item, folder, semaphore):
         viewer=item.get('viewerUrl','')
         if not viewer:
             return None,f"no viewer address for this row (pairing: {item.get('pairing','none')})"
-        preferred=item.get('documentName') or f"document_{item.get('index',0)+1}"
+        preferred=saved_name(item)
         saved,body=await fetch_file(context,viewer,folder,preferred,tries)
         if saved:
             return saved,'direct-viewer-download'
@@ -850,7 +910,7 @@ async def ui_fallback_document(context, page, item, folder, events):
         return None,'row not found during UI fallback'
     if not await mark_document_view(page,match):
         return None,'View icon not resolved during UI fallback'
-    preferred=match.get('documentName') or f"document_{match.get('index',0)+1}"
+    preferred=saved_name(item)
     before=set(context.pages)
     popups,downloads=[],[]
     on_popup=lambda p:(popups.append(p),p.on('download',downloads.append))
@@ -878,13 +938,69 @@ async def ui_fallback_document(context, page, item, folder, events):
             except Exception:pass
 
 
+def saved_name(item):
+    """'<Document ID>_<Document Name>' (the row's name only when it has no ID; 'document_<n>' when it has neither)."""
+    return DM.name_with_id(item.get('documentId',''),item.get('documentName') or f"document_{item.get('index',0)+1}")
+
+
+def copy_known(item, folder):
+    """A document this run already saved for an earlier instruction: copied from that case's folder (in .work or
+    already handed over into CASES_ROOT) - the same file, without asking System 1 again.  (path, iid) or (None, why)."""
+    known=RUN_DOCS.get(item.get('documentId') or '')
+    if not known:
+        return None,''
+    for base in (WORK_ROOT,WORK_ROOT.parent):              # .work, then CASES_ROOT (the hand-over renames the folder)
+        src=base/known['folder']/known['file']
+        try:
+            if not src.is_file():
+                continue
+            target=unique(folder,src.name)
+            shutil.copyfile(src,target)
+            if target.stat().st_size!=src.stat().st_size:
+                target.unlink(missing_ok=True)
+                return None,'the copy of the earlier file was incomplete'
+            return target,known['iid']
+        except OSError as exc:
+            return None,f'copying the earlier file failed ({type(exc).__name__})'
+    return None,'the earlier file was not found any more'
+
+
+def remember_documents(iid, folder_name, records):
+    """After a case is complete: its saved documents can be copied for later instructions of this run."""
+    for r in records or []:
+        if r.get('document_id') and r.get('saved_file') and r['document_id'] not in RUN_DOCS:
+            RUN_DOCS[r['document_id']]={'iid':iid,'folder':folder_name,'file':r['saved_file']}
+
+
+def record_for(item, by_row, status, saved, copied_from):
+    """The documents-table record of one downloaded row: its table record (matched by the row's place in the table),
+    or - when the table was not read - what the row itself showed."""
+    rec=dict(by_row.pop(item.get('rowIndex'),None) or {})
+    if not rec:
+        rec=DM.empty_record(item.get('index',0)+1)
+        rec.update(document_id=item.get('documentId',''),document_name=item.get('documentName',''),
+                   note='not read from the documents table (no table with a Document ID column)')
+    if not rec.get('document_id') and not rec.get('note'):
+        rec['note']='System 1 shows no Document ID for this row'
+    rec.update(saved_file=saved.name if saved else '',method=status if saved else '',
+               obtained=(f'copied from instruction {copied_from}' if copied_from else 'downloaded') if saved else 'not downloaded')
+    if not saved:
+        rec['note']=(rec.get('note','')+'; ' if rec.get('note') else '')+status
+    return rec
+
+
 async def download_documents(context, page, folder, events):
-    """Download 30+ Received Documents rapidly while retaining full verification."""
+    """Download 30+ Received Documents rapidly while retaining full verification.  Every row comes back with its
+    documents-table record ('record'); a document this run already saved for an earlier instruction is copied."""
     await asyncio.sleep(.10)
+    raw=await read_documents_table(page)
+    table=DM.table_records(raw)
+    event(events,'documents-table-read',found=bool(raw.get('found')),headers=raw.get('headers',[]),rows=len(table),
+          withoutId=sum(1 for r in table if not r['document_id']),error=raw.get('error',''))
     discovered=await document_rows(page)
     if not discovered:
         body=await page.locator('body').inner_text()
-        if 'Received Documents' in body:
+        if 'Received Documents' in body or table:
             raise RuntimeError('Received Documents table exists but no document rows were resolved; diagnostics saved')
         return []
 
@@ -893,10 +1009,22 @@ async def download_documents(context, page, folder, events):
         {'name':x.get('documentName',''),'id':x.get('documentId',''),'pairing':x.get('pairing',''),
          'viewerAddress':P.strip_query(x.get('viewerUrl',''))} for x in discovered])
 
+    results,copied_from=[None]*len(discovered),{}
+    for i,item in enumerate(discovered):                  # duplicates of this run: a copy on S: is the fastest route
+        saved,who=copy_known(item,folder)
+        if saved:
+            results[i],copied_from[i]=(saved,'copied-from-earlier-instruction'),who
+        elif who:
+            item.setdefault('attempts',[]).append({'copy':who})
+    if copied_from:
+        event(events,'documents-copied-from-earlier-instructions',count=len(copied_from),
+              documents=[{'id':discovered[i].get('documentId',''),'from':who} for i,who in copied_from.items()])
     semaphore=asyncio.Semaphore(8)
-    results=list(await asyncio.gather(*[
-        fast_direct_document(context,item,folder,semaphore) for item in discovered
-    ]))
+    todo=[i for i,r in enumerate(results) if r is None]
+    for i,result in zip(todo,await asyncio.gather(*[
+        fast_direct_document(context,discovered[i],folder,semaphore) for i in todo
+    ])):
+        results[i]=result
     direct_failed={i:status for i,(saved,status) in enumerate(results) if not saved}
     fallback_indexes=list(direct_failed)
     if fallback_indexes:
@@ -906,6 +1034,7 @@ async def download_documents(context, page, folder, events):
             saved,status=await ui_fallback_document(context,page,item,folder,events)
             results[index]=(saved,status)
 
+    by_row={r['table_row_index']:r for r in table}
     rows=[]
     for index,(item,(saved,status)) in enumerate(zip(discovered,results)):
         event(events,'document-result',file=saved.name if saved else '',name=item.get('documentName',''),
@@ -913,13 +1042,17 @@ async def download_documents(context, page, folder, events):
               directRoute=direct_failed.get(index,'ok'),failure='' if saved else status,
               attempts=item.get('attempts',[]),captures=item.get('captures',[]),viewerPageCopy=item.get('viewerPageCopy',''))
         rows.append({'source_text':'View','row_text':item.get('rowText',''),
-                     'saved_file':saved.name if saved else '','status':status,'name':item.get('documentName','')})
-    failures=[row for row in rows if not row['saved_file']]
+                     'saved_file':saved.name if saved else '','status':status,'name':item.get('documentName',''),
+                     'record':record_for(item,by_row,status,saved,copied_from.get(index))})
+    for rec in by_row.values():                            # in the table, but no row to click (no name and no ID)
+        rec=dict(rec,note='not downloaded: the row has no Document Name and no Document ID')
+        rows.append({'source_text':'Table only','row_text':'','saved_file':'','status':rec['note'],'name':'','record':rec})
+    failures=[row for row in rows if row['source_text']=='View' and not row['saved_file']]
     if failures:
         raise RuntimeError(f"Downloaded {len(rows)-len(failures)} of {len(rows)} Received Documents; not downloaded: "
                            +"; ".join(f"{r['name'] or '(no name)'} ({r['status']})" for r in failures))
-    event(events,'all-received-documents-downloaded',count=len(rows),parallelism=8,
-          methods=dict(collections.Counter(r['status'] for r in rows)))
+    event(events,'all-received-documents-downloaded',count=len(discovered),parallelism=8,
+          methods=dict(collections.Counter(r['status'] for r in rows if r['source_text']=='View')))
     return rows
 
 async def click_resolved(context, page, item, folder, attr, preferred):
@@ -1053,6 +1186,15 @@ class StopRun(Exception):
     """The run is stopping (shared stop signal): this case stays in .work, nothing more is downloaded."""
 
 
+def case_table(rows,events):
+    """(the case's documents-table records in table order, whether the table with a Document ID column was found)."""
+    records=sorted((dict(r['record']) for r in rows if r.get('record')),key=lambda r:r.get('row',0))
+    for r in records:
+        r.pop('table_row_index',None)
+    found=next((e.get('found',False) for e in events if e.get('event')=='documents-table-read'),False)
+    return records,bool(found)
+
+
 async def process_instruction_once(context,page,case,batch_index,batch_total,attempt,control=None):
     iid=case['iid']
     events=[];rows=[];meta={};sub=P.UNKNOWN_SUB;download_path=None;failure=None;captures=[];trace='';program_error=False
@@ -1097,6 +1239,12 @@ async def process_instruction_once(context,page,case,batch_index,batch_total,att
             'saved_file':audit_file.name,
             'status':audit_status,
         })
+        # The case's own Received Documents table, beside its documents (sent with the case, read by the run's map).
+        table,table_found=case_table(rows,events)
+        P.write_json(download_path/P.DOCUMENTS_TABLE_FILE,
+                     DM.table_file(iid,P.norm_account(meta.get('accountNumber','')),table,table_found,audit_file.name,
+                                   client_number=meta.get('customerNumber',''),client_name=meta.get('customerName',''),
+                                   sub_worktype=sub))
 
         page=await return_to_my_inbox(context,page,events)
         status='SUCCESS'
@@ -1123,12 +1271,16 @@ async def process_instruction_once(context,page,case,batch_index,batch_total,att
             except Exception:
                 pass
 
+    table,table_found=case_table(rows,events)
     result={
         'instruction_id':iid,'status':status,'attempt':attempt,
         'account_number':meta.get('accountNumber',''),
+        'system1_identity':{k:meta.get(k,'') for k in ('customerNumber','customerName','accountNumber')} if meta else {},
         'sub_worktype':sub,
         'folder':download_path.name if download_path else '',
-        'documents':[x['saved_file'] for x in rows if x.get('source_text')!='Audit Trail'],
+        'documents':[x['saved_file'] for x in rows if x.get('source_text')=='View' and x.get('saved_file')],
+        'documents_table':table,'table_found':table_found,
+        'table_file':P.DOCUMENTS_TABLE_FILE if status=='SUCCESS' else '',
         'audit':next((x['saved_file'] for x in rows if x.get('source_text')=='Audit Trail'),''),
         'files_downloaded':sum(bool(x.get('saved_file')) for x in rows),
         'download_path':str(download_path or ''),
@@ -1223,7 +1375,7 @@ def write_diagnostics(paths,case,result):
         P.write_json(paths.diagnostics('part1')/f"{case['iid']}.json",{
             'iid':case['iid'],'csv_sub_worktype':case.get('sub_worktype_csv',''),'csv_account':case.get('account',''),
             **{k:result.get(k) for k in ('status','failure','sub_worktype','account_number','folder','documents','audit',
-                                         'files_downloaded','elapsed_seconds')},
+                                         'files_downloaded','elapsed_seconds','table_found','documents_table')},
             'tries':result.get('tries') or [],'written':P.now()})
     except Exception:
         pass                                       # diagnostics never decide anything
@@ -1232,13 +1384,16 @@ def write_diagnostics(paths,case,result):
 async def run_cases(context,page,todo,paths,control,say,counts):
     """Every case of the run in CSV order; counts['done'/'held'] stay right even if this raises."""
     bugs=collections.Counter()             # program error text -> cases it failed
+    RUN_DOCS.clear()                       # duplicates are copied only from cases of THIS run
     for index,case in enumerate(todo,1):
         if control.stopped():
             say(f'stopped before {len(todo)-index+1} case(s) were downloaded')
             break
         iid=case['iid']
-        if reusable_download(paths,iid):
+        kept=reusable_download(paths,iid)
+        if kept:
             say(f'{iid} already downloaded by an earlier run - kept',iid=iid)
+            remember_documents(iid,kept['folder'],kept.get('documents_table'))
             counts['done']+=1
             continue
         (paths.downloads/f'{iid}.json').unlink(missing_ok=True)
@@ -1251,10 +1406,16 @@ async def run_cases(context,page,todo,paths,control,say,counts):
                 'iid':iid,'account':P.norm_account(result['account_number']),'folder':result['folder'],
                 'sub_worktype':sub,'sub_worktype_system1':result['sub_worktype'],
                 'sub_worktype_csv':case.get('sub_worktype_csv',''),'warnings':warnings,
-                'documents':result['documents'],'audit':result['audit'],'finished':P.now()})
+                'documents':result['documents'],'audit':result['audit'],
+                'system1_identity':result.get('system1_identity') or {},
+                'documents_table':result.get('documents_table') or [],'table_found':bool(result.get('table_found')),
+                'table_file':result.get('table_file',''),'finished':P.now()})
+            remember_documents(iid,result['folder'],result.get('documents_table'))
             counts['done']+=1
+            copied=sum(1 for r in result.get('documents_table') or [] if r.get('obtained','').startswith('copied'))
             say(f"{iid} downloaded: {len(result['documents'])} document(s) + Audit Trail "
-                f"in {result['elapsed_seconds']:.0f}s ({index}/{len(todo)})",iid=iid)
+                f"in {result['elapsed_seconds']:.0f}s ({index}/{len(todo)})"
+                +(f" - {copied} already saved for an earlier instruction, copied" if copied else ''),iid=iid)
             for w in warnings:
                 say(f'{iid} WARNING: {w}',iid=iid)
         elif result['status']=='STOPPED':

@@ -17,11 +17,21 @@ It uses the one System 1 tab in the **systems Edge** (port `systems_cdp_port`, d
   **"Your inbox is empty. There are no tasks available."** = held as "not in My Inbox under the current filters
   (<filters>)", no retry (the same search gives the same answer); several results = held, no retry; a sign-in page,
   a page still loading or anything else after 10 s = a failure, retried once.
+- **The documents table** (since 2026-11-26): only the table whose header row has a **Document ID** column is used
+  (with or without its "Received Documents" heading). Columns are found by header text, and only each cell's value
+  is read, never its repeated label. Per row: Type, Document Name, Metadata (account, client number, client name;
+  split on the first two commas), Document ID, Date Created (+ ISO). Each file is saved as
+  `<Document ID>_<Document Name>`. A document this run already saved for an earlier instruction (same Document ID) is
+  **copied** from that case folder (`.work` or CASES_ROOT); only if the copy fails is it fetched. A row without a
+  Document ID is kept and marked. The case's table goes into its folder as `_Documents Table.json` and into
+  `downloads\<id>.json` (`documents_table`, plus `system1_identity` = client number / name / account from Overview).
+  The coordinator builds the run's document map from these (`shared/document_map.py`).
 - **Each document**, first the **direct route** (no click): its viewer address, paired with its row by the document
   ID it names (by page order only when no address names an ID and the counts match; otherwise no address), fetched with
   the System 1 sign-in. When that address answers with a viewer page instead of the file, the file that page shows
   (iframe / embed / download link) is fetched. A file is saved under the row's name, with the server's extension when
-  the row has none (Word, Excel, images are kept as they are).
+  the row has none (Word, Excel, images are kept as they are). The row's place in the table (`rowIndex`) links the
+  downloaded file to its table record.
 - **Only if that fails, the View fallback, strict:** View is clicked ONCE. A file that downloads straight away is
   saved. A document window is read in this order: the file at its own address (Edge's PDF viewer shows the PDF's
   address), the file its page shows, a download it starts by itself, then ONE click on its own toolbar Download button

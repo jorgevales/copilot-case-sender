@@ -521,7 +521,7 @@ def test_part1_retries_a_failure_once_starting_the_case_folder_clean(base, monke
     _, result = T.run(P1.process_instruction(None, "page", case, 1, 1, control))
     assert result["status"] == "SUCCESS" and result["attempt"] == 2
     assert sorted(p.name for p in (paths.work / f"{hexid(1)} - AB100000").iterdir()) == \
-        ["Audit Trail.pdf", "a letter.pdf", "b form.pdf"]                 # no "(2)" duplicates from the first try
+        ["Audit Trail.pdf", P.DOCUMENTS_TABLE_FILE, "a letter.pdf", "b form.pdf"]   # no "(2)" duplicates from the first try
 
 
 def test_part1_stops_between_documents_and_audit_trail_when_the_run_stops(base, monkeypatch):
@@ -631,11 +631,13 @@ class Download:
 
 class S1Page:
     """System 1's case page: its Received Documents rows (what document_rows reads) and what a View click does."""
-    def __init__(self, ctx, rows, on_view):
-        self.ctx, self.rows, self.on_view, self.marked = ctx, rows, on_view, None
+    def __init__(self, ctx, rows, on_view, table=None):
+        self.ctx, self.rows, self.on_view, self.marked, self.table = ctx, rows, on_view, None, table
         self.listeners, self.context = collections.defaultdict(list), type("NoCursor", (), {})()   # no visual cursor here
 
     async def evaluate(self, script, arg=None):
+        if script == P1.DOCUMENTS_TABLE_JS:          # read_documents_table (the script itself runs in test_document_map)
+            return self.table or {"found": False, "headers": [], "rows": []}
         if "data-s4-document-view" in script:       # mark_document_view
             self.marked = arg
             return True
@@ -688,7 +690,7 @@ def test_part1_whole_document_step_direct_window_and_straight_download(base):
     ctx.pages = [page]
     events = []
     out = T.run(P1.download_documents(ctx, page, folder, events))
-    assert [r["saved_file"] for r in out] == ["A.pdf", "B.pdf", "C.docx"]
+    assert [r["saved_file"] for r in out] == ["id-a_A.pdf", "id-b_B.pdf", "id-c_C.docx"]    # Document ID first
     assert [r["status"] for r in out] == ["direct-viewer-download", "file-at-document-window-address", "ui-view-downloaded-directly"]
     results = [e for e in events if e["event"] == "document-result"]
     assert [e["name"] for e in results] == ["A.pdf", "B.pdf", "C.docx"] and results[0]["directRoute"] == "ok"
@@ -1018,8 +1020,10 @@ for c in [c for c in plan["cases"] if c["needs"] == "download"]:
             control.hold(c["iid"], "System 1: View not found", "part1"); continue
         folder = paths.work / P.folder_name(c["iid"], c["account"]); folder.mkdir(parents=True)
         (folder / "doc.pdf").write_bytes(b"%PDF"); (folder / "Audit Trail.pdf").write_bytes(b"%PDF")
+        table = [dict(row=1, document_id="DOC-SHARED", document_name="doc.pdf", saved_file="doc.pdf", obtained="downloaded")]
         P.write_json(paths.downloads / (c["iid"] + ".json"), dict(iid=c["iid"], account=c["account"], folder=folder.name,
-                     sub_worktype=c["sub_worktype_csv"], documents=["doc.pdf"], audit="Audit Trail.pdf", warnings=[]))
+                     sub_worktype=c["sub_worktype_csv"], documents=["doc.pdf"], audit="Audit Trail.pdf", warnings=[],
+                     documents_table=table, table_found=True))
         control.event("part1", c["iid"] + " downloaded"); time.sleep(0.2)
     else:
         P.write_json(paths.snapshot(c["account"], plan["day"]), dict(account=c["account"]))
@@ -1108,7 +1112,7 @@ def test_one_whole_run_coordinates_the_three_parts_and_reports_every_csv_row(bas
     assert "sent - Copilot: Correct" in by_id[hexid(1)] and "sent - Copilot: Correct" in by_id[hexid(4)]
     assert "excluded automatically" in by_id[hexid(2)] and "Voided" in by_id[hexid(2)]
     assert "held" in by_id[hexid(3)] and "View not found" in by_id[hexid(3)]
-    assert sorted(p.name for p in cases_root.iterdir() if p.is_dir() and p.name != ".work") == \
+    assert sorted(p.name for p in cases_root.iterdir() if p.is_dir() and p.name not in (".work", P.DOCUMENT_MAPS_DIR)) == \
         [f"{hexid(1)} - AB100000", f"{hexid(4)} - AB400000"]
     older = [p.name for p in cases_root.iterdir() if p.is_file() and p.name != "Already sent log.xlsx"]
     assert len(older) == 1 and older[0].startswith("Copilot review results - older ")   # it lives in CASES_ROOT

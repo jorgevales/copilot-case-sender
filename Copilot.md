@@ -15,7 +15,8 @@ Part 3 is the rewrite ("2") of the older "Automatic daily statics review" runner
 **Update 2026-11-26 (agreed with the user, see README "The menu"):**
 - `Run.cmd` opens a **menu** (`orchestrator/run_pipeline.py`): full run / System 1 only / System 2 only / System 1+2 /
   System 3 only / setup / check (`P.MODES`: `full`=123, `s1`, `s2`, `s12`, `s3`). Systems 1+2 always in parallel; in a
-  full run each case goes to System 3 the moment it is complete (hand-over unchanged).
+  full run each case goes to System 3 the moment it is complete (hand-over unchanged) - except Mission Control, which
+  since the documents-map change waits for every case, then sends the map first (see below).
 - Input is ONLY the **BAM Report `.xlsx`** (`shared/bam_report.py`, stdlib zip/XML reader): first sheet in workbook
   order, headers in row 5, columns found by header NAME (user's choice; 31 columns expected, other count = warning),
   needed: RequestId, Client Account Number, Process Status, Sub Worktype. Dates are real date cells -> text
@@ -35,6 +36,20 @@ Part 3 is the rewrite ("2") of the older "Automatic daily statics review" runner
   uncertain (never auto-resent); 5xx/429 retried 3x; 4xx = failed, run continues. No Sub Worktype guidance file is
   needed or sent with Mission Control (its agents have them): Part 1 / hand-over skip the guidance hold for it. The MC
   script is also the console of runs without System 3 (plan `send` = false).
+- **Documents table + run document map** (user, 2026-11-26, README "Documents table and document map"): Part 1 reads
+  ONLY the table whose header has "Document ID" (`DOCS_TABLE_FN`/`DOCUMENTS_TABLE_JS`: plain DOM calls so
+  `tests/test_document_map.py` RUNS it in Node against the documented structure), columns by header text, values from
+  `awInfoTableCell_content` only; `shared/document_map.py` turns it into records (Metadata `split(',', 2)`, Date
+  Created + ISO). Files saved `<DocumentID>_<Document Name>`; a Document ID already saved this run is COPIED from that
+  case folder (`RUN_DOCS`, `copy_known`; download if the copy fails) - no "skip duplicates" option (user's choice).
+  Missing ID = kept + marked; Metadata account mismatch = recorded only. Per case: `_Documents Table.json` in the folder
+  (Copilot/Azure upload it unchanged - accepted) + `documents_table`/`system1_identity` in `downloads\<id>.json`.
+  `Handover._close` writes the run map (`runs\<run>\document_map.json` + `CASES_ROOT\_Document maps\<run>.json`)
+  BEFORE closing the feed; each instruction entry is standalone (all BAM columns, System 1 identity, documents, related,
+  group). Mission Control sends NOTHING until the feed is closed (S1+S2 done), then the map first (part `map`;
+  not accepted = no case sent), then cases one by one in report order (`send_order` = the one place to change for
+  group sending, still undecided by the user), each with `documents_table` + `related` (`package_version` 2).
+  Copilot/Azure code not changed.
 - **Azure: not maintained** (user, 2026-11-26) - keep its tests green, build nothing new. The stashed Azure fix stays parked.
 - **The original of this notes file stays on the laptop only** (`.git/info/exclude`); the repo carries `Copilot.md`,
   regenerated from it by the local `pre-commit` hook on every commit. Never name the original in committed files; no
@@ -58,6 +73,7 @@ brand pattern of System 1/2 lives only in the git-ignored config (pasted once in
 | `2_system2_snapshots/system2_snapshots.py` | Part 2 (cookies via `cdp_call` Storage.getCookies, Access Denied → stop, expired → pause). Party profile (2026-11-03): contact records read from the page's setup-script object literals as text, never run (`setup_records`, strict `js_object`), finished rows by id prefix (`table_records`), per-section `completeness`; compliance by control ID; written file read back (`SnapshotIncomplete`). Nine account-detail pages (2026-11-03, `system2_detail_pages`, `P.DETAIL_SECTIONS`): readers from the user's sanitised reference (git-ignored), landmarks per page, any page not read / confirmed empty fails the account (`DetailsIncomplete`), staged write + read-back, same-day reuse only if `snapshot_problems` is empty; file `<ACCOUNT>_Complete_Account_Profile.json`. Charity Commission Number (2026-11-03, `system2_customer_summary_page`, `{customer}` = CSV Client Number as given, no fallback, no page-vs-customer check): one request per Client Number per run (`submit_customers`), `Additional Info` panel, key right after `Client Number` (`merge_customer_additional_info`), record in `metadata.customerAdditionalInfo`, optional (never holds a case; not captured = refetched same day). Its README has the rules. |
 | `3_copilot_sender/copilot_case_sender.py` | Part 3, the sender (~4,900 lines). Pipeline mode: `run --pipeline <run dir>` with `PipelineFeed` (section 9b). |
 | `guidance/` | README only. The real `result_contract.md`, `daily_review_instructions.md`, base message and `<Sub Worktype>.md` files live on S: (user's choice: none committed; the top-level copies are git-ignored). |
+| `shared/document_map.py`, `tests/test_document_map.py` | System 1 documents-table records, the per-case `_Documents Table.json`, the run's document map (2026-11-26) and their tests (Node runs the page script). |
 | `shared/bam_report.py`, `shared/run_scope.py`, `shared/done_log.py` | BAM Report reader, the 10 run choices, the already-done log (2026-11-26). |
 | `3_mission_control/mission_control.py` | System 3 = Mission Control (default reviewer; `run --pipeline`, `check`). Its README has the package and outcomes. |
 | `tests/test_daily_update.py`, `tests/bam_helpers.py` | Tests of the 2026-11-26 update (synthetic BAM Reports with real date cells, a local fake Mission Control endpoint, whole runs per mode). |

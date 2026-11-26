@@ -63,7 +63,7 @@ stay in your local, git-ignored `sender_config.json`.
 ## The menu (double-click `Run.cmd`)
 
 ```
-  1  Full run - <System 1> + <System 2> together; each complete case goes to Mission Control at once
+  1  Full run - <System 1> + <System 2> together; when every case is done, the document map then each case go to Mission Control
   2  <System 1> only - download the case documents
   3  <System 2> only - capture the account snapshots
   4  <System 1> + <System 2> - documents and snapshots, no review
@@ -72,9 +72,11 @@ stay in your local, git-ignored `sender_config.json`.
 ```
 
 - Systems 1 and 2 **always run in parallel** when both are in the run.
-- In a **full run** each case goes to System 3 **the moment** its documents and snapshot are both complete - with 1,000
-  cases, sending starts after the first one, not after all 1,000. A case that fails is reported in plain words and the
-  run goes on with the next one.
+- In a **full run with Mission Control** (since 2026-11-26) nothing is sent until System 1 and System 2 have finished
+  **every** case. Then the run's **document map** is sent first, then the cases one by one in the BAM Report's order
+  (see [Documents table and document map](#documents-table-and-document-map)). If the map cannot be sent, no case is
+  sent that run. With **Copilot / Azure** each case still goes **the moment** its documents and snapshot are complete.
+  A case that fails is reported in plain words and the run goes on with the next one.
 - **System 1 only / System 2 only**: what the other system already made is used. A case is moved into CASES_ROOT (ready
   for System 3) as soon as both halves exist; the rest is reported as **not complete yet** (not a problem). Without
   System 2 in the run, the newest snapshot of the account (any day) is used.
@@ -125,6 +127,44 @@ Every run option then asks for:
 For a scheduled or scripted run the same answers can be given on the command line:
 `Run.cmd run --mode full|s1|s2|s12|s3 --report <file.xlsx> --scope all|first:5|one:<id>|ids:<id>,<id>|client:<n>|account:<n>|type:<Sub Worktype>|fund:<f>|source:email|received:01/11/2026-25/11/2026 --again yes|no`.
 
+## Documents table and document map
+
+Added 2026-11-26. System 1's **Received Documents** table is captured for every case, and every run gets one
+**document map** saying which documents belong to which instructions.
+
+- **Reading the table.** Only the table whose header row has a **Document ID** column is read, with or without the
+  "Received Documents" heading around it. Columns are found by their header text, never by position. Only the value
+  part of each cell is read, not the repeated column label. Per row: Type, Document Name, Metadata (split on its first
+  two commas into account, client number, client name - a client name may contain commas or `&`), Document ID and Date
+  Created (also given as ISO text, e.g. `2026-01-01T13:37:00`).
+- **File names** start with the Document ID: `<Document ID>_<Document Name>` (a very long name is shortened). A row
+  with no Document ID keeps its plain name and is marked in the table. A different account in a row's Metadata is
+  only recorded.
+- **The same document in several instructions.** Document IDs are unique, so when a later instruction of the same run
+  has a document already saved for an earlier one, the file is **copied** on S: from that earlier case folder instead
+  of being fetched from System 1 again (faster). If the copy fails, it is downloaded as usual. Every case folder stays
+  complete.
+- **Per instruction:** `_Documents Table.json` in the case folder (one record per row: the values above, the saved
+  file name, and whether it was downloaded or copied from which instruction, plus the client details from System 1's
+  Overview). The same table is in `RUNTIME_ROOT\pipeline\downloads\<id>.json` and in Mission Control's case JSON. It is
+  sent with the case like any other file (Copilot and Azure also receive it).
+- **The run's document map** (`RUNTIME_ROOT\pipeline\runs\<run>\document_map.json`, copied to
+  `CASES_ROOT\_Document maps\<run>.json`). The coordinator writes it once every case of the run is settled. It is one
+  JSON file made to be read by an AI agent on its own, starting with a short `how_to_read` guide:
+  - `run_details`: the BAM Report file, the run choice, which systems ran;
+  - `instructions`: every instruction of the run in report order, each complete on its own (account, client number
+    and name, Sub Worktype, fund, dates, source, email subject, every column of its BAM Report row, what System 1
+    showed, its status in this run, its case folder and files, its documents with the other instructions that share
+    each one, its related instructions and its group);
+  - `documents`: one entry per Document ID, with every instruction that has it and the file name there;
+  - `groups`: instructions connected through shared documents (A shares with B, B with C: one group), with their
+    accounts, client numbers and Sub Worktypes;
+  - `documents_without_id`, and `table_recorded: false` for cases downloaded before this was added.
+- **Mission Control** receives the map **first**, as its own send (part `map`), and only after System 1 and System 2
+  have finished every case. Then each case follows, carrying its `documents_table` and `related` (its group and
+  related instructions). The order of the case sends is decided in one place (`send_order`), so sending related
+  cases together can be added later.
+
 ## A daily run, step by step
 
 1. **The BAM Report, the run choice and the already-done question** (above). Before this, an older results workbook is
@@ -147,7 +187,8 @@ For a scheduled or scripted run the same answers can be given on the command lin
    - **Part 1** downloads case after case into the hidden `CASES_ROOT\.work\<id> - <ACCOUNT>`.
    - **The coordinator** moves a case into CASES_ROOT the moment it is complete: documents + Audit Trail +
      snapshot + an instructions file for its Sub Worktype. It copies the snapshot in and renames the folder in one
-     step, so Copilot never sees a half-downloaded case.
+     step, so Copilot never sees a half-downloaded case. Once every case is settled it writes the run's
+     **document map**. Mission Control waits for this map, sends it first, then sends the cases.
    - **Part 3** picks the case up within seconds. It attaches `daily_review_instructions.md`, that type's `.md` and the
      result contract, then the snapshot, the Audit Trail and the documents (Received Documents order), types the base
      message with this case's timing filled in, sends once and collects the answer while the next case is still

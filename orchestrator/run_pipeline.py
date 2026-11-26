@@ -56,7 +56,7 @@ AZURE_SCRIPT = PROJECT / "3_azure_reviewer" / "azure_case_reviewer.py"
 MISSION_SCRIPT = PROJECT / "3_mission_control" / "mission_control.py"
 EDGE_SECONDS = 30                                   # the systems Edge's debugging endpoint should answer by then
 STOP_WAIT_SECONDS = 600                            # after System 3 ends: how long Part 1 / Part 2 may take to finish
-MENU = [("full", "Full run - {s1} + {s2} together; each complete case goes to {rv} at once"),
+MENU = [("full", "Full run - {s1} + {s2} together; {how}"),
         ("s1", "{s1} only - download the case documents"),
         ("s2", "{s2} only - capture the account snapshots"),
         ("s12", "{s1} + {s2} - documents and snapshots, no review"),
@@ -153,7 +153,9 @@ def ask_line(prompt: str, default: str = "") -> str:
 
 def menu(cfg) -> str:
     n = names_of(cfg)
-    words = {"s1": n["system1"], "s2": n["system2"], "rv": n["system3"]}
+    words = {"s1": n["system1"], "s2": n["system2"], "rv": n["system3"],
+             "how": (f"when every case is done, the document map then each case go to {n['system3']}"
+                     if reviewer_of(cfg) == "mission_control" else f"each complete case goes to {n['system3']} at once")}
     while True:
         print("\n" + "=" * 96 + "\nDAILY REVIEW - MENU\n" + "=" * 96)
         for i, (_, text) in enumerate(MENU, 1):

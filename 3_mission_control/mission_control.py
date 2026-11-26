@@ -7,11 +7,17 @@ needs is not known yet, so the package below is a starting point, made to be cha
                              progress, answers the sign-in step and sends nothing (plan 'send' = false).
   check                      the settings, and whether the endpoint answers at all (nothing is sent)
 
-What is sent, one case per send, the moment the coordinator hands the case over (its documents + snapshot complete):
+When (2026-11-26, user's rule): NOTHING is sent while System 1 / System 2 are still working.  Once every case of the run
+is settled (the coordinator has written the run's document map and closed the feed), the map is sent FIRST, then the
+cases one per send in the BAM Report's order (`send_order`: THE place to change to send related cases together).
+A map that could not be made or was not accepted (after 3 tries) = no case is sent this run.
   POST <mission_control_url>   multipart/form-data
-      part 'case'    JSON: the case's BAM Report details, its Sub Worktype and the list of its files (name, kind, size,
-                     sha256), in the order snapshot, Audit Trail, documents
-      part 'files'   every file of the case folder, in that order
+      the map:  part 'map'     JSON: shared/document_map.py's map (how_to_read, groups, instructions, documents)
+      a case:   part 'case'    JSON: the case's BAM Report details, its Sub Worktype, its Received Documents table
+                               ('documents_table'), what the map says about it ('related': group, related instructions
+                               with their shared Document IDs) and the list of its files (name, kind, size, sha256), in
+                               the order snapshot, Audit Trail, documents table, documents
+                part 'files'   every file of the case folder, in that order
   The key (setting mission_control_auth = key) goes in the header named by mission_control_key_header.
 
 Not connected yet (mission_control_url empty): nothing leaves the computer; the package's case.json is saved in
@@ -54,13 +60,16 @@ for p in (str(PROJECT / "3_copilot_sender"), str(PROJECT), str(HERE)):
 import copilot_case_sender as S                     # noqa: E402  settings, storage rules, hand-over feed, log
 from shared import pipeline as P                    # noqa: E402
 from shared import done_log as DL                   # noqa: E402
+from shared import document_map as DM               # noqa: E402
 
-PACKAGE_VERSION = 1
-OUTBOX = "mission-control"                          # RUNTIME_ROOT\mission-control\<run>\<id>\case.json
+PACKAGE_VERSION = 2                                 # 2: documents table + related instructions; the map goes first
+OUTBOX = "mission-control"                          # RUNTIME_ROOT\mission-control\<run>\<id>\case.json (+ map.json)
+MAP_OUTBOX = "map.json"                             # RUNTIME_ROOT\mission-control\<run>\map.json: the map as sent
 TRIES = 3
 BACKOFF = (5, 15)
 MAX_PACKAGE_MB = 300                                # one case bigger than this is not sent (reported as failed)
-EXTRA_PHASES = {"mission-control", "mc-sent", "mc-prepared", "mc-failed", "mc-uncertain", "safe-stop"}
+EXTRA_PHASES = {"mission-control", "mc-sent", "mc-prepared", "mc-failed", "mc-uncertain", "safe-stop", "mc-map",
+                "mc-waiting"}
 STATES = {"sent": "mc_sent", "prepared": "mc_prepared", "failed": "mc_failed", "uncertain": "mc_uncertain"}
 
 
@@ -91,13 +100,15 @@ def case_files(folder: Path, order: list, snapshot_suffix: str = P.SNAPSHOT_SUFF
     out = []
     for n in names:
         kind = ("account snapshot" if n.endswith(snapshot_suffix) else
+                "documents table" if n == P.DOCUMENTS_TABLE_FILE else
                 "audit trail" if n.casefold().startswith("audit trail") else "document")
         out.append({"name": n, "kind": kind, "path": present[n]})
     return out
 
 
-def case_package(row: dict, handed: dict, folder: Path) -> tuple:
-    """(the 'case' JSON, the files to send).  THE place to change when Mission Control's trigger structure is known."""
+def case_package(row: dict, handed: dict, folder: Path, table=None, related=None) -> tuple:
+    """(the 'case' JSON, the files to send).  THE place to change when Mission Control's trigger structure is known.
+    `table` = the case's Received Documents records, `related` = what the run's map says about it."""
     files = case_files(folder, list(handed.get("order") or []))
     meta = {
         "package_version": PACKAGE_VERSION,
@@ -115,6 +126,8 @@ def case_package(row: dict, handed: dict, folder: Path) -> tuple:
         "source": row.get("case_source", ""),
         "email_subject": row.get("email_subject", ""),
         "warnings": list(handed.get("warnings") or []),
+        "documents_table": list(table or []),
+        "related": related or {"group": None, "related_instructions": [], "document_ids": []},
         "files": [{"name": f["name"], "kind": f["kind"], "size": f["path"].stat().st_size, "sha256": sha256(f["path"])}
                   for f in files],
         "prepared_at": P.now(),
@@ -161,12 +174,26 @@ def post(cfg, body: bytes, ctype: str, opener=urllib.request.urlopen) -> tuple:
         return resp.status, resp.read(65536)
 
 
+def map_multipart(doc_map: dict) -> tuple:
+    """The run's document map as its own send: one part 'map' (JSON).  -> (body bytes, content type)."""
+    boundary = "----dailyreview" + uuid.uuid4().hex
+    body = b"".join([f"--{boundary}\r\nContent-Disposition: form-data; name=\"map\"; filename=\"document_map.json\"\r\n"
+                     "Content-Type: application/json; charset=utf-8\r\n\r\n".encode(),
+                     json.dumps(doc_map, ensure_ascii=False).encode("utf-8"), f"\r\n--{boundary}--\r\n".encode()])
+    return body, f"multipart/form-data; boundary={boundary}"
+
+
 def send_case(cfg, meta: dict, files: list, opener=urllib.request.urlopen, sleep=time.sleep) -> tuple:
     """-> (outcome, plain detail).  outcome: sent / failed / uncertain.  Raises KeyRefused on 401/403."""
     size = sum(f["path"].stat().st_size for f in files)
     if size > MAX_PACKAGE_MB * 1024 * 1024:
         return "failed", f"the case's files are {size // (1024 * 1024)} MB - more than {MAX_PACKAGE_MB} MB, not sent"
     body, ctype = multipart(meta, files)
+    return send_body(cfg, body, ctype, opener, sleep, "case")
+
+
+def send_body(cfg, body: bytes, ctype: str, opener=urllib.request.urlopen, sleep=time.sleep, what="case") -> tuple:
+    """One package (a case or the map), up to TRIES times -> (outcome, plain detail).  Raises KeyRefused on 401/403."""
     last = ""
     for n in range(1, TRIES + 1):
         try:
@@ -177,13 +204,13 @@ def send_case(cfg, meta: dict, files: list, opener=urllib.request.urlopen, sleep
             if exc.code in (408, 429) or exc.code >= 500:
                 last = f"Mission Control was busy or had a problem (HTTP {exc.code})"
             else:
-                return "failed", f"Mission Control refused this case (HTTP {exc.code})"
+                return "failed", f"Mission Control refused this {what} (HTTP {exc.code})"
         except (socket.timeout, TimeoutError):
-            return "uncertain", (f"no answer within {cfg.mission_control_timeout} s after sending - the case may have "
+            return "uncertain", (f"no answer within {cfg.mission_control_timeout} s after sending - the {what} may have "
                                  "arrived: check Mission Control before sending it again")
         except urllib.error.URLError as exc:
             if isinstance(getattr(exc, "reason", None), (socket.timeout, TimeoutError)):
-                return "uncertain", (f"no answer within {cfg.mission_control_timeout} s - the case may have arrived: "
+                return "uncertain", (f"no answer within {cfg.mission_control_timeout} s - the {what} may have arrived: "
                                      "check Mission Control before sending it again")
             last = "Mission Control could not be reached (network)"
         except OSError:
@@ -204,11 +231,41 @@ def save_package(out: Path, meta: dict, outcome: str = "", detail: str = "") -> 
     return out
 
 
+def send_map(cfg, paths: P.Paths, opener=urllib.request.urlopen, sleep=time.sleep) -> tuple:
+    """The run's document map, before any case -> (ok, plain detail, the map or None).  ok only when Mission Control
+    accepted it (2xx) or, not connected yet, when it was prepared.  Raises KeyRefused."""
+    status = DM.read_status(paths) or {}
+    doc_map = DM.read_map(paths) if status.get("ok") else None
+    if not doc_map:
+        return False, "the run's document map could not be made (" + (status.get("error") or "no map file") + ")", None
+    out = Path(cfg.runtime_root) / OUTBOX / paths.run.name
+    out.mkdir(parents=True, exist_ok=True)
+    if not cfg.mission_control_url:
+        P.write_json(out / MAP_OUTBOX, {**doc_map, "outcome": "prepared"})
+        return True, "Mission Control not connected yet - the document map was prepared and saved, not sent", doc_map
+    body, ctype = map_multipart(doc_map)
+    try:
+        outcome, detail = send_body(cfg, body, ctype, opener, sleep, "map")
+    except KeyRefused as exc:
+        P.write_json(out / MAP_OUTBOX, {**doc_map, "outcome": "failed", "detail": str(exc)})
+        raise
+    P.write_json(out / MAP_OUTBOX, {**doc_map, "outcome": outcome, "detail": detail})
+    return outcome == "sent", detail, doc_map
+
+
+def send_order(cases: list, plan_order: list, doc_map=None) -> list:
+    """THE place that decides how the cases go after the map.  Now: one case per send, in the BAM Report's order.
+    (To send related cases together later: group them here by doc_map['instructions'][id]['group'].)"""
+    rank = {iid: n for n, iid in enumerate(plan_order)}
+    return sorted(cases, key=lambda c: rank.get(c.id, len(rank)))
+
+
 def process(cfg, feed, case, opener=urllib.request.urlopen, sleep=time.sleep) -> tuple:
     """One case end to end -> (outcome, detail).  Raises KeyRefused."""
     row = feed.rows.get(case.id) or {}
     handed = P.read_json(feed.paths.cases / f"{case.id}.json") or {}
-    meta, files = case_package(row, handed, case.path)
+    table = (P.read_json(feed.paths.downloads / f"{case.id}.json") or {}).get("documents_table")
+    meta, files = case_package(row, handed, case.path, table, DM.related_of(getattr(feed, "doc_map", None), case.id))
     out = Path(cfg.runtime_root) / OUTBOX / feed.paths.run.name / case.id
     if not cfg.mission_control_url:
         save_package(out, meta, "prepared", "Mission Control not connected yet - saved, not sent")
@@ -270,6 +327,7 @@ async def pipeline_async(ctx, run_dir: Path, opener=urllib.request.urlopen) -> i
     cfg, log = ctx.cfg, ctx.log
     stop = S.Stopper()
     feed = MissionFeed(run_dir, ctx, S.local_salt(ctx.rt))
+    feed.doc_map = None
     names = names_of(cfg)
     feed.names = {"part1": names["system1"], "part2": names["system2"]}
     sending = bool(feed.plan.get("send", True))
@@ -299,6 +357,7 @@ async def pipeline_async(ctx, run_dir: Path, opener=urllib.request.urlopen) -> i
     try:
         await feed.confirm_ready(terminal, log, stop)
         queue, running = [], {}
+        map_ok, no_map, told = False, "", False       # the map goes first: no case before it was accepted
         while True:
             for case in await asyncio.to_thread(feed.poll):
                 if not sending:
@@ -309,7 +368,32 @@ async def pipeline_async(ctx, run_dir: Path, opener=urllib.request.urlopen) -> i
                 else:
                     queue.append(case)
             stopping = bool(stop.is_set or feed.stopping() or refused)
-            while queue and not stopping and len(running) < pool._max_workers:
+            if queue and not map_ok and not no_map and not stopping:
+                if not feed.closed:                         # System 1 / System 2 still working on other cases
+                    if not told:
+                        told = True
+                        log("mc-waiting", note=f"{len(queue)} case(s) ready - nothing is sent until every case of the "
+                                               "run is settled; then the document map goes first")
+                else:
+                    try:
+                        map_ok, detail, feed.doc_map = await loop.run_in_executor(pool, send_map, cfg, feed.paths, opener)
+                    except KeyRefused as exc:
+                        refused, code, map_ok, detail = str(exc), 3, False, str(exc)
+                        feed.control.stop("part3", str(exc))
+                    except Exception as exc:                # noqa: BLE001 - reported, the cases are not sent
+                        map_ok, detail = False, f"could not be sent: {S.safe_exc(ctx.red, exc)}"
+                    log("mc-map", note=("document map: " + detail) if map_ok else f"document map NOT sent: {detail} - "
+                        "no case is sent this run")
+                    if map_ok:
+                        queue = send_order(queue, feed.wanted, feed.doc_map)
+                    else:
+                        no_map = "not sent - the document map did not reach Mission Control first: " + detail
+                    stopping = bool(stopping or refused)
+            if no_map:
+                for case in queue:
+                    record(case, "failed", no_map)
+                queue.clear()
+            while queue and map_ok and not stopping and len(running) < pool._max_workers:
                 case = queue.pop(0)
                 log("mission-control", case.alias, note="sending to Mission Control" if cfg.mission_control_url
                     else "preparing the package (not connected yet)")

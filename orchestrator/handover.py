@@ -7,6 +7,8 @@ The hand-over is the only step that moves a case into CASES_ROOT, and only when 
   -> the snapshot is copied into the folder, the folder is renamed into CASES_ROOT (one step, same share)
   -> RUNTIME_ROOT\\pipeline\\cases\\<id>.json tells Part 3 which instructions to attach and in which order.
 A case that cannot be completed is held with a plain reason (shown in the daily report), never sent half-done.
+Once every case is settled, the run's document map is written (shared/document_map.py) and THEN the feed is closed:
+Mission Control sends the map first, then the cases.
 """
 from __future__ import annotations
 
@@ -18,6 +20,7 @@ import shutil
 import uuid
 from pathlib import Path
 
+from shared import document_map as DM
 from shared import pipeline as P
 
 
@@ -195,7 +198,7 @@ class Handover:
         if self.control.stopped():                 # no hand-over while stopping: unfinished cases stay in .work
             for c in self.todo:                    # what was made before the stop is still logged
                 self._note_done(c, P.read_json(self.paths.downloads / f"{c['iid']}.json"))
-            self.control.close_feed()
+            self._close()
             return True
         held = self.control.held()
         failed = P.read_json(self.paths.sub("status") / "part2-failed.json", {}) or {}
@@ -231,9 +234,21 @@ class Handover:
                 continue
             self._hand_over(c, m, guidance, snap)
         if p1_over and all(c["iid"] in self.done for c in self.todo):
-            self.control.close_feed()
+            self._close()
             return True
         return False
+
+    def _close(self) -> None:
+        """Every case is settled: the run's document map first (Mission Control waits for it), then the feed closes."""
+        status = DM.write_map(self.paths, self.plan, self.control)
+        if status.get("ok"):
+            s = status.get("summary") or {}
+            self.control.event("coordinator", f"document map ready: {s.get('instructions', 0)} instruction(s), "
+                               f"{s.get('documents', 0)} document(s), {s.get('documents_in_several_instructions', 0)} "
+                               f"in several instructions, {s.get('groups', 0)} group(s) of related instructions")
+        else:
+            self.control.event("coordinator", f"WARNING: the document map could not be made ({status.get('error')})")
+        self.control.close_feed()
 
     def _hand_over(self, c: dict, m: dict, guidance: Path | None, snap: Path) -> None:
         iid = c["iid"]
@@ -249,7 +264,8 @@ class Handover:
         except OSError as exc:
             self._hold(iid, f"the case folder could not be moved into CASES_ROOT ({type(exc).__name__})")
             return
-        order = [snap.name] + ([m["audit"]] if m.get("audit") else []) + list(m.get("documents") or [])
+        order = [snap.name] + ([m["audit"]] if m.get("audit") else []) + \
+            ([m["table_file"]] if m.get("table_file") else []) + list(m.get("documents") or [])
         P.write_json(self.paths.cases / f"{iid}.json", {
             "iid": iid, "account": c["account"], "folder": m["folder"], "sub_worktype": m["sub_worktype"],
             "guidance": str(guidance) if guidance else "", "order": order, "warnings": m.get("warnings", []),
