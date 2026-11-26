@@ -11,6 +11,11 @@ Pipeline changes (2026-11-03, the pointer stayed in the System 1 AND System 2 ta
   - a page that is left (navigation, bfcache) destroys its own pointer, so going Back never shows a stale one;
   - an install meets a pointer left by another run (other token): the old one is destroyed first;
   - REMOVE / SWEEP are the one clean-up script, also used by the coordinator's end-of-run sweep (no Playwright).
+Pretend clicks (2026-11-26, user's request, for the eye only - nothing is ever clicked by them):
+  - `tap` draws a press + ripple where the pointer is; `center_tap` first moves it to the middle of the page (Part 1
+    does this once the Documents section is open), fire and forget;
+  - `start_nudging`: when nothing visible has happened for NUDGE_SECONDS (2 s), the pointer taps where it is, again
+    every 2 s, so a slow page or a long download still looks alive.  It speeds nothing up.
 """
 from __future__ import annotations
 
@@ -57,6 +62,15 @@ REMOVE = r"""deep => {
  return found;
 }"""
 SWEEP = "(" + REMOVE + ")(true)"   # one Runtime.evaluate expression, for a tab reached over its own DevTools socket
+NUDGE_SECONDS = 2.0        # nothing visible for this long -> the pointer taps where it is (drawing only)
+
+# A pretend click (drawn only, see `tap` in INSTALL): where the pointer is, or after a move to the page's middle.
+TAP = r"""p => {
+ const s=window.__studio_visual_cursor_v1__;if(!s||!s.tap)return false;
+ if(!p.center){s.tap();return true;}
+ const x=innerWidth/2,y=innerHeight/2;
+ return Promise.resolve(s.move(x,y)).then(()=>{s.tap(x,y);return true;});
+}"""
 
 INSTALL = r"""cfg => {
  const key='__studio_visual_cursor_v1__';
@@ -70,7 +84,7 @@ INSTALL = r"""cfg => {
  const listeners=[],animations=new Set(),timers=new Map();
  const reduced=()=>cfg.reduced_motion===null?matchMedia('(prefers-reduced-motion: reduce)').matches:cfg.reduced_motion;
  const duration=n=>reduced()?0:Math.max(0,n);
- const state={x:cfg.initial_x,y:cfg.initial_y,lastInput:null,token:cfg.token,ensure,move,previewElement,destroy};
+ const state={x:cfg.initial_x,y:cfg.initial_y,lastInput:null,token:cfg.token,ensure,move,previewElement,destroy,tap};
  window[key]=state;
  function listen(target,type,fn){target.addEventListener(type,fn,true);listeners.push([target,type,fn]);}
  function animate(el,frames,ms){
@@ -140,6 +154,14 @@ INSTALL = r"""cfg => {
      const a=animate(ring,[{opacity:.9,transform:'translate(-50%,-50%) scale(.15)'},{opacity:0,transform:'translate(-50%,-50%) scale(1)'}],cfg.ripple_ms);
      a.finished.catch(()=>{}).finally(()=>ring.remove());
    }
+ }
+ // A pretend click: the press and the ripple are DRAWN only - no event is dispatched, nothing on the page is clicked.
+ function tap(x,y){
+   if(dead)return;
+   x=Number.isFinite(x)?x:state.x;y=Number.isFinite(y)?y:state.y;
+   pulse('down',x,y);
+   const id=setTimeout(()=>{timers.delete(id);pulse('up',x,y);},duration(cfg.press_ms));
+   timers.set(id,()=>{});
  }
  function send(data){
    if(dead)return;
@@ -230,6 +252,8 @@ class VisualCursor:
         self._token=uuid.uuid4().hex
         self._prefix='__studio_cursor_position_'+self._token+':'
         self._page_handler=lambda page:self._schedule(self._attach(page))
+        self._last=0.0               # loop time of the pointer's last visible action (the nudge waits on it)
+        self._last_page=None         # weakref to the page of that action
 
     @classmethod
     async def start(cls, context, config=None, *, tracing=False, only=None):
@@ -262,7 +286,9 @@ class VisualCursor:
             import json, math
             point=json.loads(text[len(self._prefix):])
             x,y=float(point['x']),float(point['y'])
-            if math.isfinite(x) and math.isfinite(y):self._positions[page]=(x,y)
+            if math.isfinite(x) and math.isfinite(y):
+                self._positions[page]=(x,y)
+                self._touch(page)      # any visible move/press (also the page's own section clicks) restarts the nudge clock
         except (ValueError,TypeError,KeyError):pass
 
     async def _install(self, frame):
@@ -310,9 +336,49 @@ class VisualCursor:
         if handlers:
             for name,fn in zip(('framenavigated','domcontentloaded','close','console'),handlers):page.remove_listener(name,fn)
 
+    def _touch(self, page):
+        try:
+            self._last=asyncio.get_running_loop().time();self._last_page=weakref.ref(page)
+        except Exception:pass
+
+    async def tap(self, page, *, center=False):
+        """A pretend click, DRAWN only (no input reaches the page): at the pointer's place, or - center=True - after a
+        move to the middle of the visible page.  Never raises, never waits longer than STOP_SECONDS."""
+        if not self.enabled or self._closed:return
+        try:
+            if not self._allowed(page) or page.is_closed():return
+            self._touch(page)
+            await asyncio.wait_for(page.evaluate(TAP,{'center':bool(center)}),STOP_SECONDS)
+        except Exception:pass
+
+    def center_tap(self, page):
+        """Fire and forget: the pointer goes to the middle of the page and taps there (Part 1 never waits for it)."""
+        self._schedule(self.tap(page,center=True))
+
+    def start_nudging(self, idle=2.0):
+        """While nothing visible happens for `idle` seconds (a slow page, a long download), the pointer taps where it
+        is, again every `idle` seconds: it shows the run is alive.  Drawing only - it speeds nothing up."""
+        self._touch_now()
+        self._schedule(self._nudge_loop(float(idle)))
+
+    def _touch_now(self):
+        try:self._last=asyncio.get_running_loop().time()
+        except Exception:pass
+
+    async def _nudge_loop(self, idle):
+        loop=asyncio.get_running_loop()
+        while not self._closed:
+            await asyncio.sleep(min(.25,idle/4))
+            if not self.enabled or loop.time()-self._last<idle:continue
+            page=self._last_page() if self._last_page else None
+            if page is None or page.is_closed():
+                self._touch_now();continue
+            await self.tap(page)                      # also restarts the idle clock
+
     async def move_to(self, page, x, y):
         if not self.enabled or self._closed:return
         try:
+            self._touch(page)
             self._positions[page]=(x,y)
             await self._attach(page)
             if not self._allowed(page):return
@@ -341,7 +407,12 @@ class VisualCursor:
     async def click(self, locator, **options):
         if self.enabled and not self._closed and not options.get('trial',False):
             await self.move_to_locator(locator,position=options.get('position'))
-        return await locator.click(**options)
+        try:
+            return await locator.click(**options)
+        finally:
+            if self.enabled and not self._closed:
+                try:self._touch(locator.page)
+                except Exception:pass
 
     async def screenshot(self, page, **options):
         if self.enabled and not self.config.visuals_in_screenshots:
@@ -392,6 +463,13 @@ async def visual_click(locator, **options):
     cursor=for_page(locator.page)
     if cursor:return await cursor.click(locator,**options)
     return await locator.click(**options)
+
+def visual_center_tap(page):
+    """Fire and forget: the pointer moves to the middle of `page` and taps there (drawing only; never waits)."""
+    try:
+        cursor=for_page(page)
+        if cursor:cursor.center_tap(page)
+    except Exception:pass                          # the pointer never stops Part 1
 
 async def visual_screenshot(page, **options):
     cursor=for_page(page)

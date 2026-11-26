@@ -28,6 +28,18 @@ It uses the one System 1 tab in the **systems Edge** (port `systems_cdp_port`, d
   Each record also gets its likely `origin`: within 2 minutes of the instruction's BAM `Created Date` = probable
   customer document, later = probable processor upload, a missing date = unknown (the Audit Trail confirms).
   The coordinator builds the run's document map from these (`shared/document_map.py`).
+- **Speed** (since 2026-11-26, about 100 instructions a run): no fixed wait. The table and its rows are read
+  together the moment the rows are there (re-read every 0.1 s only while it is still filling in; an empty table is
+  believed after 0.5 s, 10 s at most). Copies of duplicates and direct downloads (8 at a time) run side by side,
+  and every file is written to S: in a worker thread, so parallel files never queue behind each other's writes.
+  **The Audit Trail is fetched while the documents are still arriving.** Only if a document then needs its View
+  click is the Documents section opened again. If the Audit Trail step fails, the downloads in flight finish
+  first, so nothing is written into a case folder that is being started clean. Each case's `documents-timing`
+  event (diagnostics) gives the times: `tableMs`, `filesMs`, `alongsideMs`, `fallbackMs`, `totalMs`.
+- **The pointer's pretend clicks** (drawing only: nothing on the page is ever clicked by them). Once the
+  Documents section is open, the pointer moves to the middle of the page and taps there. Whenever nothing
+  visible has happened for 2 s (a slow page, a long download), it taps where it is, again every 2 s, to show the
+  run is alive. This doesn't speed anything up. `STUDIO_VISUAL_CURSOR=0` turns it off with the pointer.
 - **Each document**, first the **direct route** (no click): its viewer address, paired with its row by the document
   ID it names (by page order only when no address names an ID and the counts match; otherwise no address), fetched with
   the System 1 sign-in. When that address answers with a viewer page instead of the file, the file that page shows
@@ -47,7 +59,8 @@ It uses the one System 1 tab in the **systems Edge** (port `systems_cdp_port`, d
   CSV's, and a difference is reported.
 - **Retries** a failed case once (the folder is started clean). A hold or a stop is never retried.
 - **Never touches** your System 2 tab: it only works in tabs on System 1's host.
-- **Stops** when the shared stop signal is set: before the next case, or between the documents and the Audit Trail.
+- **Stops** when the shared stop signal is set: before the next case, or before the Audit Trail step starts (it
+  runs while the documents arrive; the downloads already started finish first).
   An unfinished case stays in `.work`.
 
 Kept unchanged from the original script: every UI step, selector and wait, the Audit Trail route, plus

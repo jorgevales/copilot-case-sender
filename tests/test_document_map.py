@@ -88,24 +88,35 @@ function build(n) {
   Object.defineProperty(el, 'textContent', {get() { return el.childNodes.map(c => c.nodeType === 3 ? c.text : c.textContent).join(''); }});
   return el;
 }
-global.document = {documentElement: build(job.tree)};
+const all = (e, out = []) => { for (const k of e.children) { out.push(k); all(k, out); } return out; };
+const root = build(job.tree);
+global.document = {documentElement: root, body: all(root).find(e => e.tagName === 'BODY')};
+if (job.native)   // the browser's own index (querySelectorAll of one tag name), as the real page has it
+  global.document.querySelectorAll = sel => all(root).filter(e => e.tagName === sel.toUpperCase());
 const fn = eval('(' + job.script + ')');
 process.stdout.write(JSON.stringify(fn()));
 """
 
 
 def run_page_script(base, page_html):
+    """The page script, run in Node twice: with the browser's own table index and with the plain tree walk.  Both
+    must give the same answer, which is returned."""
     node = shutil.which("node")
     if not node:
         pytest.skip("Node.js is not installed - the page script cannot be run here")
     t = Tree()
     t.feed(page_html)
     (base / "harness.js").write_text(HARNESS, "utf-8")
-    (base / "job.json").write_text(json.dumps({"tree": t.root, "script": P1.DOCUMENTS_TABLE_JS}), "utf-8")
-    out = subprocess.run([node, str(base / "harness.js"), str(base / "job.json")], capture_output=True, text=True,
-                         timeout=60)
-    assert out.returncode == 0, out.stderr
-    return json.loads(out.stdout)
+    answers = []
+    for native in (True, False):
+        (base / "job.json").write_text(json.dumps({"tree": t.root, "script": P1.DOCUMENTS_TABLE_JS, "native": native}),
+                                       "utf-8")
+        out = subprocess.run([node, str(base / "harness.js"), str(base / "job.json")], capture_output=True, text=True,
+                             timeout=60)
+        assert out.returncode == 0, out.stderr
+        answers.append(json.loads(out.stdout))
+    assert answers[0] == answers[1]
+    return answers[0]
 
 
 def test_the_page_script_reads_only_the_table_with_a_document_id_column(base):
@@ -135,7 +146,10 @@ def test_the_page_script_finds_the_table_without_its_wrapper_in_any_column_order
     assert [r["document_id"] for r in recs] == [GUID_A, ""] and recs[0]["document_name"] == "COA.pdf"
     assert recs[0]["client_name"] == "A, B AND C" and recs[0]["client_number"] == "123"
     assert recs[0]["date_created"] == "2026-03-02T09:05:00" and recs[0]["other_columns"] == {"Notes": "first"}
-    assert run_page_script(base, "<body>" + info_table(["Name", "Value"], [["a", "b"]]) + "</body>")["found"] is False
+    none = run_page_script(base, "<body>" + info_table(["Name", "Value"], [["a", "b"]]) + "</body>")
+    assert none["found"] is False and none["heading"] is False
+    loading = run_page_script(base, "<body><h3>Received Documents</h3><p>loading</p></body>")
+    assert loading["found"] is False and loading["heading"] is True          # the table is still to come: wait for it
 
 
 def test_the_row_and_view_scripts_that_now_share_the_table_finder_still_parse(base):
@@ -151,11 +165,13 @@ def test_the_row_and_view_scripts_that_now_share_the_table_finder_still_parse(ba
             return [] if "marker" in script else True
     T.run(P1.document_rows(Grab()))
     T.run(P1.mark_document_view(Grab(), {"documentId": "x", "index": 0}))
+    assert len(scripts) == 2 and all("s4DocsTable(document)" in s for s in scripts)
+    VC = TP.VC
+    scripts += [VC.INSTALL, VC.TAP]                      # the pointer's in-page scripts (tap = pretend click) too
     for n, s in enumerate(scripts):
         (base / f"s{n}.js").write_text("const f = (" + s + ");\n", "utf-8")
         out = subprocess.run([node, "--check", str(base / f"s{n}.js")], capture_output=True, text=True, timeout=60)
         assert out.returncode == 0, out.stderr
-    assert len(scripts) == 2 and all("s4DocsTable(document)" in s for s in scripts)
 
 
 # ---------------------------------------------------------------------------------------------- the records
@@ -240,7 +256,7 @@ def test_a_complete_case_gets_its_documents_table_file_and_record(base, monkeypa
     paths, control = TP.p1_setup(base)
     TP.P1Fakes(P1, monkeypatch)
 
-    async def documents(context, page, folder, events):
+    async def documents(context, page, folder, events, during=None):
         (folder / f"{GUID_A}_COA.pdf").write_bytes(b"%PDF")
         events.append({"event": "documents-table-read", "found": True})
         rec = dict(DM.empty_record(1), document_id=GUID_A, document_name="COA.pdf", saved_file=f"{GUID_A}_COA.pdf",
@@ -496,6 +512,171 @@ def test_a_map_mission_control_refuses_means_no_case_is_sent(base, monkeypatch, 
     assert [kind for kind, *_ in DU.Trigger.sent] == ["map"] and DU.Trigger.got == []
     assert rows[hexid(1)]["outcome"] == "NOT sent to Mission Control - failed"
     assert "document map did not reach Mission Control first" in rows[hexid(1)]["detail"]
+
+
+# ---------------------------------------------------------------------------------------------- speed (2026-11-26)
+
+class SlowCtx(TP.Ctx):
+    """A signed-in GET that takes `delay` seconds; counts the answers given."""
+    def __init__(self, table, delay):
+        super().__init__(table)
+        self.done, inner, ctx = 0, self.request, self
+
+        class Request:
+            async def get(self, url, timeout=0):
+                await asyncio.sleep(delay)
+                answer = await inner.get(url, timeout)
+                ctx.done += 1
+                return answer
+        self.request = Request()
+
+
+def slow_case(base):
+    paths, _ = TP.p1_setup(base)
+    folder = paths.work / f"{hexid(1)} - AB1"
+    folder.mkdir(parents=True)
+    o = "https://system1.example.invalid"
+    ctx = SlowCtx({o + "/view/a": TP.Resp(b"%PDF-a"), o + "/view/b": TP.Resp(b"%PDF-b")}, 0.3)
+    rows = [{"index": 0, "rowIndex": 0, "documentName": "A.pdf", "documentId": "id-a", "viewerUrl": o + "/view/a",
+             "pairing": "id", "viewerUrlsOnPage": 2},
+            {"index": 1, "rowIndex": 1, "documentName": "B.pdf", "documentId": "id-b", "viewerUrl": o + "/view/b",
+             "pairing": "id", "viewerUrlsOnPage": 2},
+            {"index": 2, "rowIndex": 2, "documentName": "C.docx", "documentId": "id-c", "pairing": "none",
+             "viewerUrlsOnPage": 2}]
+    page = TP.S1Page(ctx, rows, lambda p, row: p.fire("download", TP.Download(b"PK\x03\x04", "c.docx")))
+    ctx.pages = [page]
+    return folder, ctx, page
+
+
+def test_the_audit_trail_runs_while_the_documents_arrive_and_view_reopens_the_documents(base, monkeypatch):
+    folder, ctx, page = slow_case(base)
+    opened = []
+
+    async def section(context, p, name, events):
+        opened.append(name)
+        return p
+
+    async def live(context, p=None):
+        return p
+    monkeypatch.setattr(P1, "section", section)
+    monkeypatch.setattr(P1, "live", live)
+    seen = {}
+
+    async def during():                              # the Audit Trail step
+        seen["answers_when_started"] = ctx.done
+        await asyncio.sleep(0.05)
+    events = []
+    out = T.run(P1.download_documents(ctx, page, folder, events, during=during))
+    assert seen == {"answers_when_started": 0}          # it started before any document had arrived
+    assert [r["saved_file"] for r in out] == ["id-a_A.pdf", "id-b_B.pdf", "id-c_C.docx"]
+    assert opened == ["Documents"]                       # View is clicked only after going back to the documents
+    timing = next(e for e in events if e["event"] == "documents-timing")
+    assert timing["alongsideMs"] is not None and timing["viewClicks"] == 1 and timing["documents"] == 3
+
+
+def test_a_failing_audit_trail_lets_the_downloads_finish_before_the_case_fails(base, monkeypatch):
+    folder, ctx, page = slow_case(base)
+
+    async def during():
+        raise RuntimeError("Audit Trail control not found")
+    with pytest.raises(RuntimeError, match="Audit Trail"):
+        T.run(P1.download_documents(ctx, page, folder, [], during=during))
+    assert ctx.done == 2 and sorted(p.name for p in folder.iterdir()) == ["id-a_A.pdf", "id-b_B.pdf"]   # nothing left writing
+
+
+def test_documents_saved_side_by_side_never_take_the_same_name(base):
+    paths, _ = TP.p1_setup(base)
+    folder = paths.work / "f"
+    folder.mkdir(parents=True)
+    o = "https://system1.example.invalid"
+    ctx = SlowCtx({o + "/1": TP.Resp(b"%PDF-1"), o + "/2": TP.Resp(b"%PDF-2")}, 0.05)
+    rows = [{"index": i, "rowIndex": i, "documentName": "Email.pdf", "documentId": "", "viewerUrl": f"{o}/{i + 1}",
+             "pairing": "position", "viewerUrlsOnPage": 2} for i in range(2)]
+    out = T.run(P1.download_documents(ctx, TP.S1Page(ctx, rows, None), folder, []))
+    assert sorted(r["saved_file"] for r in out) == ["Email (2).pdf", "Email.pdf"]
+    assert sorted((folder / r["saved_file"]).read_bytes() for r in out) == [b"%PDF-1", b"%PDF-2"]
+
+
+class FillingPage(TP.S1Page):
+    """The Documents section while its table is still filling in: `empty` reads without the table first."""
+    def __init__(self, ctx, rows, table, empty):
+        super().__init__(ctx, rows, None, table)
+        self.empty, self.reads = empty, 0
+
+    async def evaluate(self, script, arg=None):
+        if script == P1.DOCUMENTS_TABLE_JS:
+            self.reads += 1
+            if self.reads <= self.empty:
+                return {"found": False, "headers": [], "rows": [], "heading": True}
+        elif self.reads <= self.empty and "marker" in script:
+            return []
+        return await super().evaluate(script, arg)
+
+
+def test_the_table_is_used_the_moment_it_has_rows_and_an_empty_one_after_half_a_second():
+    table = {"found": True, "headers": HEADERS, "rows": [{"index": 0, "cells": ["Other", "a.pdf", "", "id-a", "", ""]}]}
+    rows = [{"index": 0, "rowIndex": 0, "documentName": "a.pdf", "documentId": "id-a", "pairing": "none"}]
+    page = FillingPage(None, rows, table, empty=2)
+    import time as _t
+    start = _t.monotonic()
+    raw, found = T.run(P1.wait_documents_page(page))
+    assert raw["found"] and found == rows and page.reads == 3 and _t.monotonic() - start < P1.TABLE_SETTLE
+    start = _t.monotonic()
+    raw, found = T.run(P1.wait_documents_page(FillingPage(None, [], dict(table, rows=[]), empty=0)))
+    assert raw["found"] and found == [] and P1.TABLE_SETTLE <= _t.monotonic() - start < P1.TABLE_SETTLE + 0.5
+
+
+def test_the_audit_trail_step_is_handed_to_the_documents_and_a_stop_there_downloads_nothing_more(base, monkeypatch):
+    paths, control = TP.p1_setup(base)
+    fakes = TP.P1Fakes(P1, monkeypatch, overlap=True)
+    case = {"iid": hexid(1), "account": "AB100000", "sub_worktype_csv": "x"}
+    _, result = T.run(P1.process_instruction(None, "page", case, 1, 1, control))
+    assert result["status"] == "SUCCESS" and result["audit"] == "Audit Trail.pdf"
+    assert fakes.calls["during"] == 1 and fakes.calls["audit"] == 1       # once, alongside - not again afterwards
+    fakes = TP.P1Fakes(P1, monkeypatch, overlap=True, on_docs=lambda: control.stop("part2", "Access Denied"))
+    _, result = T.run(P1.process_instruction(None, "page", case, 1, 1, control))
+    assert result["status"] == "STOPPED" and fakes.calls["audit"] == 0
+
+
+# ---------------------------------------------------------------------------------------------- the pointer's taps
+
+class TapFrame(TP.PointerFrame):
+    def __init__(self):
+        super().__init__()
+        self.taps = []
+
+    async def evaluate(self, script, arg=None):
+        if script == TP.VC.TAP:
+            self.taps.append(arg)
+            return True
+        return await super().evaluate(script, arg)
+
+
+def test_the_pointer_taps_the_middle_after_documents_and_nudges_every_idle_two_seconds():
+    VC = TP.VC
+    s1_frame, s2_frame = TapFrame(), TapFrame()
+    s1 = TP.PointerPage("https://system1.example.invalid/app/case", s1_frame)
+    s2 = TP.PointerPage("https://system2.example.invalid/home", s2_frame)
+
+    async def go():
+        cur = await VC.VisualCursor.start(TP.PointerContext(s1, s2), VC.CursorConfig(), only=TP.system1_only)
+        await cur.move_to(s1, 10, 10)
+        VC.visual_center_tap("not a page")              # never raises, whatever it is given
+        cur.center_tap(s1)
+        await asyncio.sleep(0.05)
+        await cur.tap(s2)                               # never on another system's tab
+        cur.start_nudging(0.2)
+        await asyncio.sleep(0.75)                       # idle: a tap about every 0.2 s
+        busy = len(s1_frame.taps)
+        for _ in range(4):                              # something visible every 0.1 s: no nudge
+            await cur.move_to(s1, 20, 20)
+            await asyncio.sleep(0.1)
+        quiet = len(s1_frame.taps) - busy
+        await cur.close()
+        return busy, quiet
+    busy, quiet = T.run(go())
+    assert s1_frame.taps[0] == {"center": True} and s2_frame.taps == []
+    assert busy >= 3 and all(t == {"center": False} for t in s1_frame.taps[1:]) and quiet == 0
 
 
 trigger = DU.trigger                                  # the local fake Mission Control endpoint (pytest fixture)

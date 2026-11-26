@@ -442,7 +442,8 @@ def test_discovery_never_treats_the_work_folder_as_a_case(env):
 class P1Fakes:
     """System 1 page steps replaced by scripted ones; the case logic between them is the real one."""
 
-    def __init__(self, mod, monkeypatch, account="AB100000", sub="Change of Address", fail_audit=0, on_docs=None):
+    def __init__(self, mod, monkeypatch, account="AB100000", sub="Change of Address", fail_audit=0, on_docs=None,
+                 overlap=False):
         self.calls = collections.Counter()
 
         async def page_back(*a, **k):
@@ -463,11 +464,14 @@ class P1Fakes:
         async def section(context, page, name, events):
             return page
 
-        async def documents(context, page, folder, events):
+        async def documents(context, page, folder, events, during=None):
             for n in ("b form.pdf", "a letter.pdf"):
                 (folder / n).write_bytes(b"%PDF")
             if on_docs:
                 on_docs()
+            if overlap and during is not None:      # like the real step: the Audit Trail while the files arrive
+                self.calls["during"] += 1
+                await during()
             return [{"source_text": "View", "saved_file": "b form.pdf"}, {"source_text": "View", "saved_file": "a letter.pdf"}]
 
         async def audit(context, page, folder, events):
@@ -479,7 +483,7 @@ class P1Fakes:
         for name, fn in (("wait_inbox", page_back), ("search_open", search_open), ("verified_overview_identity", verified),
                          ("detect_open_section", detect), ("section", section), ("download_documents", documents),
                          ("download_audit", audit), ("open_or_recover_inbox", page_back),
-                         ("ensure_clean_inbox_search", page_back)):
+                         ("ensure_clean_inbox_search", page_back), ("live", page_back)):
             monkeypatch.setattr(mod, name, fn)
 
         async def back(context, page, events):
@@ -703,7 +707,7 @@ def test_part1_a_program_error_is_not_retried_and_keeps_its_trace(base, monkeypa
     paths, control = p1_setup(base)
     fakes = P1Fakes(P1, monkeypatch)
 
-    async def broken(context, page, folder, events):
+    async def broken(context, page, folder, events, during=None):
         raise TypeError("event() got multiple values for argument 'name'")
     monkeypatch.setattr(P1, "download_documents", broken)
     case = {"iid": hexid(1), "account": "AB100000", "sub_worktype_csv": "x"}

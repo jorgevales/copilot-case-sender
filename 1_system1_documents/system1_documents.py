@@ -53,8 +53,10 @@ if not VISUAL_CURSOR_MODULE.is_file():
 from shared import pipeline as P
 from shared import document_map as DM
 from studio_visual_cursor import (
+    NUDGE_SECONDS,
     CursorConfig,
     VisualCursor,
+    visual_center_tap,
     visual_click,
     visual_screenshot,
 )
@@ -164,13 +166,20 @@ def event(items, name, /, **details):
     """Positional-only: a detail may itself be called `name` or `items` (VDI 2026-11-02: name=... crashed every case)."""
     items.append({"at": now(), "event": name, **details})
     print(name, flush=True)
+RESERVED = {}          # folder -> names handed out (files are written in worker threads, side by side)
+
+
 def unique(folder, name):
+    """A free name in `folder`, reserved at once: files are saved in parallel threads, so a name handed out must not
+    be handed out again before its file exists.  Called on the event loop only (never from a thread)."""
     base = safe(name, "download")                  # the shortened name stays short when " (2)" is added
+    taken = RESERVED.setdefault(folder, set())
     path = folder / base
     i = 2
-    while path.exists():
+    while path.name in taken or path.exists():
         path = folder / f"{Path(base).stem} ({i}){Path(base).suffix}"
         i += 1
+    taken.add(path.name)
     return path
 
 
@@ -626,8 +635,11 @@ DOCS_TABLE_FN = r"""
     if(s4find(cell,k=>s4has(k,'awInfoTableCell_innerHeader')).length)return '';   // only the repeated label: empty
     return s4clean(cell.textContent);
   }
+  function s4tables(doc){                     // the browser's own index when it has one (fast on a big page)
+    return doc.querySelectorAll?Array.from(doc.querySelectorAll('table')):s4find(doc.documentElement||doc,k=>s4tag(k)==='table');
+  }
   function s4DocsTable(doc){
-    for(const t of s4find(doc.documentElement||doc,k=>s4tag(k)==='table')){
+    for(const t of s4tables(doc)){
       const trs=s4own(t,k=>s4tag(k)==='tr');
       const head=trs.find(r=>s4kids(r).some(k=>s4tag(k)==='th'));
       if(!head)continue;
@@ -640,7 +652,7 @@ DOCS_TABLE_FN = r"""
 """
 DOCUMENTS_TABLE_JS = "() => {" + DOCS_TABLE_FN + r"""
   const p=s4DocsTable(document);
-  if(!p)return {found:false,headers:[],rows:[]};
+  if(!p)return {found:false,headers:[],rows:[],heading:/Received Documents/.test((document.body&&document.body.textContent)||'')};
   return {found:true,headers:p.headers,
           rows:p.rows.map((r,i)=>({index:i,cells:s4kids(r).filter(k=>s4tag(k)==='td').map(s4text)}))};
 }"""
@@ -780,7 +792,7 @@ async def fetch_file(context, url, folder, preferred, tries):
     if not response.ok or kind=='html' or not body:
         return None,body
     target=unique(folder,file_name(preferred,disp,kind,url))
-    target.write_bytes(body)
+    await asyncio.to_thread(target.write_bytes,body)  # S: writes in worker threads: parallel files never queue behind each other
     rec['saved']=target.name
     return target,body
 
@@ -943,26 +955,38 @@ def saved_name(item):
     return DM.name_with_id(item.get('documentId',''),item.get('documentName') or f"document_{item.get('index',0)+1}")
 
 
-def copy_known(item, folder):
-    """A document this run already saved for an earlier instruction: copied from that case's folder (in .work or
-    already handed over into CASES_ROOT) - the same file, without asking System 1 again.  (path, iid) or (None, why)."""
-    known=RUN_DOCS.get(item.get('documentId') or '')
-    if not known:
-        return None,''
-    for base in (WORK_ROOT,WORK_ROOT.parent):              # .work, then CASES_ROOT (the hand-over renames the folder)
-        src=base/known['folder']/known['file']
+def _copy_first(sources, target):
+    """(worker thread) Copy the first source that exists to `target`; '' when done, else why not."""
+    for src in sources:
         try:
             if not src.is_file():
                 continue
-            target=unique(folder,src.name)
             shutil.copyfile(src,target)
             if target.stat().st_size!=src.stat().st_size:
                 target.unlink(missing_ok=True)
-                return None,'the copy of the earlier file was incomplete'
-            return target,known['iid']
+                return 'the copy of the earlier file was incomplete'
+            return ''
         except OSError as exc:
-            return None,f'copying the earlier file failed ({type(exc).__name__})'
-    return None,'the earlier file was not found any more'
+            try:target.unlink(missing_ok=True)
+            except OSError:pass
+            return f'copying the earlier file failed ({type(exc).__name__})'
+    return 'the earlier file was not found any more'
+
+
+async def copy_known(item, folder):
+    """A document this run already saved for an earlier instruction: copied from that case's folder (in .work or
+    already handed over into CASES_ROOT) - the same file, without asking System 1 again; the copy runs in a worker
+    thread, side by side with the downloads.  (path, iid) or (None, why)."""
+    known=RUN_DOCS.get(item.get('documentId') or '')
+    if not known:
+        return None,''
+    target=unique(folder,known['file'])
+    why=await asyncio.to_thread(_copy_first,[base/known['folder']/known['file'] for base in (WORK_ROOT,WORK_ROOT.parent)],
+                                target)                # .work, then CASES_ROOT (the hand-over renames the folder)
+    if why:
+        RESERVED.get(folder,set()).discard(target.name)
+        return None,why
+    return target,known['iid']
 
 
 def remember_documents(iid, folder_name, records):
@@ -989,15 +1013,49 @@ def record_for(item, by_row, status, saved, copied_from):
     return rec
 
 
-async def download_documents(context, page, folder, events):
+TABLE_SETTLE=0.5      # no table with rows yet: how long an empty / missing table is given before it is believed
+TABLE_WAIT=10.0       # the longest wait for the Received Documents table to fill in
+FETCH_PARALLEL=8      # documents fetched at the same time (one case)
+
+
+def _has_rows(raw):
+    return any(any(c for c in r.get('cells') or []) for r in raw.get('rows') or [])
+
+
+async def wait_documents_page(page):
+    """(table, rows) as soon as the Received Documents table has its rows - no fixed wait: both page reads go out
+    together and are repeated every 0.1 s only while the table is still filling in.  An empty table, or a case without
+    one, is believed after TABLE_SETTLE; TABLE_WAIT is the limit (then the rows found so far are used)."""
+    t0=time.monotonic()
+    while True:
+        raw,discovered=await asyncio.gather(read_documents_table(page),document_rows(page))
+        waited=time.monotonic()-t0
+        if raw.get('found') and _has_rows(raw):
+            return raw,discovered
+        if waited>=TABLE_SETTLE and (discovered or raw.get('found') or not raw.get('heading')):
+            return raw,discovered
+        if waited>=TABLE_WAIT:
+            return raw,discovered
+        await asyncio.sleep(.1)
+
+
+async def download_documents(context, page, folder, events, during=None):
     """Download 30+ Received Documents rapidly while retaining full verification.  Every row comes back with its
-    documents-table record ('record'); a document this run already saved for an earlier instruction is copied."""
-    await asyncio.sleep(.10)
-    raw=await read_documents_table(page)
+    documents-table record ('record'); a document this run already saved for an earlier instruction is copied.
+
+    Speed (2026-11-26, ~100 instructions a run): the table and the rows are read in one go as soon as they are there;
+    copies (worker threads) and direct downloads (FETCH_PARALLEL at a time, files written in worker threads) all run
+    side by side; and `during` - an async step that needs no document, Part 1 gives it the Audit Trail - runs on the
+    page WHILE the files arrive.  Only if a document then needs its View click is the Documents section opened again.
+    If `during` fails, the downloads in flight are let finish before the error goes on (nothing is ever written into a
+    case folder that is being started clean)."""
+    t0=time.monotonic()
+    raw,discovered=await wait_documents_page(page)
     table=DM.table_records(raw)
+    t_table=time.monotonic()
     event(events,'documents-table-read',found=bool(raw.get('found')),headers=raw.get('headers',[]),rows=len(table),
-          withoutId=sum(1 for r in table if not r['document_id']),error=raw.get('error',''))
-    discovered=await document_rows(page)
+          withoutId=sum(1 for r in table if not r['document_id']),error=raw.get('error',''),
+          waitedMs=int((t_table-t0)*1000))
     if not discovered:
         body=await page.locator('body').inner_text()
         if 'Received Documents' in body or table:
@@ -1009,30 +1067,51 @@ async def download_documents(context, page, folder, events):
         {'name':x.get('documentName',''),'id':x.get('documentId',''),'pairing':x.get('pairing',''),
          'viewerAddress':P.strip_query(x.get('viewerUrl',''))} for x in discovered])
 
-    results,copied_from=[None]*len(discovered),{}
-    for i,item in enumerate(discovered):                  # duplicates of this run: a copy on S: is the fastest route
-        saved,who=copy_known(item,folder)
+    copied_from={}
+    semaphore=asyncio.Semaphore(FETCH_PARALLEL)
+
+    async def obtain(i,item):
+        saved,who=await copy_known(item,folder)           # a duplicate of this run: a copy on S: is the fastest route
         if saved:
-            results[i],copied_from[i]=(saved,'copied-from-earlier-instruction'),who
-        elif who:
+            copied_from[i]=who
+            return saved,'copied-from-earlier-instruction'
+        if who:
             item.setdefault('attempts',[]).append({'copy':who})
+        return await fast_direct_document(context,item,folder,semaphore)
+    # return_exceptions: one document's surprise never leaves the others writing on after the case has failed
+    fetching=asyncio.ensure_future(asyncio.gather(*(obtain(i,x) for i,x in enumerate(discovered)),return_exceptions=True))
+    t_during=None
+    if during is not None:
+        try:
+            await during()
+            t_during=time.monotonic()
+        except BaseException:
+            await asyncio.gather(fetching,return_exceptions=True)
+            raise
+    results=list(await fetching)
+    t_fetched=time.monotonic()
+    bug=next((r for r in results if isinstance(r,PROGRAM_ERRORS)),None)
+    if bug is not None:
+        raise bug                                          # a mistake in this program: reported as one, never retried
+    results=[(None,f'failed: {type(r).__name__}: {r}'[:300]) if isinstance(r,BaseException) else r for r in results]
     if copied_from:
         event(events,'documents-copied-from-earlier-instructions',count=len(copied_from),
               documents=[{'id':discovered[i].get('documentId',''),'from':who} for i,who in copied_from.items()])
-    semaphore=asyncio.Semaphore(8)
-    todo=[i for i,r in enumerate(results) if r is None]
-    for i,result in zip(todo,await asyncio.gather(*[
-        fast_direct_document(context,discovered[i],folder,semaphore) for i in todo
-    ])):
-        results[i]=result
     direct_failed={i:status for i,(saved,status) in enumerate(results) if not saved}
     fallback_indexes=list(direct_failed)
     if fallback_indexes:
         event(events,'document-ui-fallback-started',count=len(fallback_indexes))
+        if during is not None:                             # the page went on to History: back to the documents
+            page=await section(context,await live(context,page),'Documents',events)
         for index in fallback_indexes:
             item=discovered[index]
             saved,status=await ui_fallback_document(context,page,item,folder,events)
             results[index]=(saved,status)
+    end=time.monotonic()
+    event(events,'documents-timing',tableMs=int((t_table-t0)*1000),filesMs=int((t_fetched-t_table)*1000),
+          alongsideMs=int((t_during-t_table)*1000) if t_during else None,
+          fallbackMs=int((end-t_fetched)*1000),totalMs=int((end-t0)*1000),documents=len(discovered),
+          copied=len(copied_from),viewClicks=len(fallback_indexes))
 
     by_row={r['table_row_index']:r for r in table}
     rows=[]
@@ -1049,9 +1128,9 @@ async def download_documents(context, page, folder, events):
         rows.append({'source_text':'Table only','row_text':'','saved_file':'','status':rec['note'],'name':'','record':rec})
     failures=[row for row in rows if row['source_text']=='View' and not row['saved_file']]
     if failures:
-        raise RuntimeError(f"Downloaded {len(rows)-len(failures)} of {len(rows)} Received Documents; not downloaded: "
-                           +"; ".join(f"{r['name'] or '(no name)'} ({r['status']})" for r in failures))
-    event(events,'all-received-documents-downloaded',count=len(discovered),parallelism=8,
+        raise RuntimeError(f"Downloaded {len(discovered)-len(failures)} of {len(discovered)} Received Documents; "
+                           "not downloaded: "+"; ".join(f"{r['name'] or '(no name)'} ({r['status']})" for r in failures))
+    event(events,'all-received-documents-downloaded',count=len(discovered),parallelism=FETCH_PARALLEL,
           methods=dict(collections.Counter(r['status'] for r in rows if r['source_text']=='View')))
     return rows
 
@@ -1222,19 +1301,29 @@ async def process_instruction_once(context,page,case,batch_index,batch_total,att
         if download_path.exists():                 # a leftover of an interrupted run: start this case clean
             shutil.rmtree(download_path)
         download_path.mkdir(parents=True,exist_ok=True)
+        RESERVED.pop(download_path,None)           # names reserved by an earlier attempt are free again
 
-        # Download every Received Document, then download the Audit Trail file
-        # from History into the same instruction/account folder.
+        # Download every Received Document and the Audit Trail file (History) into the same folder.  The Audit
+        # Trail is fetched WHILE the documents arrive (download_documents' `during`), not after them.
         if initial_section!='Documents' or await detect_open_section(page)!='Documents':
             page=await section(context,page,'Documents',events)
-        rows=await download_documents(context,page,download_path,events)
-        if control is not None and control.stopped():
-            raise StopRun('run stopping')
+        visual_center_tap(page)                    # the pointer goes to the middle of the page and taps (drawing only)
+        audit={}
 
-        page=await section(context,page,'History',events)
-        audit_file,audit_status=await download_audit(
-            context,page,download_path,events
-        )
+        async def audit_step():
+            if control is not None and control.stopped():
+                raise StopRun('run stopping')
+            p=await section(context,await live(context,page),'History',events)
+            audit['page']=p
+            audit['file'],audit['status']=await download_audit(context,p,download_path,events)
+        rows=await download_documents(context,page,download_path,events,during=audit_step)
+        page=await live(context,audit.get('page',page))
+        if 'file' not in audit:                    # no document to wait for (or none fetched): the Audit Trail now
+            if control is not None and control.stopped():
+                raise StopRun('run stopping')
+            page=await section(context,page,'History',events)
+            audit['file'],audit['status']=await download_audit(context,page,download_path,events)
+        audit_file,audit_status=audit['file'],audit['status']
         rows.append({
             'source_text':'Audit Trail',
             'row_text':'History - Audit Trail',
@@ -1489,6 +1578,7 @@ async def run_pipeline(run_dir):
         try:
             if not await wait_for_go(context,control):
                 return 0
+            cursor.start_nudging(NUDGE_SECONDS)    # nothing visible for 2 s -> the pointer taps where it is (drawing only)
             mine=[p for p in context.pages if on_system1(p)]   # the one System 1 tab the sign-in check confirmed
             page=await open_or_recover_inbox(context,mine[0] if mine else None)
             page.set_default_timeout(4000)

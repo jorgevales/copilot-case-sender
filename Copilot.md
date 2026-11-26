@@ -50,6 +50,15 @@ Part 3 is the rewrite ("2") of the older "Automatic daily statics review" runner
   not accepted = no case sent), then cases one by one in report order (`send_order` = the one place to change for
   group sending, still undecided by the user), each with `documents_table` + `related` (`package_version` 2).
   Copilot/Azure code not changed.
+- **Part 1 document speed** (user, 2026-11-26, ~100 instructions/run): `wait_documents_page` (table + rows read
+  together, no fixed sleep; TABLE_SETTLE 0.5 s / TABLE_WAIT 10 s), copies + direct fetches side by side
+  (FETCH_PARALLEL 8, writes via `asyncio.to_thread`; names reserved in `RESERVED` so parallel saves never clash; cleared
+  when a case folder is started clean), and `download_documents(..., during=audit_step)`: the Audit Trail runs WHILE
+  files arrive; View fallback reopens Documents afterwards; a failing `during` waits for in-flight downloads before
+  raising. `documents-timing` event per case. Pointer (`studio_visual_cursor.py`): `TAP`/`tap` = drawn-only pretend
+  click, `center_tap` after Documents opens (fire and forget), `start_nudging(NUDGE_SECONDS=2)` taps where the pointer
+  is after 2 s without visible activity (console position reports reset the clock). *Locally verified* (fakes); VDI
+  timings still to come.
 - **Document origin** (user, 2026-11-26): optional BAM column `Created Date` (`created_date`, a date column). Each
   document record gets `DM.origin_of(Date Created, Created Date)`: 0-2 min after (fixed `CUSTOMER_MINUTES`) = probable
   customer document, later = probable processor upload, missing/negative = origin unknown; always "the Audit Trail
