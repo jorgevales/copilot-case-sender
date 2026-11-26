@@ -43,6 +43,10 @@ HOW_TO_READ_TABLE = [
     "document (identical file).",
     "account_ref, client_number and client_name come from the row's Metadata (account,client number,client name). "
     "date_created is the row's Date Created as ISO text (UK date, 12-hour clock in date_created_raw).",
+    "origin compares date_created with the instruction's Created Date (instruction_created_date, from the BAM "
+    "Report): 'probable customer document' = added within 2 minutes of the instruction's creation (most likely "
+    "came with the customer's request); 'probable processor upload' = added later; 'origin unknown' = a date is "
+    "missing. It is a likelihood only: the Audit Trail confirms who added each document.",
 ]
 
 HOW_TO_READ_MAP = [
@@ -60,6 +64,10 @@ HOW_TO_READ_MAP = [
     "with no shared document has group null.",
     "run_details: the BAM Report file, the run choice and which systems ran.",
     "documents_without_id: rows whose Document ID was blank in System 1. They cannot be matched across instructions.",
+    "origin (per instruction and document): 'probable customer document' = added within 2 minutes of that "
+    "instruction's Created Date (most likely came with the customer's request); 'probable processor upload' = added "
+    "later; 'origin unknown' = a date is missing. The same document can differ between instructions (a customer "
+    "document in one, added later to another). A likelihood only: each case's Audit Trail confirms who added it.",
     "table_recorded false = that instruction was downloaded before the documents table was captured: its documents are "
     "not in this map.",
     "status: 'ready' = complete and handed to System 3 in this run; 'held' / 'waiting' = not sent in this run (reason "
@@ -82,6 +90,56 @@ def iso_date(text: str) -> str:
         except ValueError:
             continue
     return ""
+
+
+# A document's likely origin, from its Date Created and the instruction's Created Date (BAM Report).  Documents can
+# only be added after the instruction was created: within CUSTOMER_MINUTES of it = it most likely came with the
+# customer's request (uploaded automatically when the case was made); later = most likely added by a processor.
+# Only a likelihood (user, 2026-11-26): the case's Audit Trail is what confirms who added it.
+CUSTOMER_MINUTES = 2
+ORIGIN_CUSTOMER = "probable customer document"
+ORIGIN_PROCESSOR = "probable processor upload"
+ORIGIN_UNKNOWN = "origin unknown"
+
+
+def when(text):
+    """'dd/mm/yyyy hh:mm AM/PM' or ISO text -> datetime (None when it is neither)."""
+    t = clean(text)
+    if not t:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(t)
+    except ValueError:
+        pass
+    iso = iso_date(t)
+    return datetime.datetime.fromisoformat(iso) if iso else None
+
+
+def origin_of(document_date, instruction_created) -> dict:
+    """{origin, minutes_after_instruction_created, origin_note} for one document of one instruction."""
+    d, c = when(document_date), when(instruction_created)
+    if not d or not c:
+        return {"origin": ORIGIN_UNKNOWN, "minutes_after_instruction_created": None,
+                "origin_note": ("no Created Date for the instruction" if not c else "no Date Created for the document")
+                + " - check the Audit Trail"}
+    minutes = round((d - c).total_seconds() / 60, 1)
+    if minutes < 0:
+        return {"origin": ORIGIN_UNKNOWN, "minutes_after_instruction_created": minutes,
+                "origin_note": "dated before the instruction's Created Date (should not happen) - check the Audit Trail"}
+    if minutes <= CUSTOMER_MINUTES:
+        return {"origin": ORIGIN_CUSTOMER, "minutes_after_instruction_created": minutes,
+                "origin_note": f"added within {CUSTOMER_MINUTES} min of the instruction's creation - most likely came "
+                               "with the customer's request; the Audit Trail confirms it"}
+    return {"origin": ORIGIN_PROCESSOR, "minutes_after_instruction_created": minutes,
+            "origin_note": f"added {minutes:g} min after the instruction was created - most likely added by a "
+                           "processor; the Audit Trail confirms it"}
+
+
+def label_origins(records: list, instruction_created) -> list:
+    """Every record gets its origin (in place); returns the records."""
+    for r in records or []:
+        r.update(origin_of(r.get("date_created") or r.get("date_created_raw"), instruction_created))
+    return records
 
 
 def split_metadata(raw: str) -> tuple:
@@ -128,11 +186,12 @@ def table_records(raw) -> list:
 
 
 def table_file(iid: str, account: str, records: list, table_found: bool, audit: str = "", client_number: str = "",
-               client_name: str = "", sub_worktype: str = "") -> dict:
-    """What '_Documents Table.json' in the case folder holds (the client details as System 1's Overview shows them)."""
+               client_name: str = "", sub_worktype: str = "", created: str = "") -> dict:
+    """What '_Documents Table.json' in the case folder holds (the client details as System 1's Overview shows them;
+    `created` = the instruction's Created Date from the BAM Report)."""
     return {"table_version": TABLE_VERSION, "how_to_read": HOW_TO_READ_TABLE, "instruction_id": iid,
             "client_account_number": account, "client_number": client_number, "client_name": client_name,
-            "sub_worktype": sub_worktype, "table_found": table_found,
+            "sub_worktype": sub_worktype, "instruction_created_date": created, "table_found": table_found,
             "documents": [{k: v for k, v in r.items() if k != "table_row_index"} for r in records],
             "audit_trail": audit, "written": P.now()}
 
@@ -189,9 +248,12 @@ def build_map(paths: P.Paths, plan: dict, control: P.Control) -> dict:
         where = ("CASES_ROOT" if folder and (paths.cases_root / folder).is_dir() else
                  "CASES_ROOT\\.work" if folder and (paths.work / folder).is_dir() else "")
         records = m.get("documents_table")
+        created = c.get("created_date", "")
+        origins = [origin_of(r.get("date_created") or r.get("date_created_raw"), created) for r in records or []]
         ids = []
-        for r in records or []:
-            ref = {"instruction_id": iid, "file_name": r.get("saved_file", ""), "obtained": r.get("obtained", "")}
+        for r, o in zip(records or [], origins):
+            ref = {"instruction_id": iid, "file_name": r.get("saved_file", ""), "obtained": r.get("obtained", ""),
+                   "origin": o["origin"], "minutes_after_instruction_created": o["minutes_after_instruction_created"]}
             did = r.get("document_id", "")
             if not did:
                 without_id.append({**ref, "document_name": r.get("document_name", ""), "type": r.get("type", ""),
@@ -214,7 +276,7 @@ def build_map(paths: P.Paths, plan: dict, control: P.Control) -> dict:
             "client_number": c.get("client_number", "") or s1.get("customerNumber", ""),
             "client_name": c.get("client_name", "") or s1.get("customerName", ""),
             "sub_worktype": m.get("sub_worktype") or handed.get("sub_worktype") or c.get("sub_worktype_csv", ""),
-            "fund": c.get("fund", ""), "fund_type": c.get("fund_type", ""),
+            "fund": c.get("fund", ""), "fund_type": c.get("fund_type", ""), "created_date": created,
             "received_date": c.get("received_date", ""), "end_date": c.get("end_date", ""),
             "source": c.get("case_source", ""), "email_subject": c.get("email_subject", ""),
             "status": status, "status_reason": why,
@@ -231,8 +293,10 @@ def build_map(paths: P.Paths, plan: dict, control: P.Control) -> dict:
                            "type": r.get("type", ""), "date_created": r.get("date_created", ""),
                            "file_name": r.get("saved_file", ""), "obtained": r.get("obtained", ""),
                            "account_ref": r.get("account_ref", ""), "client_number": r.get("client_number", ""),
-                           "client_name": r.get("client_name", ""), "also_in_instructions": []}
-                          for r in records or []],
+                           "client_name": r.get("client_name", ""), **o, "also_in_instructions": []}
+                          for r, o in zip(records or [], origins)],
+            "documents_by_origin": {k: sum(1 for o in origins if o["origin"] == k)
+                                    for k in (ORIGIN_CUSTOMER, ORIGIN_PROCESSOR, ORIGIN_UNKNOWN)},
             "document_ids": ids, "documents_without_id": sum(1 for x in without_id if x["instruction_id"] == iid),
             "related_instructions": [], "group": None}
     links = {i: {} for i in order}                          # iid -> {other iid: [shared document ids]}

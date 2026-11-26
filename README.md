@@ -100,6 +100,7 @@ Every run option then asks for:
    | Y / Z | `Source` / `Email Subject` | Email / Post / blank; run choice 9, Mission Control |
    | AA | `Sub Worktype` | **needed** |
    | AE | `End Date` | case timing |
+   | (by name) | `Created Date` | optional: each document's likely origin (see [Documents table and document map](#documents-table-and-document-map)) |
 
    Dates are real Excel date-times (`25/11/2026 12:23 PM`). Every excluded row (Voided, an invalid or repeated
    RequestId, no account) is listed under **AUTOMATICALLY EXCLUDED** before anything starts and again at the end.
@@ -144,6 +145,16 @@ Added 2026-11-26. System 1's **Received Documents** table is captured for every 
   has a document already saved for an earlier one, the file is **copied** on S: from that earlier case folder instead
   of being fetched from System 1 again (faster). If the copy fails, it is downloaded as usual. Every case folder stays
   complete.
+- **Likely origin of each document.** Documents can only be added after the instruction was created. Each document's
+  Date Created is compared with the instruction's **Created Date** (BAM Report):
+  - within **2 minutes** = **probable customer document** (most likely came with the customer's request, uploaded
+    when the case was made);
+  - later = **probable processor upload** (most likely added by a processor);
+  - **origin unknown** when a date is missing, or the document is dated before the instruction (a clock mismatch).
+
+  This is a likelihood only. The case's Audit Trail confirms who added each document, and every label says so. The
+  same document can be a customer document in one instruction and a later addition in another. A report without
+  Created Date still runs (a note at the start; every origin is then "unknown").
 - **Per instruction:** `_Documents Table.json` in the case folder (one record per row: the values above, the saved
   file name, and whether it was downloaded or copied from which instruction, plus the client details from System 1's
   Overview). The same table is in `RUNTIME_ROOT\pipeline\downloads\<id>.json` and in Mission Control's case JSON. It is
@@ -154,8 +165,8 @@ Added 2026-11-26. System 1's **Received Documents** table is captured for every 
   - `run_details`: the BAM Report file, the run choice, which systems ran;
   - `instructions`: every instruction of the run in report order, each complete on its own (account, client number
     and name, Sub Worktype, fund, dates, source, email subject, every column of its BAM Report row, what System 1
-    showed, its status in this run, its case folder and files, its documents with the other instructions that share
-    each one, its related instructions and its group);
+    showed, its status in this run, its case folder and files, its documents with their likely origin and the other
+    instructions that share each one, its related instructions and its group);
   - `documents`: one entry per Document ID, with every instruction that has it and the file name there;
   - `groups`: instructions connected through shared documents (A shares with B, B with C: one group), with their
     accounts, client numbers and Sub Worktypes;

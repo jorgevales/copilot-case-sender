@@ -50,6 +50,11 @@ Part 3 is the rewrite ("2") of the older "Automatic daily statics review" runner
   not accepted = no case sent), then cases one by one in report order (`send_order` = the one place to change for
   group sending, still undecided by the user), each with `documents_table` + `related` (`package_version` 2).
   Copilot/Azure code not changed.
+- **Document origin** (user, 2026-11-26): optional BAM column `Created Date` (`created_date`, a date column). Each
+  document record gets `DM.origin_of(Date Created, Created Date)`: 0-2 min after (fixed `CUSTOMER_MINUTES`) = probable
+  customer document, later = probable processor upload, missing/negative = origin unknown; always "the Audit Trail
+  confirms" (we never parse the Audit Trail). Labelled per instruction in `_Documents Table.json`, downloads json and
+  the document map (not the relationship map). Assumes BAM and System 1 use the same clock: *Proposed* until a VDI run.
 - **Relationship map** (user, 2026-11-26, `shared/relationship_map.py`): built by `write_map` right after the
   documents map, from its instruction entries. Tree Client Number -> Sub Worktype -> time cluster (chained within
   setting `relationship_hours`, default 2, passed via the plan). Pairs ONLY within the same Client Number: strong =

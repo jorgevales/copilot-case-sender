@@ -6,6 +6,7 @@ SENDER_TEST_ROOT.  The table script itself is RUN (Node + a tiny DOM built from 
     <PYTHON_EXECUTABLE> -B -m pytest -p no:cacheprovider tests
 """
 import asyncio
+import datetime
 import html.parser
 import json
 import shutil
@@ -172,6 +173,28 @@ def test_records_split_the_metadata_on_two_commas_and_read_the_uk_date():
     assert DM.name_with_id(GUID_A, "Email.pdf") == f"{GUID_A}_Email.pdf" and DM.name_with_id("", "Email.pdf") == "Email.pdf"
 
 
+@pytest.mark.parametrize("document, created, origin, minutes", [
+    ("2026-11-20T09:00:00", "20/11/2026 09:00 AM", DM.ORIGIN_CUSTOMER, 0),           # uploaded with the case
+    ("20/11/2026 09:02 AM", "20/11/2026 09:00 AM", DM.ORIGIN_CUSTOMER, 2),           # the 2-minute edge
+    ("2026-11-20T09:03:00", "20/11/2026 09:00 AM", DM.ORIGIN_PROCESSOR, 3),
+    ("2026-11-21T14:00:00", "20/11/2026 09:00 AM", DM.ORIGIN_PROCESSOR, 1740),
+    ("2026-11-20T08:59:00", "20/11/2026 09:00 AM", DM.ORIGIN_UNKNOWN, -1),            # cannot happen: clock mismatch
+    ("2026-11-20T09:00:00", "", DM.ORIGIN_UNKNOWN, None),                             # no Created Date in the report
+    ("", "20/11/2026 09:00 AM", DM.ORIGIN_UNKNOWN, None),
+])
+def test_a_documents_origin_comes_from_the_instructions_created_date(document, created, origin, minutes):
+    o = DM.origin_of(document, created)
+    assert o["origin"] == origin and o["minutes_after_instruction_created"] == minutes
+    assert "Audit Trail" in o["origin_note"]
+
+
+def test_the_bam_report_gives_the_created_date_as_text(base):
+    report = DU.BH.write_bam(base / "r.xlsx", [DU.BH.case(hexid(1), created=datetime.datetime(2026, 11, 20, 13, 5))])
+    cases, _, _ = P.read_report(report)
+    assert cases[0]["created_date"] == "20/11/2026 01:05 PM" and cases[0]["row"]["Created Date"] == "20/11/2026 01:05 PM"
+    assert cases[0]["row"]["Received Date"] == "20/11/2026 09:15 AM"            # every date column as text in the row
+
+
 # ---------------------------------------------------------------------------------------------- Part 1
 
 def test_the_document_step_names_files_by_id_copies_duplicates_and_records_every_row(base, monkeypatch):
@@ -221,15 +244,17 @@ def test_a_complete_case_gets_its_documents_table_file_and_record(base, monkeypa
         (folder / f"{GUID_A}_COA.pdf").write_bytes(b"%PDF")
         events.append({"event": "documents-table-read", "found": True})
         rec = dict(DM.empty_record(1), document_id=GUID_A, document_name="COA.pdf", saved_file=f"{GUID_A}_COA.pdf",
-                   obtained="downloaded", table_row_index=0)
+                   obtained="downloaded", table_row_index=0, date_created="2026-11-20T09:01:00")
         return [{"source_text": "View", "saved_file": f"{GUID_A}_COA.pdf", "status": "direct", "record": rec}]
     monkeypatch.setattr(P1, "download_documents", documents)
-    case = {"iid": hexid(1), "account": "AB100000", "sub_worktype_csv": "x"}
+    case = {"iid": hexid(1), "account": "AB100000", "sub_worktype_csv": "x", "created_date": "20/11/2026 09:00 AM"}
     _, result = T.run(P1.process_instruction(None, "page", case, 1, 1, control))
     assert result["status"] == "SUCCESS" and result["documents"] == [f"{GUID_A}_COA.pdf"]
     saved = P.read_json(paths.work / f"{hexid(1)} - AB100000" / P.DOCUMENTS_TABLE_FILE)
     assert saved["documents"][0]["document_id"] == GUID_A and saved["audit_trail"] == "Audit Trail.pdf"
     assert saved["table_found"] and saved["how_to_read"] and result["table_file"] == P.DOCUMENTS_TABLE_FILE
+    assert saved["instruction_created_date"] == "20/11/2026 09:00 AM"
+    assert saved["documents"][0]["origin"] == DM.ORIGIN_CUSTOMER and result["documents_table"][0]["origin"] == DM.ORIGIN_CUSTOMER
 
 
 def test_the_downloads_record_keeps_the_table_and_later_cases_can_copy_from_it(base, monkeypatch):
@@ -253,9 +278,9 @@ def test_the_downloads_record_keeps_the_table_and_later_cases_can_copy_from_it(b
 
 # ---------------------------------------------------------------------------------------------- the run's map
 
-def rec(did, name, saved=None):
+def rec(did, name, saved=None, date="2026-11-20T09:01:00"):
     return dict(DM.empty_record(1), document_id=did, document_name=name, saved_file=saved or f"{did}_{name}",
-                obtained="downloaded", type="Other")
+                obtained="downloaded", type="Other", date_created=date)
 
 
 def test_the_map_links_instructions_through_shared_documents_and_groups_them(base):
@@ -275,7 +300,9 @@ def test_the_map_links_instructions_through_shared_documents_and_groups_them(bas
     control.hold(ids[5], "System 2: no snapshot", "coordinator")
     plan = {"cases": [{"iid": i, "account": "AB1", "needs": "download", "client_number": "C1", "client_name": "SYNTH",
                        "sub_worktype_csv": "Change of Address", "fund": "F1", "status": "Ended", "row_number": 6 + n,
-                       "row": {"RequestId": i, "Fund": "F1"}} for n, i in enumerate(ids)] +
+                       "row": {"RequestId": i, "Fund": "F1"},
+                       "created_date": {0: "20/11/2026 09:00 AM", 1: "20/11/2026 08:00 AM"}.get(n, "")}
+                      for n, i in enumerate(ids)] +
                      [{"iid": hexid(7), "needs": "skipped"}], "bam": "BAM Report.xlsx", "scope": "Every case"}
     P.write_json(paths.downloads / f"{ids[0]}.json", dict(P.read_json(paths.downloads / f"{ids[0]}.json"),
                  system1_identity={"customerNumber": "C1", "customerName": "SYNTH", "accountNumber": "AB1"},
@@ -295,6 +322,13 @@ def test_the_map_links_instructions_through_shared_documents_and_groups_them(bas
     assert first["system1"]["client_number"] == "C1" and first["system1"]["sub_worktype"] == "Bank Details"
     assert first["documents"][0]["also_in_instructions"] == [ids[1], ids[5]] and first["documents"][0]["file_name"] == "D1_a.pdf"
     assert m["run_details"]["bam_report"] == "BAM Report.xlsx" and m["run_details"]["run_choice"] == "Every case"
+    # D1 (added 09:01) came with the customer's request of ids[0] (created 09:00), but was added later to ids[1] (08:00)
+    assert first["documents"][0]["origin"] == DM.ORIGIN_CUSTOMER and first["created_date"] == "20/11/2026 09:00 AM"
+    assert inst[ids[1]]["documents"][0]["origin"] == DM.ORIGIN_PROCESSOR
+    assert inst[ids[1]]["documents"][0]["minutes_after_instruction_created"] == 61
+    assert [x["origin"] for x in m["documents"]["D1"]["in_instructions"]] == \
+        [DM.ORIGIN_CUSTOMER, DM.ORIGIN_PROCESSOR, DM.ORIGIN_UNKNOWN]
+    assert inst[ids[2]]["documents_by_origin"] == {DM.ORIGIN_CUSTOMER: 0, DM.ORIGIN_PROCESSOR: 0, DM.ORIGIN_UNKNOWN: 2}
     assert inst[ids[3]]["group"] is None and inst[ids[3]]["related_instructions"] == []
     assert inst[ids[4]]["table_recorded"] is False and inst[ids[5]]["status"] == "held"
     assert inst[ids[0]]["status"] == "ready" and inst[ids[0]]["folder_location"] == "CASES_ROOT"

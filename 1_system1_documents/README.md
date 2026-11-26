@@ -25,6 +25,8 @@ It uses the one System 1 tab in the **systems Edge** (port `systems_cdp_port`, d
   **copied** from that case folder (`.work` or CASES_ROOT); only if the copy fails is it fetched. A row without a
   Document ID is kept and marked. The case's table goes into its folder as `_Documents Table.json` and into
   `downloads\<id>.json` (`documents_table`, plus `system1_identity` = client number / name / account from Overview).
+  Each record also gets its likely `origin`: within 2 minutes of the instruction's BAM `Created Date` = probable
+  customer document, later = probable processor upload, a missing date = unknown (the Audit Trail confirms).
   The coordinator builds the run's document map from these (`shared/document_map.py`).
 - **Each document**, first the **direct route** (no click): its viewer address, paired with its row by the document
   ID it names (by page order only when no address names an ID and the counts match; otherwise no address), fetched with

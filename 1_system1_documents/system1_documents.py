@@ -1186,11 +1186,13 @@ class StopRun(Exception):
     """The run is stopping (shared stop signal): this case stays in .work, nothing more is downloaded."""
 
 
-def case_table(rows,events):
-    """(the case's documents-table records in table order, whether the table with a Document ID column was found)."""
+def case_table(rows,events,created=''):
+    """(the case's documents-table records in table order, whether the table with a Document ID column was found).
+    Each record gets its likely origin from the instruction's Created Date (BAM Report): DM.origin_of."""
     records=sorted((dict(r['record']) for r in rows if r.get('record')),key=lambda r:r.get('row',0))
     for r in records:
         r.pop('table_row_index',None)
+    DM.label_origins(records,created)
     found=next((e.get('found',False) for e in events if e.get('event')=='documents-table-read'),False)
     return records,bool(found)
 
@@ -1240,11 +1242,11 @@ async def process_instruction_once(context,page,case,batch_index,batch_total,att
             'status':audit_status,
         })
         # The case's own Received Documents table, beside its documents (sent with the case, read by the run's map).
-        table,table_found=case_table(rows,events)
+        table,table_found=case_table(rows,events,case.get('created_date',''))
         P.write_json(download_path/P.DOCUMENTS_TABLE_FILE,
                      DM.table_file(iid,P.norm_account(meta.get('accountNumber','')),table,table_found,audit_file.name,
                                    client_number=meta.get('customerNumber',''),client_name=meta.get('customerName',''),
-                                   sub_worktype=sub))
+                                   sub_worktype=sub,created=case.get('created_date','')))
 
         page=await return_to_my_inbox(context,page,events)
         status='SUCCESS'
@@ -1271,7 +1273,7 @@ async def process_instruction_once(context,page,case,batch_index,batch_total,att
             except Exception:
                 pass
 
-    table,table_found=case_table(rows,events)
+    table,table_found=case_table(rows,events,case.get('created_date',''))
     result={
         'instruction_id':iid,'status':status,'attempt':attempt,
         'account_number':meta.get('accountNumber',''),

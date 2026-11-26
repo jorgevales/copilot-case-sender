@@ -44,9 +44,10 @@ COLUMNS = {
     "subject": ("Email Subject", ("emailsubject",)),
     "sub": ("Sub Worktype", ("subworktype",)),
     "end": ("End Date", ("enddate",)),
+    "created": ("Created Date", ("createddate",)),     # optional: the documents' likely origin (customer / processor)
 }
 NEEDED = ("iid", "account", "status", "sub")
-DATE_KEYS = ("received", "end")
+DATE_KEYS = ("received", "end", "created")
 SHOWN_FORMAT = "%d/%m/%Y %I:%M %p"   # the same text shared/timing.py reads
 
 
@@ -217,6 +218,7 @@ def read_bam_report(path, id_re, reviewed_status: str, norm_account) -> tuple:
     if absent:
         warnings.append("these columns are not in the report: " + ", ".join(absent))
     cases, excluded, seen = [], [], set()
+    date_cols = {at[k] for k in DATE_KEYS if k in at}  # the whole row (sent on) shows dates as text too
     for n, raw in enumerate(rows[HEADER_ROW:], HEADER_ROW + 1):
         def get(key, _raw=raw):
             i = at.get(key)
@@ -229,8 +231,9 @@ def read_bam_report(path, id_re, reviewed_status: str, norm_account) -> tuple:
                 "client_number": get("client"), "status": get("status"), "sub_worktype_csv": get("sub"),
                 "end_date": get("end"), "case_source": get("source"), "received_date": get("received"),
                 "client_name": get("client_name"), "fund": get("fund"), "fund_type": get("fund_type"),
-                "email_subject": get("subject"),
-                "row": {header[i]: as_text(v) for i, v in enumerate(raw) if i < len(header) and header[i]}}
+                "email_subject": get("subject"), "created_date": get("created"),
+                "row": {header[i]: as_date_text(v) if i in date_cols else as_text(v)
+                        for i, v in enumerate(raw) if i < len(header) and header[i]}}
         if not id_re.match(item["iid"]):
             excluded.append({**item, "reason": "not a valid RequestId (32 characters)"})
         elif item["status"].casefold() != reviewed_status:

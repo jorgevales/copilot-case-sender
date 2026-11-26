@@ -6,7 +6,7 @@ import zipfile
 from xml.sax.saxutils import escape
 
 # The 31 columns, A..AE, as the real report has them (the ignored ones get filler names).
-HEADERS = (["RequestId"] + [f"Ignored {c}" for c in "BCDEFGHIJ"] + ["Received Date", "Ignored L", "Ignored M",
+HEADERS = (["RequestId", "Created Date"] + [f"Ignored {c}" for c in "CDEFGHIJ"] + ["Received Date", "Ignored L", "Ignored M",
            "Client Account Number", "Client Name", "Client Number", "Fund", "Fund Type", "Ignored S", "Ignored T",
            "Ignored U", "Process Status", "Ignored W", "Ignored X", "Source", "Email Subject", "Sub Worktype",
            "Ignored AB", "Ignored AC", "Ignored AD", "End Date"])
@@ -44,11 +44,12 @@ def _sheet(rows):
 
 
 def case(iid, account="AB100000", status="Ended", sub="Change of Address", client="C1", name="Synthetic Client One",
-         fund="Fund A", fund_type="Income", source="Email", subject="Change please", received=None, end=None):
+         fund="Fund A", fund_type="Income", source="Email", subject="Change please", received=None, end=None,
+         created=None):
     """One report row as {header: value}."""
     return {"RequestId": iid, "Client Account Number": account, "Process Status": status, "Sub Worktype": sub,
             "Client Number": client, "Client Name": name, "Fund": fund, "Fund Type": fund_type, "Source": source,
-            "Email Subject": subject,
+            "Email Subject": subject, "Created Date": created or "",
             "Received Date": received or datetime.datetime(2026, 11, 20, 9, 15),
             "End Date": end or datetime.datetime(2026, 11, 25, 12, 23)}
 

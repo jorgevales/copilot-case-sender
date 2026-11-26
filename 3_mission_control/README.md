@@ -40,7 +40,7 @@ Then **one case per send** (`package_version` 2):
 
 | Part | Content |
 |---|---|
-| `case` | JSON: `request_id`, `client_account_number`, `client_name`, `client_number`, `fund`, `fund_type`, `process_status`, `sub_worktype` (System 1's), `sub_worktype_in_report`, `received_date`, `end_date`, `source`, `email_subject`, `warnings`, `documents_table` (the case's Received Documents records), `related` (`group`, `related_instructions` with the shared Document IDs, `document_ids`), `relationships` (`client_number`, `sub_worktype`, `time_cluster`, `related` with strength + reasons, `window_hours`), and `files` (name, kind, size, sha256 of each) |
+| `case` | JSON: `request_id`, `client_account_number`, `client_name`, `client_number`, `fund`, `fund_type`, `process_status`, `sub_worktype` (System 1's), `sub_worktype_in_report`, `received_date`, `end_date`, `source`, `email_subject`, `warnings`, `documents_table` (the case's Received Documents records, each with its likely `origin`: probable customer document / probable processor upload / origin unknown), `related` (`group`, `related_instructions` with the shared Document IDs, `document_ids`), `relationships` (`client_number`, `sub_worktype`, `time_cluster`, `related` with strength + reasons, `window_hours`), and `files` (name, kind, size, sha256 of each) |
 | `files` | every file of the case folder, in the order: account snapshot, Audit Trail, documents table (`_Documents Table.json`, kind `documents table`), documents |
 
 With `mission_control_auth = key`, the key goes in the header named by `mission_control_key_header` (default
