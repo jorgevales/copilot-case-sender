@@ -36,8 +36,9 @@ Part 3 is the rewrite ("2") of the older "Automatic daily statics review" runner
   needed or sent with Mission Control (its agents have them): Part 1 / hand-over skip the guidance hold for it. The MC
   script is also the console of runs without System 3 (plan `send` = false).
 - **Azure: not maintained** (user, 2026-11-26) - keep its tests green, build nothing new. The stashed Azure fix stays parked.
-- **Copilot.md is NOT in the repo** (`.git/info/exclude`); the repo carries `Copilot.md`, regenerated from this file by the
-  local `pre-commit` hook (Copilot -> Copilot). Never mention Copilot.md in committed files; no Co-Authored-By lines.
+- **The original of this notes file stays on the laptop only** (`.git/info/exclude`); the repo carries `Copilot.md`,
+  regenerated from it by the local `pre-commit` hook on every commit. Never name the original in committed files; no
+  Co-Authored-By lines (local `commit-msg` hook removes them).
 
 Real runs happen on the work VDI, with everything on the `S:` drive. Local copies are for development and tests only.
 Parts 1 and 2 started from sanitized copies of the user's VDI scripts. The repo is PUBLIC: every page address, host and
