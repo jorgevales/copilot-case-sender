@@ -925,8 +925,20 @@ async def ui_fallback_document(context, page, item, folder, events):
     preferred=saved_name(item)
     before=set(context.pages)
     popups,downloads=[],[]
-    on_popup=lambda p:(popups.append(p),p.on('download',downloads.append))
-    page.on('popup',on_popup);page.on('download',downloads.append)
+
+    # Plain Python functions, never a built-in like `downloads.append`: Playwright stores its wrapper ON the listener
+    # (attribute `_pw_impl_instance_`), which a built-in cannot take - VDI 2026-11-26: "AttributeError:
+    # 'builtin_function_or_method' object has no attribute '_pw_impl_instance_'" on the first View fallback.
+    def on_download(download):
+        downloads.append(download)
+
+    def on_popup(popup):
+        popups.append(popup)
+        try:
+            popup.on('download',on_download)
+        except Exception:
+            pass
+    page.on('popup',on_popup);page.on('download',on_download)
     try:
         await visual_click(page.locator('[data-s4-document-view="1"]'),timeout=4000,force=True)
         end=time.monotonic()+8
@@ -943,7 +955,7 @@ async def ui_fallback_document(context, page, item, folder, events):
     except Exception as exc:
         return None,f'UI fallback failed: {type(exc).__name__}: {exc}'
     finally:
-        page.remove_listener('popup',on_popup);page.remove_listener('download',downloads.append)
+        page.remove_listener('popup',on_popup);page.remove_listener('download',on_download)
         for p in [*popups,*(p for p in context.pages if p not in before)]:
             try:
                 if p is not page and not p.is_closed():await p.close()
@@ -1039,16 +1051,13 @@ async def wait_documents_page(page):
         await asyncio.sleep(.1)
 
 
-async def download_documents(context, page, folder, events, during=None):
+async def download_documents(context, page, folder, events):
     """Download 30+ Received Documents rapidly while retaining full verification.  Every row comes back with its
     documents-table record ('record'); a document this run already saved for an earlier instruction is copied.
 
     Speed (2026-11-26, ~100 instructions a run): the table and the rows are read in one go as soon as they are there;
     copies (worker threads) and direct downloads (FETCH_PARALLEL at a time, files written in worker threads) all run
-    side by side; and `during` - an async step that needs no document, Part 1 gives it the Audit Trail - runs on the
-    page WHILE the files arrive.  Only if a document then needs its View click is the Documents section opened again.
-    If `during` fails, the downloads in flight are let finish before the error goes on (nothing is ever written into a
-    case folder that is being started clean)."""
+    side by side.  The page stays on Documents the whole time (see process_instruction_once)."""
     t0=time.monotonic()
     raw,discovered=await wait_documents_page(page)
     table=DM.table_records(raw)
@@ -1079,16 +1088,7 @@ async def download_documents(context, page, folder, events, during=None):
             item.setdefault('attempts',[]).append({'copy':who})
         return await fast_direct_document(context,item,folder,semaphore)
     # return_exceptions: one document's surprise never leaves the others writing on after the case has failed
-    fetching=asyncio.ensure_future(asyncio.gather(*(obtain(i,x) for i,x in enumerate(discovered)),return_exceptions=True))
-    t_during=None
-    if during is not None:
-        try:
-            await during()
-            t_during=time.monotonic()
-        except BaseException:
-            await asyncio.gather(fetching,return_exceptions=True)
-            raise
-    results=list(await fetching)
+    results=list(await asyncio.gather(*(obtain(i,x) for i,x in enumerate(discovered)),return_exceptions=True))
     t_fetched=time.monotonic()
     bug=next((r for r in results if isinstance(r,PROGRAM_ERRORS)),None)
     if bug is not None:
@@ -1101,15 +1101,12 @@ async def download_documents(context, page, folder, events, during=None):
     fallback_indexes=list(direct_failed)
     if fallback_indexes:
         event(events,'document-ui-fallback-started',count=len(fallback_indexes))
-        if during is not None:                             # the page went on to History: back to the documents
-            page=await section(context,await live(context,page),'Documents',events)
         for index in fallback_indexes:
             item=discovered[index]
             saved,status=await ui_fallback_document(context,page,item,folder,events)
             results[index]=(saved,status)
     end=time.monotonic()
     event(events,'documents-timing',tableMs=int((t_table-t0)*1000),filesMs=int((t_fetched-t_table)*1000),
-          alongsideMs=int((t_during-t_table)*1000) if t_during else None,
           fallbackMs=int((end-t_fetched)*1000),totalMs=int((end-t0)*1000),documents=len(discovered),
           copied=len(copied_from),viewClicks=len(fallback_indexes))
 
@@ -1303,27 +1300,19 @@ async def process_instruction_once(context,page,case,batch_index,batch_total,att
         download_path.mkdir(parents=True,exist_ok=True)
         RESERVED.pop(download_path,None)           # names reserved by an earlier attempt are free again
 
-        # Download every Received Document and the Audit Trail file (History) into the same folder.  The Audit
-        # Trail is fetched WHILE the documents arrive (download_documents' `during`), not after them.
+        # Download every Received Document, then the Audit Trail file (History) into the same folder.  The case stays
+        # on Documents until every document has arrived: leaving it for History while they were still downloading
+        # (tried 2026-11-26) sent the VDI run into the View fallback - most likely System 1 stops answering a
+        # document's link once its page has moved on.
         if initial_section!='Documents' or await detect_open_section(page)!='Documents':
             page=await section(context,page,'Documents',events)
         visual_center_tap(page)                    # the pointer goes to the middle of the page and taps (drawing only)
-        audit={}
+        rows=await download_documents(context,page,download_path,events)
+        if control is not None and control.stopped():
+            raise StopRun('run stopping')
 
-        async def audit_step():
-            if control is not None and control.stopped():
-                raise StopRun('run stopping')
-            p=await section(context,await live(context,page),'History',events)
-            audit['page']=p
-            audit['file'],audit['status']=await download_audit(context,p,download_path,events)
-        rows=await download_documents(context,page,download_path,events,during=audit_step)
-        page=await live(context,audit.get('page',page))
-        if 'file' not in audit:                    # no document to wait for (or none fetched): the Audit Trail now
-            if control is not None and control.stopped():
-                raise StopRun('run stopping')
-            page=await section(context,page,'History',events)
-            audit['file'],audit['status']=await download_audit(context,page,download_path,events)
-        audit_file,audit_status=audit['file'],audit['status']
+        page=await section(context,page,'History',events)
+        audit_file,audit_status=await download_audit(context,page,download_path,events)
         rows.append({
             'source_text':'Audit Trail',
             'row_text':'History - Audit Trail',

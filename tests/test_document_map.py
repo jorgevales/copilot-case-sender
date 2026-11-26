@@ -256,7 +256,7 @@ def test_a_complete_case_gets_its_documents_table_file_and_record(base, monkeypa
     paths, control = TP.p1_setup(base)
     TP.P1Fakes(P1, monkeypatch)
 
-    async def documents(context, page, folder, events, during=None):
+    async def documents(context, page, folder, events):
         (folder / f"{GUID_A}_COA.pdf").write_bytes(b"%PDF")
         events.append({"event": "documents-table-read", "found": True})
         rec = dict(DM.empty_record(1), document_id=GUID_A, document_name="COA.pdf", saved_file=f"{GUID_A}_COA.pdf",
@@ -531,59 +531,6 @@ class SlowCtx(TP.Ctx):
         self.request = Request()
 
 
-def slow_case(base):
-    paths, _ = TP.p1_setup(base)
-    folder = paths.work / f"{hexid(1)} - AB1"
-    folder.mkdir(parents=True)
-    o = "https://system1.example.invalid"
-    ctx = SlowCtx({o + "/view/a": TP.Resp(b"%PDF-a"), o + "/view/b": TP.Resp(b"%PDF-b")}, 0.3)
-    rows = [{"index": 0, "rowIndex": 0, "documentName": "A.pdf", "documentId": "id-a", "viewerUrl": o + "/view/a",
-             "pairing": "id", "viewerUrlsOnPage": 2},
-            {"index": 1, "rowIndex": 1, "documentName": "B.pdf", "documentId": "id-b", "viewerUrl": o + "/view/b",
-             "pairing": "id", "viewerUrlsOnPage": 2},
-            {"index": 2, "rowIndex": 2, "documentName": "C.docx", "documentId": "id-c", "pairing": "none",
-             "viewerUrlsOnPage": 2}]
-    page = TP.S1Page(ctx, rows, lambda p, row: p.fire("download", TP.Download(b"PK\x03\x04", "c.docx")))
-    ctx.pages = [page]
-    return folder, ctx, page
-
-
-def test_the_audit_trail_runs_while_the_documents_arrive_and_view_reopens_the_documents(base, monkeypatch):
-    folder, ctx, page = slow_case(base)
-    opened = []
-
-    async def section(context, p, name, events):
-        opened.append(name)
-        return p
-
-    async def live(context, p=None):
-        return p
-    monkeypatch.setattr(P1, "section", section)
-    monkeypatch.setattr(P1, "live", live)
-    seen = {}
-
-    async def during():                              # the Audit Trail step
-        seen["answers_when_started"] = ctx.done
-        await asyncio.sleep(0.05)
-    events = []
-    out = T.run(P1.download_documents(ctx, page, folder, events, during=during))
-    assert seen == {"answers_when_started": 0}          # it started before any document had arrived
-    assert [r["saved_file"] for r in out] == ["id-a_A.pdf", "id-b_B.pdf", "id-c_C.docx"]
-    assert opened == ["Documents"]                       # View is clicked only after going back to the documents
-    timing = next(e for e in events if e["event"] == "documents-timing")
-    assert timing["alongsideMs"] is not None and timing["viewClicks"] == 1 and timing["documents"] == 3
-
-
-def test_a_failing_audit_trail_lets_the_downloads_finish_before_the_case_fails(base, monkeypatch):
-    folder, ctx, page = slow_case(base)
-
-    async def during():
-        raise RuntimeError("Audit Trail control not found")
-    with pytest.raises(RuntimeError, match="Audit Trail"):
-        T.run(P1.download_documents(ctx, page, folder, [], during=during))
-    assert ctx.done == 2 and sorted(p.name for p in folder.iterdir()) == ["id-a_A.pdf", "id-b_B.pdf"]   # nothing left writing
-
-
 def test_documents_saved_side_by_side_never_take_the_same_name(base):
     paths, _ = TP.p1_setup(base)
     folder = paths.work / "f"
@@ -626,18 +573,6 @@ def test_the_table_is_used_the_moment_it_has_rows_and_an_empty_one_after_half_a_
     assert raw["found"] and found == [] and P1.TABLE_SETTLE <= _t.monotonic() - start < P1.TABLE_SETTLE + 0.5
 
 
-def test_the_audit_trail_step_is_handed_to_the_documents_and_a_stop_there_downloads_nothing_more(base, monkeypatch):
-    paths, control = TP.p1_setup(base)
-    fakes = TP.P1Fakes(P1, monkeypatch, overlap=True)
-    case = {"iid": hexid(1), "account": "AB100000", "sub_worktype_csv": "x"}
-    _, result = T.run(P1.process_instruction(None, "page", case, 1, 1, control))
-    assert result["status"] == "SUCCESS" and result["audit"] == "Audit Trail.pdf"
-    assert fakes.calls["during"] == 1 and fakes.calls["audit"] == 1       # once, alongside - not again afterwards
-    fakes = TP.P1Fakes(P1, monkeypatch, overlap=True, on_docs=lambda: control.stop("part2", "Access Denied"))
-    _, result = T.run(P1.process_instruction(None, "page", case, 1, 1, control))
-    assert result["status"] == "STOPPED" and fakes.calls["audit"] == 0
-
-
 # ---------------------------------------------------------------------------------------------- the pointer's taps
 
 class TapFrame(TP.PointerFrame):
@@ -677,6 +612,28 @@ def test_the_pointer_taps_the_middle_after_documents_and_nudges_every_idle_two_s
     busy, quiet = T.run(go())
     assert s1_frame.taps[0] == {"center": True} and s2_frame.taps == []
     assert busy >= 3 and all(t == {"center": False} for t in s1_frame.taps[1:]) and quiet == 0
+
+
+# ---------------------------------------------------------------------------------------------- the console
+
+def test_a_system1_line_shows_the_real_instruction_id_on_the_console_but_not_in_the_log_file(base, capsys):
+    S = TP.S
+    iid, other = hexid(7), hexid(8)
+    log = S.Log(None, S.Redactor(), "full", show_ids=True)
+    log.file = base / "events.txt"
+    log("system1", show_id=iid, note=f"{iid} NOT downloaded: copied from {other}")
+    shown = capsys.readouterr().out
+    assert f"note={iid} NOT downloaded: copied from <id>" in shown          # only the line's own case is shown
+    filed = (base / "events.txt").read_text("utf-8")
+    assert iid not in filed and "<id> NOT downloaded" in filed
+    quiet = S.Log(None, S.Redactor(), "full", show_ids=False)              # the setting off: <id> as before
+    quiet("system1", show_id=iid, note=f"{iid} NOT downloaded")
+    assert iid not in capsys.readouterr().out
+
+
+def test_the_fakes_refuse_a_built_in_listener_like_playwright_does():
+    with pytest.raises(AttributeError, match="_pw_impl_instance_"):
+        TP.pw_listener([].append)
 
 
 trigger = DU.trigger                                  # the local fake Mission Control endpoint (pytest fixture)

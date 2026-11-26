@@ -13,6 +13,7 @@ What is faked: System 1, System 2 and Copilot pages.  Real-browser behaviour is 
 import asyncio
 import collections
 import importlib.util
+import inspect
 import json
 import os
 import shutil
@@ -442,8 +443,7 @@ def test_discovery_never_treats_the_work_folder_as_a_case(env):
 class P1Fakes:
     """System 1 page steps replaced by scripted ones; the case logic between them is the real one."""
 
-    def __init__(self, mod, monkeypatch, account="AB100000", sub="Change of Address", fail_audit=0, on_docs=None,
-                 overlap=False):
+    def __init__(self, mod, monkeypatch, account="AB100000", sub="Change of Address", fail_audit=0, on_docs=None):
         self.calls = collections.Counter()
 
         async def page_back(*a, **k):
@@ -464,14 +464,11 @@ class P1Fakes:
         async def section(context, page, name, events):
             return page
 
-        async def documents(context, page, folder, events, during=None):
+        async def documents(context, page, folder, events):
             for n in ("b form.pdf", "a letter.pdf"):
                 (folder / n).write_bytes(b"%PDF")
             if on_docs:
                 on_docs()
-            if overlap and during is not None:      # like the real step: the Audit Trail while the files arrive
-                self.calls["during"] += 1
-                await during()
             return [{"source_text": "View", "saved_file": "b form.pdf"}, {"source_text": "View", "saved_file": "a letter.pdf"}]
 
         async def audit(context, page, folder, events):
@@ -483,7 +480,7 @@ class P1Fakes:
         for name, fn in (("wait_inbox", page_back), ("search_open", search_open), ("verified_overview_identity", verified),
                          ("detect_open_section", detect), ("section", section), ("download_documents", documents),
                          ("download_audit", audit), ("open_or_recover_inbox", page_back),
-                         ("ensure_clean_inbox_search", page_back), ("live", page_back)):
+                         ("ensure_clean_inbox_search", page_back)):
             monkeypatch.setattr(mod, name, fn)
 
         async def back(context, page, events):
@@ -598,6 +595,16 @@ def test_part1_direct_route_reads_the_file_inside_a_viewer_page_and_records_ever
     assert saved is None and "no viewer address" in how and "pairing: none" in how
 
 
+def pw_listener(fn):
+    """What Playwright (1.65, _impl_to_api_mapping.wrap_handler) does with EVERY listener given to on() /
+    remove_listener(): it stores its wrapper on the listener itself.  A built-in such as `list.append` cannot take an
+    attribute - VDI 2026-11-26: AttributeError '_pw_impl_instance_' in the View fallback.  The fakes do the same."""
+    if inspect.ismethod(fn):
+        setattr(fn.__self__, "_pw_impl_instance_" + fn.__name__, fn)
+    else:
+        setattr(fn, "_pw_impl_instance_", fn)
+
+
 class Popup:
     """A document window: its address, what its page shows, and whether it has its own toolbar Download button."""
     def __init__(self, url, shown=(), toolbar=False):
@@ -616,7 +623,7 @@ class Popup:
         raise AssertionError("nothing may be clicked in this test")
 
     def on(self, event, fn):
-        pass
+        pw_listener(fn)
 
     def is_closed(self):
         return getattr(self, "closed", False)
@@ -648,9 +655,11 @@ class S1Page:
         return [dict(r) for r in self.rows]          # document_rows
 
     def on(self, event, fn):
+        pw_listener(fn)
         self.listeners[event].append(fn)
 
     def remove_listener(self, event, fn):
+        pw_listener(fn)
         self.listeners[event].remove(fn)
 
     def fire(self, event, value):
@@ -707,7 +716,7 @@ def test_part1_a_program_error_is_not_retried_and_keeps_its_trace(base, monkeypa
     paths, control = p1_setup(base)
     fakes = P1Fakes(P1, monkeypatch)
 
-    async def broken(context, page, folder, events, during=None):
+    async def broken(context, page, folder, events):
         raise TypeError("event() got multiple values for argument 'name'")
     monkeypatch.setattr(P1, "download_documents", broken)
     case = {"iid": hexid(1), "account": "AB100000", "sub_worktype_csv": "x"}

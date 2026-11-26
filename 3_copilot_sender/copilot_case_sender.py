@@ -996,12 +996,19 @@ class Log:
         if rt:
             self.file = rt.logs / f"events-{datetime.datetime.now():%Y%m%d-%H%M%S}.txt"   # one JSON event per line; .txt so Copilot accepts it as an attachment
 
-    def __call__(self, phase: str, alias: str = "", **fields) -> None:
+    def __call__(self, phase: str, alias: str = "", show_id: str = "", **fields) -> None:
+        """`show_id`: the real instruction ID a progress line is about (System 1 / 2 lines have no alias yet) - kept
+        as it is on the console when console_show_ids is on; the log file still gets `<id>`."""
         raw = {k: (v if isinstance(v, (str, int, float, bool, type(None))) else str(v)) for k, v in fields.items()}
         self.console.append(f"[{datetime.datetime.now():%H:%M:%S}] {alias or '-':<12} {phase:<18} " + " ".join(f"{k}={v}" for k, v in raw.items()))
-        self.events.append({"ts": now(), "phase": phase, "case": alias, "instruction_id": self.redact.ids.get(alias, ""), **raw})
+        self.events.append({"ts": now(), "phase": phase, "case": alias, "instruction_id": self.redact.ids.get(alias, "") or show_id, **raw})
+        shown_fields = None
+        if show_id and self.show_ids:
+            mark = "\x00instruction\x00"            # survives the redaction, then becomes the real ID again (console only)
+            shown_fields = {k: (self.redact(re.sub(re.escape(show_id), mark, v, flags=re.I)).replace(mark, show_id)
+                                if isinstance(v, str) else v) for k, v in fields.items()}
         fields = {k: (self.redact(v) if isinstance(v, str) else v) for k, v in fields.items()}
-        line = " ".join(f"{k}={v}" for k, v in fields.items())
+        line = " ".join(f"{k}={v}" for k, v in (shown_fields or fields).items())
         shown = self.redact.ids.get(alias) if self.show_ids else None
         if shown:
             line = f"{line} instruction={shown}".strip()
@@ -4567,7 +4574,7 @@ class PipelineFeed:
         while True:
             for ev in await asyncio.to_thread(self.control.new_events):
                 phase = phases.get(ev.get("part"), "pipeline") + ("-detail" if ev.get("level") == "detail" else "")
-                log(phase, note=ev.get("text", ""))
+                log(phase, show_id=ev.get("iid", ""), note=ev.get("text", ""))
             pause = await asyncio.to_thread(self.control.paused)
             if pause and pause["seq"] > asked and (prompt is None or prompt.done()):
                 asked = pause["seq"]

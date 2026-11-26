@@ -53,9 +53,13 @@ Part 3 is the rewrite ("2") of the older "Automatic daily statics review" runner
 - **Part 1 document speed** (user, 2026-11-26, ~100 instructions/run): `wait_documents_page` (table + rows read
   together, no fixed sleep; TABLE_SETTLE 0.5 s / TABLE_WAIT 10 s), copies + direct fetches side by side
   (FETCH_PARALLEL 8, writes via `asyncio.to_thread`; names reserved in `RESERVED` so parallel saves never clash; cleared
-  when a case folder is started clean), and `download_documents(..., during=audit_step)`: the Audit Trail runs WHILE
-  files arrive; View fallback reopens Documents afterwards; a failing `during` waits for in-flight downloads before
-  raising. `documents-timing` event per case. Pointer (`studio_visual_cursor.py`): `TAP`/`tap` = drawn-only pretend
+  when a case folder is started clean). `documents-timing` event per case. DROPPED after the VDI run (same day):
+  fetching the Audit Trail (History) while documents were still downloading - the run fell into the View fallback
+  (likely System 1 stops answering a document link once the page left Documents); never leave Documents before every
+  file arrived. Same run: the View fallback had `page.on('download', downloads.append)` - Playwright setattr's
+  `_pw_impl_instance_` on every listener, a built-in can't take it -> AttributeError. Listeners must be plain
+  functions; the test fakes (`pw_listener`) now enforce it. Part 1/2 progress lines show the real ID on the console
+  (`Log(..., show_id=)`, relay passes the event's iid; log file keeps `<id>`). Pointer (`studio_visual_cursor.py`): `TAP`/`tap` = drawn-only pretend
   click, `center_tap` after Documents opens (fire and forget), `start_nudging(NUDGE_SECONDS=2)` taps where the pointer
   is after 2 s without visible activity (console position reports reset the clock). *Locally verified* (fakes); VDI
   timings still to come.
